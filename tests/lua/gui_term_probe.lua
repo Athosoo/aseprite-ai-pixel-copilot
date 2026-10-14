@@ -10,8 +10,10 @@
 --   4) 小面板贴主窗口右下角
 --   5) 图片矫正确认窗：小、能列队
 
-local EXT = [[D:\PraticleTool\Aseprite-AI\extension]]
-package.path = package.path .. ";" .. EXT .. [[\?.lua]]
+local ROOT = os.getenv("ASE_PROJ")
+if not ROOT or ROOT == "" then ROOT = "." end   -- 从仓库根跑即可
+local EXT = ROOT .. "/extension"
+package.path = package.path .. ";" .. EXT .. "/?.lua"
 
 local ok, err = pcall(function()
   local agentModule = require("lib.agent")
@@ -49,8 +51,8 @@ local ok, err = pcall(function()
       p.menuHover = 0
       p:fillInput("")
       p:log("PROBE: 切场景 —— 小面板（右下角）+ 图片矫正确认窗（队列 2 张）", "tool")
-      p:addFixFile("D:/PraticleTool/Aseprite-AI/tests/lua/demo_a.png")
-      p:addFixFile("D:/PraticleTool/Aseprite-AI/tests/lua/demo_b.png")
+      p:addFixFile(ROOT .. "/tests/lua/demo_a.png")
+      p:addFixFile(ROOT .. "/tests/lua/demo_b.png")
       p:showMini()
       p:repaint()
       pcall(function()

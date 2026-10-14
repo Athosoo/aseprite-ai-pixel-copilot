@@ -1,12 +1,14 @@
 -- tests/lua/versions_test.lua -- 快照/回滚 无头测试
--- 跑法： "D:/PraticleTool/Aseprite/aseprite.exe" -b --script tests/lua/versions_test.lua
+-- 跑法： "<你的 Aseprite>/aseprite.exe" -b --script tests/lua/versions_test.lua
 --
 -- 注意（重要）：versions.rollback 内部用 `cel.image = 新图像` 写回，这会让
 -- 之前持有的 image 变量失效（"Tried to access a deleted 'ImageObj'"）。
 -- 所以回滚/撤销之后必须重新取 cel.image。
 
-local ROOT = "D:/PraticleTool/Aseprite-AI/extension"
-package.path = package.path .. ";" .. ROOT .. "/?.lua"
+local ROOT = os.getenv("ASE_PROJ")
+if not ROOT or ROOT == "" then ROOT = "." end
+local EXT = ROOT .. "/extension"
+package.path = package.path .. ";" .. EXT .. "/?.lua"
 
 local versions = require("lib.versions")
 

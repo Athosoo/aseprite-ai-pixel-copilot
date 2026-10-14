@@ -11,8 +11,10 @@
 --
 -- 前置：mock LLM(8792) 与桥(8777) 已启动。
 
-local EXT = [[D:\PraticleTool\Aseprite-AI\extension]]
-package.path = package.path .. ";" .. EXT .. [[\?.lua]]
+local ROOT = os.getenv("ASE_PROJ")
+if not ROOT or ROOT == "" then ROOT = "." end   -- 从仓库根跑即可
+local EXT = ROOT .. "/extension"
+package.path = package.path .. ";" .. EXT .. "/?.lua"
 
 local ok, err = pcall(function()
   local agentModule = require("lib.agent")

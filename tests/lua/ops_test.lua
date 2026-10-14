@@ -1,8 +1,10 @@
 -- tests/lua/ops_test.lua -- 算子无头测试
--- 跑法： "D:/PraticleTool/Aseprite/aseprite.exe" -b --script tests/lua/ops_test.lua
+-- 跑法： "<你的 Aseprite>/aseprite.exe" -b --script tests/lua/ops_test.lua
 
-local ROOT = "D:/PraticleTool/Aseprite-AI/extension"
-package.path = package.path .. ";" .. ROOT .. "/?.lua"
+local ROOT = os.getenv("ASE_PROJ")
+if not ROOT or ROOT == "" then ROOT = "." end
+local EXT = ROOT .. "/extension"
+package.path = package.path .. ";" .. EXT .. "/?.lua"
 
 local ops = require("lib.ops")
 

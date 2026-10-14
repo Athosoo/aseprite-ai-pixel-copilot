@@ -10,8 +10,10 @@
 -- 结果写 tests/lua/gui_e2e_result.txt，然后自动退出。
 -- 前置：mock LLM 与桥已启动（见 tests/run_gui_e2e.sh）
 
-local OUT = "D:/PraticleTool/Aseprite-AI/tests/lua/gui_e2e_result.txt"
-local EXT = "D:/PraticleTool/Aseprite-AI/extension"
+local OUT = ROOT .. "/tests/lua/gui_e2e_result.txt"
+local ROOT = os.getenv("ASE_PROJ")
+if not ROOT or ROOT == "" then ROOT = "." end
+local EXT = ROOT .. "/extension"
 
 local log = {}
 local function w(s)

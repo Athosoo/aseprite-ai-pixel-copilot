@@ -6,10 +6,13 @@
 --
 -- 跑法（会短暂弹出一个 Aseprite 窗口，测完自动退出）：
 --   1) 先起 echo 服务： node bridge/test/echo.mjs
---   2) "D:/PraticleTool/Aseprite/aseprite.exe" --script tests/lua/gui_ws_probe.lua
+--   2) 在仓库根跑： aseprite.exe --script tests/lua/gui_ws_probe.lua
 -- 结果写到 tests/lua/gui_ws_result.txt
 
-local OUT = "D:/PraticleTool/Aseprite-AI/tests/lua/gui_ws_result.txt"
+local ROOT = os.getenv("ASE_PROJ")
+if not ROOT or ROOT == "" then ROOT = "." end   -- 从仓库根跑即可
+
+local OUT = ROOT .. "/tests/lua/gui_ws_result.txt"
 local log = {}
 local function w(s)
   log[#log + 1] = tostring(s)

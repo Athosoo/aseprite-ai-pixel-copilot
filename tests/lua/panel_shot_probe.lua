@@ -5,8 +5,10 @@
 --
 -- 跑法（见 tests/shot_panel.sh）：会临时关掉脚本运行确认框，截完图后由外部杀掉进程。
 
-local EXT = "D:/PraticleTool/Aseprite-AI/extension"
-local OUT = "D:/PraticleTool/Aseprite-AI/tests/lua/panel_shot_ready.txt"
+local ROOT = os.getenv("ASE_PROJ")
+if not ROOT or ROOT == "" then ROOT = "." end
+local EXT = ROOT .. "/extension"
+local OUT = ROOT .. "/tests/lua/panel_shot_ready.txt"
 
 package.path = package.path .. ";" .. EXT .. "/?.lua"
 

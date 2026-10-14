@@ -4,7 +4,7 @@
 -- 而且它指向的 bridge 真的存在。
 -- 改了 main.lua 的路径探测 / install.ps1 之后跑这个。
 --
---   "D:/PraticleTool/Aseprite/aseprite.exe" -b --script tests/lua/path_test.lua
+--   "<你的 Aseprite>/aseprite.exe" -b --script tests/lua/path_test.lua
 --
 -- 前提：先跑过一次 install.ps1（它会写 __project.lua）。
 

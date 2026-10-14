@@ -18,3 +18,8 @@ __pycache__/
 
 # 临时诊断产物（脚本生成的中间截图）
 tests/lua/_*.png
+
+# 测试输出：每次跑都会变，不进版本库。
+# README 里引用的两张是单独复制到 docs/ 的（不随测试变化）。
+tests/lua/gui_*.png
+tests/lua/*_result.txt

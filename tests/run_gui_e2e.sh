@@ -11,7 +11,20 @@ set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PROJ="$(dirname "$HERE")"
-ASE="D:/PraticleTool/Aseprite/aseprite.exe"
+export ASE_PROJ="$PROJ"   # 探针靠它定位 extension/，不依赖 cwd
+# Aseprite 可执行文件：优先 $ASE_BIN，其次 PATH 里的 aseprite，
+# 最后回退到作者机器的常见位置（别人的机器请设 ASE_BIN）。
+ASE="${ASE_BIN:-}"
+if [ -z "$ASE" ]; then
+  if command -v aseprite >/dev/null 2>&1; then
+    ASE="aseprite"
+  elif [ -x "D:/PraticleTool/Aseprite/aseprite.exe" ]; then
+    ASE="D:/PraticleTool/Aseprite/aseprite.exe"
+  else
+    echo "找不到 Aseprite：请设 ASE_BIN=<aseprite.exe 的完整路径>" >&2
+    exit 1
+  fi
+fi
 INI="$USERPROFILE/AppData/Roaming/Aseprite/aseprite.ini"
 BACKUP="/tmp/aseprite.ini.bak"
 RESULT="$HERE/lua/gui_e2e_result.txt"

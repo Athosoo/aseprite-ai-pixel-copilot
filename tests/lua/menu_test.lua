@@ -3,10 +3,12 @@
 -- 无头（-b）单元测试：语言解析、内建命令、命令表打印与排版、输入模型（哨兵）、
 -- 队列/历史/面板路由。像素层面的东西见 tests/run_gui_visual.sh --term。
 --
--- 跑法：  "D:/PraticleTool/Aseprite/aseprite.exe" -b --script tests/lua/menu_test.lua
+-- 跑法：  "<你的 Aseprite>/aseprite.exe" -b --script tests/lua/menu_test.lua
 
-local EXT = [[D:\PraticleTool\Aseprite-AI\extension]]
-package.path = package.path .. ";" .. EXT .. [[\?.lua]]
+local ROOT = os.getenv("ASE_PROJ")
+if not ROOT or ROOT == "" then ROOT = "." end   -- 从仓库根跑即可
+local EXT = ROOT .. "/extension"
+package.path = package.path .. ";" .. EXT .. "/?.lua"
 
 local pass, fail = 0, 0
 local function ok(cond, name)
