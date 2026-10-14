@@ -33,7 +33,7 @@
 - **第三方扩展 `paletton-color-wheel` 已移出**（10/1 装的色轮，不是本项目的；
   它的 `__pref.lua` 还是全默认值，说明只试装没用起来；且它和我们的 Ctrl+Shift+P 撞键）。
   移到了 `%APPDATA%\Aseprite\extensions.disabled\paletton-color-wheel`，**没删**，想恢复移回去即可。
-- **别去动 Aseprite 安装目录自带的 14 个扩展**：`D:\PraticleTool\Aseprite\data\extensions\`
+- **别去动 Aseprite 安装目录自带的 14 个扩展**：`<Aseprite 安装目录>\data\extensions\`
   下那 14 个（`*-palettes` / `aseprite-theme` / `bayer-matrices`）是官方资源包，
   `contributes` 里只有 `palettes`/`themes`/`ditheringMatrices`、**没有 `scripts`**，
   所以**不注册命令、不占 `File > Scripts` 菜单**；删了会丢 pico8 / dawnbringer / endesga
@@ -61,14 +61,14 @@
 | Perfect Pixel 接入 | `bridge/vendor/perfectPixel.mjs` | 合成伪像素画 64x64 | 精确还原 16x16 |
 | **面板 GUI + WebSocket + 算子回路** | 整个扩展 | **真 Aseprite + 真桥 + mock LLM**，`tests/run_gui_visual.sh` | **通过，见 `tests/lua/gui_panel_e2e.png`** |
 | **终端式面板（回显/内建命令/命令表/小面板）** | `extension/lib/{panel,menu,miniwindow,i18n}.lua` + `agent.lua` | GUI `bash tests/run_gui_visual.sh --term`（+ `--term-en`） + 无头 `tests/lua/menu_test.lua` | **通过：`gui_term_menu.png`/`gui_term_palette.png`/`gui_term_en_menu.png`；89/89** |
-| 中文像素字体 | `D:\PraticleTool\Aseprite\data\fonts\` | A/B 像素比对 + 截图 | 中文墨高 18px vs 拉丁 14px，比例协调 |
+| 中文像素字体 | `<Aseprite 安装目录>\data\fonts\` | A/B 像素比对 + 截图 | 中文墨高 18px vs 拉丁 14px，比例协调 |
 
 ## 复现测试
 
 ```bash
-"D:/PraticleTool/Aseprite/aseprite.exe" -b --script tests/lua/ops_test.lua
-"D:/PraticleTool/Aseprite/aseprite.exe" -b --script tests/lua/versions_test.lua
-"D:/PraticleTool/Aseprite/aseprite.exe" -b --script tests/lua/menu_test.lua
+aseprite.exe -b --script tests/lua/ops_test.lua
+aseprite.exe -b --script tests/lua/versions_test.lua
+aseprite.exe -b --script tests/lua/menu_test.lua
 cd bridge && node test/selftest.mjs
 
 # GUI 可视化验证（会短暂弹 Aseprite 窗口，自动截图后杀进程）
@@ -117,7 +117,7 @@ Aseprite，不是就**拒绝截图**（防隐私泄露）。
    - 写自动化测试时要预置这些键，键串是 **chunk source name**：`--script` 传入的路径会被
      `get_absolute_path` 规范成**反斜杠绝对路径**；而 `require` 的模块名走 `package.path` 模板，
      Lua 把 `lib.ws` 里的点换成 **Windows 分隔符 `\`**，所以会得到
-     `D:/PraticleTool/.../extension/lib\ws.lua` 这种**混合分隔符**。两种都要写上（见 `run_gui_visual.sh`）。
+     `<repo>/extension/lib\ws.lua` 这种**混合分隔符**。两种都要写上（见 `run_gui_visual.sh`）。
 10. **`ask_access` 在无 UI 时直接放行**（`security.cpp:436`）→ 无头测试能读写文件。
 
 ### JSON 与消息

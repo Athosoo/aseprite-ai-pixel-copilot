@@ -288,10 +288,10 @@ python tools/bdf2ttf.py <字体.bdf> -o fusion-pixel-10px.ttf --family "Fusion P
 
 ```bash
 # 无头单测（命令表排版 / 输入模型 / 历史 / 矫正队列）
-"D:/PraticleTool/Aseprite/aseprite.exe" -b --script tests/lua/menu_test.lua      # 89 项
-"D:/PraticleTool/Aseprite/aseprite.exe" -b --script tests/lua/ops_test.lua       # 31 项
-"D:/PraticleTool/Aseprite/aseprite.exe" -b --script tests/lua/versions_test.lua  # 20 项
-"D:/PraticleTool/Aseprite/aseprite.exe" -b --script tests/lua/path_test.lua      # 安装路径机制
+aseprite.exe -b --script tests/lua/menu_test.lua      # 89 项
+aseprite.exe -b --script tests/lua/ops_test.lua       # 31 项
+aseprite.exe -b --script tests/lua/versions_test.lua  # 20 项
+aseprite.exe -b --script tests/lua/path_test.lua      # 安装路径机制
 
 # 桥的自测（mock LLM + mock Aseprite，不联网、不花 token）
 cd bridge && node test/selftest.mjs                                              # 22 项
