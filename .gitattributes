@@ -1,0 +1,24 @@
+# 换行符策略 —— 这个项目踩过 CRLF 的坑，别改：
+#
+#   Aseprite 的 Lua 是 POSIX 分支实现，**CRLF 文件里的多行字符串会直接报
+#   `unfinished string`**（实测）。所以 .lua 一律强制 LF，不管谁在什么平台上 clone。
+#
+#   .ps1 反过来：PowerShell 5 按 ANSI 读脚本，中文注释需要 UTF-8 **BOM** 才不会乱码，
+#   而且 Windows 脚本惯例是 CRLF。（BOM 是文件内容的一部分，git 不会动它。）
+
+* text=auto eol=lf
+
+*.lua  text eol=lf
+*.mjs  text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.sh   text eol=lf
+*.py   text eol=lf
+*.keys text eol=lf
+
+*.ps1  text eol=crlf
+
+*.png  binary
+*.ttf  binary
+*.aseprite binary

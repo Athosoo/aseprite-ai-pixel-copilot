@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aseprite-keys>
+  <keyboard version="1">
+    <commands>
+      <key command="ai_pixel_copilot_open" shortcut="Ctrl+Shift+A" />
+      <key command="ai_pixel_copilot_menu" shortcut="Ctrl+Shift+M" />
+      <key command="ai_pixel_copilot_palette" shortcut="Ctrl+Shift+P" />
+    </commands>
+  </keyboard>
+</aseprite-keys>

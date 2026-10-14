@@ -1,0 +1,16 @@
+{
+  "port": 8777,
+  "llm": {
+    "baseUrl": "http://127.0.0.1:8792/v1",
+    "apiKey": "test-key",
+    "model": "mock-model",
+    "temperature": 0,
+    "maxSteps": 6,
+    "timeoutMs": 30000
+  },
+  "systemPrompt": "测试用系统提示。",
+  "paths": {
+    "perfectPixelBundle": "vendor/perfectPixel.mjs",
+    "colorBank": "test/.tmp/gui-colors.json"
+  }
+}

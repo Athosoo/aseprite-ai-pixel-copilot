@@ -1,0 +1,20 @@
+# 依赖（自己 npm install）
+node_modules/
+bridge/node_modules/
+
+# 个人配置与运行数据 —— 含 API Key / 色值记忆库，绝不能提交
+bridge/config.json
+bridge/data/
+bridge/test/.tmp/
+
+# 系统 / 编辑器
+Thumbs.db
+.DS_Store
+*.log
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+
+# 临时诊断产物（脚本生成的中间截图）
+tests/lua/_*.png
