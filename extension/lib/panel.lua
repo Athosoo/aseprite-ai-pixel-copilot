@@ -36,6 +36,22 @@ Panel.__index = Panel
 local CANVAS_W, CANVAS_H = 660, 420
 local MAX_LINES = 800
 local INPUT_MAX_ROWS = 6                 -- 输入区最多显示几行，超出只显示尾部
+-- 画布小于这个尺寸就不再画内容，改画一行"窗口太小"（P4：Aseprite 没暴露最小尺寸 API）
+local MIN_CANVAS_W, MIN_CANVAS_H = 240, 120
+
+-- 栏模式（P12）。Aseprite 没有"把对话框停靠进主窗口布局"的 API，也**读不到主窗口
+-- 的几何**（实测 app.window / app.workspace 在 -b 下是 nil，GUI 下也没有 bounds 字段），
+-- 所以做不到真的贴边停靠。能做的是一键把窗口**缩成一条**，位置沿用当前的 x/y：
+--   底边栏：很宽很矮（一行输出 + 一行输入），用户自己拖到底边就很像状态条
+--   侧边栏：窄而高（日志 + 输入），拖到右侧就是侧栏
+-- 窗口尺寸 = 画布尺寸 + 实测的边框余量（672x467 的窗口对应 660x420 的画布）。
+local CHROME_W, CHROME_H = 12, 47
+local MODE_CANVAS = {
+  panel      = { w = CANVAS_W, h = CANVAS_H },
+  bar_bottom = { w = 1000, h = 44 },
+  bar_side   = { w = 320, h = 420 },
+}
+local MODE_ORDER = { "panel", "bar_bottom", "bar_side" }
 
 -- 哨兵：一个普通空格。
 --   * 必须"渲染出来看不见"——NBSP 不行：字体缺该字形，Aseprite 画成红条（实测）；
@@ -56,6 +72,44 @@ local STATUS  = Color(130, 190, 255)
 local MENU_TX = Color(214, 220, 230)
 local MENU_HL = Color(46, 134, 222)      -- 悬浮：蓝
 local MENU_HLT= Color(255, 255, 255)
+
+-- 状态栏配色（P2）：忙 = 黄、执行算子 = 青、闲 = 绿、出错/断联 = 红
+local STATUS_OK    = Color(126, 226, 168)
+local STATUS_BUSY  = Color(255, 206, 92)
+local STATUS_TOOL  = Color(128, 200, 220)
+local STATUS_ERROR = Color(255, 122, 122)
+
+local STATUS_COLORS = {
+  ok = STATUS_OK, busy = STATUS_BUSY, tool = STATUS_TOOL, error = STATUS_ERROR,
+}
+
+-- 桥侧 / 面板侧给的 kind -> 四类之一
+local STATUS_KIND_ALIAS = {
+  ok = "ok", ready = "ok", connected = "ok", done = "ok",
+  busy = "busy", thinking = "busy", working = "busy", connecting = "busy", waiting = "busy",
+  tool = "tool", running = "tool", op = "tool",
+  error = "error", disconnected = "error", failed = "error",
+}
+
+-- 转圈帧（P2）：思考/执行时状态栏第一个字符在动
+local SPIN_FRAMES = { "|", "/", "-", "\\" }
+local SPIN_INTERVAL = 0.12
+
+-- 哪些状态算"闲"（停转圈）。判断用【原文】—— 桥发的英文和面板本地化后的中文都要认。
+-- 前缀匹配：只要以这些开头就算闲（"connected, waiting for input" 也算闲）。
+local IDLE_STATUS_PREFIX = {
+  "ready", "connected", "disconnected", "error", "missing api key",
+  "就绪", "已连接", "已断开", "出错", "连接出错", "缺少",
+}
+
+-- 断联/连接出错：状态栏下面再补一行红字提示（P2 第 3 点）
+local ALERT_STATUS_PREFIX = { "disconnected", "connection error", "已断开", "连接出错" }
+
+-- 红色状态（比 alert 宽：普通的 error / 缺 key 也红，但不弹提示行）
+local ERROR_STATUS_PREFIX = {
+  "error", "出错", "missing api key", "缺少",
+  "disconnected", "connection error", "已断开", "连接出错",
+}
 
 local KIND_COLOR = {
   user  = USER,
@@ -105,6 +159,25 @@ function panel.new(opts)
     menuRows = nil,
     menuHover = 0,
     hitRows = {},
+    -- 状态栏（P2/P5a）：busy 决定转圈，docName 显示当前文件
+    statusRaw = "",
+    statusKind = "ok",
+    docName = "",
+    alert = "",
+    busy = false,
+    spinIdx = 1,
+    spinTimer = nil,
+    -- P7 选项式提问
+    pendingAsk = nil,
+    askDlg = nil,
+    askClosing = false,
+    askShownOptions = nil,
+    -- P4 窗口自然尺寸（第一次绘制时记下来）
+    naturalBounds = nil,
+    naturalFor = nil,
+    inputFocused = false,
+    -- P12 形态
+    mode = "panel",
     -- 图片矫正队列
     fixQueue = {},
   }, Panel)
@@ -147,9 +220,98 @@ function Panel:echo(text)
   self:log(text, "user")
 end
 
-function Panel:setStatus(text, kind)
-  self.status = i18n.statusText(text)
-  self.statusKind = kind or ""
+-- 状态文本的"闲/忙"判定。用【原文】判（翻译后的文本不该参与逻辑），
+-- 前缀匹配，中英都认 —— 桥发英文，面板自己那几处发的是本地化后的中文。
+local function startsWithAny(s, list)
+  for _, p in ipairs(list) do
+    if s:sub(1, #p) == p then return true end
+  end
+  return false
+end
+
+-- 只对纯 ASCII 做小写（string.lower 是字节级的，会改坏多字节字符）
+local function asciiLower(s)
+  if s:find("^[%z\1-\127]*$") then return s:lower() end
+  return s
+end
+
+local function normalizeStatus(s)
+  return asciiLower(tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+function Panel:_statusIsIdle(raw)
+  local s = normalizeStatus(raw)
+  if s == "" then return true end
+  return startsWithAny(s, IDLE_STATUS_PREFIX)
+end
+
+function Panel:_statusIsError(raw)
+  local s = normalizeStatus(raw)
+  return startsWithAny(s, ERROR_STATUS_PREFIX)
+end
+
+function Panel:_statusNeedsAlert(raw)
+  local s = normalizeStatus(raw)
+  return startsWithAny(s, ALERT_STATUS_PREFIX)
+end
+
+----------------------------------------------------------------------
+-- 转圈动画（P2）
+----------------------------------------------------------------------
+
+-- Timer 对象必须被长期持有（GC 掉 = 动画停），所以挂在 self 上。
+-- 注意：`-b` 无头模式下 Timer 能构造、start/stop 也能改 isRunning，
+-- 但 ontick 不会触发（没有 UI 循环）—— 测试只能断言"表有没有被启动"。
+function Panel:_ensureSpinTimer()
+  if self.spinTimer then return self.spinTimer end
+  local ok, t = pcall(function()
+    return Timer{ interval = SPIN_INTERVAL, ontick = function() self:_spinTick() end }
+  end)
+  if ok and t then self.spinTimer = t end
+  return self.spinTimer
+end
+
+function Panel:_spinTick()
+  self.spinIdx = (self.spinIdx or 1) % #SPIN_FRAMES + 1
+  self:repaint()
+end
+
+function Panel:_startSpin()
+  local t = self:_ensureSpinTimer()
+  if t and not t.isRunning then
+    pcall(function() t:start() end)
+  end
+end
+
+function Panel:_stopSpin()
+  local t = self.spinTimer
+  if t and t.isRunning then
+    pcall(function() t:stop() end)
+  end
+end
+
+function Panel:isBusy() return self.busy == true end
+
+function Panel:setStatus(text, kind, docName)
+  local raw = tostring(text or "")
+  self.statusRaw = raw
+  self.status = i18n.statusText(raw)
+  if docName ~= nil then self.docName = tostring(docName) end
+
+  self.busy = not self:_statusIsIdle(raw)
+  self.statusKind = STATUS_KIND_ALIAS[kind or ""]
+    or (self.busy and "busy")
+    or (self:_statusIsError(raw) and "error")
+    or "ok"
+
+  -- 断联/连接出错：状态栏下面补一行红字（P2 第 3 点）
+  if self:_statusNeedsAlert(raw) then
+    self.alert = i18n.t("bridgeDown")
+  else
+    self.alert = ""
+  end
+
+  if self.busy then self:_startSpin() else self:_stopSpin() end
   self:repaint()
 end
 
@@ -228,6 +390,7 @@ function Panel:_resetEntry(restoreCaret)
     end
   end)
   self.entrySyncing = false
+  self.inputFocused = true          -- 绕完一圈，焦点回到输入框
 end
 
 function Panel:_inputBackspace()
@@ -237,7 +400,7 @@ function Panel:_inputBackspace()
   self.input = i and s:sub(1, i - 1) or ""
 end
 
--- ↑ / ↓ 翻历史（控制台 / 终端习惯）
+-- ↑ / ↓ 翻历史（控制台 / 终端习惯）；Esc = 关菜单 / 中断当前任务（P3）
 function Panel:_onKeyDown(ev)
   if ev.code == "ArrowUp" then
     self:_history(-1)
@@ -247,6 +410,14 @@ function Panel:_onKeyDown(ev)
     self:_history(1)
     if ev.stopPropagation then ev.stopPropagation() end
     self:repaint()
+  elseif ev.code == "Escape" then
+    if self.menuOpen then
+      self:closeMenu()
+      self:repaint()
+    elseif self.busy then
+      if self.opts.onAction then self.opts.onAction("abort") end
+    end
+    if ev.stopPropagation then ev.stopPropagation() end
   end
 end
 
@@ -270,7 +441,10 @@ function Panel:_history(delta)
 
   local text = (pos == 0) and (self.draft or "") or self.history[n - pos + 1]
   self:fillInput(text)
-  if self.dlg then pcall(function() self.dlg:modify{ id = "input", focus = true } end) end
+  if self.dlg then
+    pcall(function() self.dlg:modify{ id = "input", focus = true } end)
+    self.inputFocused = true
+  end
   self:repaint()
 end
 
@@ -282,6 +456,16 @@ function Panel:_submit()
   local text = tostring(self.input or ""):gsub("^%s+", ""):gsub("%s+$", "")
   self:fillInput("")
   if text == "" then return end
+
+  -- 有正在等回答的提问：数字/字母先当成回答（这是阻塞式问题，优先级最高）
+  if self.pendingAsk then
+    local ans = self:_interpretAskInput(text)
+    if ans ~= nil then
+      self:echo(text)
+      if self.opts.onAskAnswer then self.opts.onAskAnswer(ans) end
+      return
+    end
+  end
 
   -- 命令表开着：编号 / 键位 / x 关闭
   if self.menuOpen then
@@ -333,6 +517,285 @@ function Panel:_submit()
   -- 其余原样发给 AI
   self:echo(text)
   if self.opts.onSend then self.opts.onSend(text) end
+end
+
+-- 滚轮翻历史。
+-- 终端惯例：滚轮【上】= 往历史翻（scroll 增大），滚轮【下】= 回最新（scroll 归 0）。
+-- deltaY > 0 是滚轮向下，所以这里是 -1。上界在 _paint 里钳（那里才知道行数）。
+-- 抽成方法是为了无头测试能直接调（闭包里的处理器在 -b 模式下拿不到）。
+function Panel:_onWheel(ev)
+  local dy = (ev and ev.deltaY) or 0
+  if dy == 0 then return end          -- 水平滚动 / 空事件：别白翻一页
+  self.scroll = math.max(0, self.scroll + (dy > 0 and -1 or 1) * 3)
+  self:repaint()
+end
+
+function Panel:_onCanvasMouseMove(ev)
+  local idx = self:_menuIndexAt(ev.x or 0, ev.y or 0)
+  if (idx or 0) ~= (self.menuHover or 0) then
+    self.menuHover = idx or 0
+    self:repaint()          -- 悬浮高亮必须重绘，否则屏幕上什么都看不到
+  end
+end
+
+-- 点画布空白处 = 把焦点还给输入点（终端习惯：点了就能接着打字）。
+--
+-- 这里有两个坑（都实测过，见 tests/lua/gui_resize_probe.lua 的输出）：
+--   1) `dlg:modify` 会触发一次重新布局，而 Aseprite 的布局会把窗口**按内容撑回
+--      自然尺寸** —— 用户手动把窗口缩小后，点一下内部就"跳回原大小"，就是这么来的。
+--      实测：设成 320x220 -> 点一下 -> 变回 672x467。
+--   2) 焦点状态没有 API 可读，只能自己记（self.inputFocused）。
+-- 所以：焦点已经在输入框 -> 什么都不做；窗口已经不是自然尺寸（用户拖过）-> 也不动，
+-- 免得把用户调好的尺寸冲掉。自然尺寸在第一次绘制时（_paint）记下来。
+function Panel:_windowIsNatural()
+  local nb = self.naturalBounds
+  if not nb or not self.dlg then return true end
+  local ok, b = pcall(function() return self.dlg.bounds end)
+  if not ok or not b then return true end        -- 读不到就当自然尺寸，行为退回旧版
+  return (b.width or 0) == nb.w and (b.height or 0) == nb.h
+end
+
+function Panel:_onCanvasMouseDown(ev, dlg)
+  if ev.button ~= MouseButton.LEFT then return end
+  if self:_menuIndexAt(ev.x or 0, ev.y or 0) then return end
+  if self.inputFocused then return end
+  -- 用户拖过窗口大小：不再 modify，否则会把尺寸冲回内容自然尺寸
+  if self.naturalBounds and not self:_windowIsNatural() then return end
+  dlg = dlg or self.dlg
+  if not dlg then return end
+  pcall(function() dlg:modify{ id = "input", focus = true } end)
+  self.inputFocused = true
+end
+
+function Panel:_onCanvasMouseUp(ev)
+  if ev.button == MouseButton.LEFT and self.menuOpen then
+    local idx = self:_menuIndexAt(ev.x or 0, ev.y or 0)
+    if idx then self:_runMenuIndex(idx) end
+  end
+end
+
+----------------------------------------------------------------------
+-- 选项式提问（P7）
+--
+-- AI 问"要 A 还是 B"时：终端里列出编号选项（敲数字也能答），
+-- 同时由 agent 弹一个原生按钮窗（点选）。两条通道都通到同一个回调。
+----------------------------------------------------------------------
+
+-- 取消词（大小写不敏感，仅 ASCII 才做小写）
+local ASK_CANCEL = {
+  x = true, q = true, esc = true, cancel = true, skip = true, none = true,
+  ["取消"] = true, ["放弃"] = true, ["算了"] = true, ["不了"] = true, ["关闭"] = true,
+}
+
+function Panel:setAsk(ask, silent)
+  self.pendingAsk = ask
+  if ask and not silent then
+    self:log(tostring(ask.question or ""), "ai")
+    for i, opt in ipairs(ask.options or {}) do
+      self:log(string.format(i18n.t("askOption"), i, tostring(opt)), "menu")
+    end
+    self:log(i18n.t("askHint"), "info")
+  end
+  self:repaint()
+end
+
+function Panel:askIsPending() return self.pendingAsk ~= nil end
+
+-- 把一行输入解释成"对当前提问的回答"：返回 1..n、或 "cancel"、或 nil（不是回答）
+function Panel:_interpretAskInput(text)
+  if not self.pendingAsk then return nil end
+  local s = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if s == "" then return nil end
+  local n = #(self.pendingAsk.options or {})
+
+  local num = tonumber(s)
+  if num and num == math.floor(num) and num >= 1 and num <= n then return num end
+
+  if #s == 1 and s:find("^[%z\1-\127]+$") then
+    local idx = s:lower():byte() - string.byte("a") + 1
+    if idx >= 1 and idx <= n then return idx end
+  end
+
+  local key = s:find("^[%z\1-\127]+$") and s:lower() or s
+  if ASK_CANCEL[key] then return "cancel" end
+  return nil
+end
+
+----------------------------------------------------------------------
+-- 形态：面板 / 底边栏 / 侧边栏（P12）
+--
+-- 极限说清楚：Aseprite 没给脚本"停靠进主窗口"的接口，也读不到主窗口几何，
+-- 所以这里做的是"把窗口缩成一条 + 布局换成栏的形态"，位置沿用当前 x/y，
+-- 用户拖到底边/右边就得到想要的效果。配色用自绘的深色（和面板一致）：
+-- app.theme 只暴露一个 color 成员（实测），拿不到整套主题色。
+----------------------------------------------------------------------
+
+function Panel:layoutMode() return self.mode or "panel" end
+
+function Panel:modeLabel(mode)
+  mode = mode or self:layoutMode()
+  if mode == "bar_bottom" then return i18n.t("modeBarBottom") end
+  if mode == "bar_side" then return i18n.t("modeBarSide") end
+  return i18n.t("modePanel")
+end
+
+-- 栏形态贴哪儿：app.window.width/height 和 dlg.bounds 同一坐标系（miniwindow 也是这么用的）。
+-- 拿不到就返回 nil，调用方沿用它原来的位置。
+function Panel:_barAnchor(mode)
+  local W, H = 0, 0
+  pcall(function() W = app.window.width or 0 end)
+  pcall(function() H = app.window.height or 0 end)
+  if W <= 0 or H <= 0 then return nil end
+
+  local c = MODE_CANVAS[mode]
+  local bw, bh = c.w + CHROME_W, c.h + CHROME_H
+  if mode == "bar_bottom" then
+    -- 底边栏：水平居中，贴底
+    return math.max(0, math.floor((W - bw) / 2)), math.max(0, H - bh)
+  end
+  -- 侧边栏：贴右，垂直居中
+  return math.max(0, W - bw), math.max(0, math.floor((H - bh) / 2))
+end
+
+-- 返回实际生效的形态名
+function Panel:setMode(mode, quiet)
+  local valid = false
+  for _, m in ipairs(MODE_ORDER) do if m == mode then valid = true end end
+  if not valid then mode = "panel" end
+  self.mode = mode
+  self.naturalBounds = nil          -- 形态变了，自然尺寸要重新记
+  self.naturalFor = nil
+
+  if self.dlg and self.shown then
+    local c = MODE_CANVAS[mode]
+    local ww, wh = c.w + CHROME_W, c.h + CHROME_H
+
+    -- 顺序很重要：modify 会触发一次重新布局，把窗口按内容撑回自然尺寸。
+    -- 先 modify（改焦点），**最后**才设 bounds —— 反过来的话 bounds 会被那次布局冲掉
+    -- （实测：先设 bounds 再 modify，读回来还是旧尺寸）。
+    self.inputFocused = false
+    pcall(function() self.dlg:modify{ id = "input", focus = true } end)
+    self.inputFocused = true
+
+    local x, y = nil, nil
+    if mode ~= "panel" then
+      x, y = self:_barAnchor(mode)
+    end
+    if not x then
+      local ok, b = pcall(function() return self.dlg.bounds end)
+      if ok and b then x, y = b.x, b.y end
+    end
+    if x and y then
+      pcall(function() self.dlg.bounds = Rectangle(x, y, ww, wh) end)
+    end
+    -- 刚设完的尺寸就是它的"自然尺寸"，不然点击逻辑会以为用户拖过而不再给焦点
+    self.naturalBounds = { w = ww, h = wh }
+    self.naturalFor = mode
+  end
+
+  if not quiet then self:log(string.format(i18n.t("modeChanged"), self:modeLabel()), "info") end
+  self:repaint()
+  return self.mode
+end
+
+function Panel:cycleMode()
+  local cur = self:layoutMode()
+  for i, m in ipairs(MODE_ORDER) do
+    if m == cur then
+      return self:setMode(MODE_ORDER[i % #MODE_ORDER + 1])
+    end
+  end
+  return self:setMode("panel")
+end
+
+function Panel:isBar() return self:layoutMode() ~= "panel" end
+
+-- 把一行文本裁到宽度 maxW 以内。keepTail=true 保留尾部（输入行长、要看到光标附近）
+function Panel:_clipToWidth(gc, text, maxW, keepTail)
+  text = tostring(text or "")
+  if maxW <= 0 then return "" end
+  if self:_textWidth(gc, text) <= maxW then return text end
+
+  local chars = {}
+  for _, code in utf8.codes(text) do chars[#chars + 1] = utf8.char(code) end
+  if keepTail then
+    local out = {}
+    for i = #chars, 1, -1 do
+      table.insert(out, 1, chars[i])
+      if self:_textWidth(gc, table.concat(out)) > maxW - 12 then
+        table.remove(out, 1)
+        break
+      end
+    end
+    return "…" .. table.concat(out)
+  end
+  local out = {}
+  for i = 1, #chars do
+    out[#out + 1] = chars[i]
+    if self:_textWidth(gc, table.concat(out)) > maxW - 12 then
+      table.remove(out)
+      break
+    end
+  end
+  return table.concat(out) .. "…"
+end
+
+-- 栏形态的绘制：状态行（上）+ 最后一行输出（中，够高才画）+ 输入行（下）
+function Panel:_paintBar(gc)
+  local w, h = gc.width, gc.height
+  local szC = gc:measureText("中")
+  local szL = gc:measureText("Ag")
+  local lh = math.max(10, (szL and szL.height or 12), (szC and szC.height or 12))
+  local rowH = math.max(lh, math.floor(lh * ROW_FACTOR + 0.5))
+
+  local rows = math.max(1, math.floor(h / rowH))
+  local y = 2
+
+  -- 1) 状态行
+  gc.color = STATUS_COLORS[self.statusKind or "ok"] or STATUS
+  local spin = ""
+  if self.busy then spin = SPIN_FRAMES[self.spinIdx or 1] .. " " end
+  local extras = ""
+  if self.miniShown then extras = extras .. "  ▣" end
+  if self.scroll > 0 then extras = extras .. "  ↕" end
+  local docSuffix = ""
+  if self.docName and self.docName ~= "" then docSuffix = "   ｜ " .. tostring(self.docName) end
+  local statusText = spin .. string.format(i18n.t("statusBar"), self.status) .. docSuffix .. extras
+  gc:fillText(self:_clipToWidth(gc, statusText, w - 12, false), 6, y)
+  y = y + rowH
+
+  -- 2) 最后一行输出（高度够才画）
+  if rows >= 3 then
+    local last = nil
+    for i = #self.lines, 1, -1 do
+      if self.lines[i].text ~= "" then last = self.lines[i] break end
+    end
+    if last then
+      gc.color = KIND_COLOR[last.kind] or TEXT
+      gc:fillText(self:_clipToWidth(gc, last.text, w - 12, false), 6, y)
+    end
+    y = y + rowH
+  end
+
+  -- 3) 输入行（贴底）
+  local mark = i18n.promptMark()
+  local markW = self:_textWidth(gc, mark)
+  local inputY = math.max(y, h - rowH)
+  gc.color = USER
+  gc:fillText(mark, 6, inputY)
+  local shown = tostring(self.input or "")
+  if shown == "" then
+    gc.color = DIM
+    gc:fillText(self:_clipToWidth(gc, i18n.t("inputHint"), w - 18 - markW, false), 6 + markW, inputY)
+  else
+    shown = self:_clipToWidth(gc, shown, w - 18 - markW, true)
+    gc.color = USER
+    gc:fillText(shown, 6 + markW, inputY)
+    gc:fillRect(Rectangle(6 + markW + self:_textWidth(gc, shown) + 1, inputY, 5, lh))
+  end
+
+  self.dbg = string.format("bar mode=%s w=%d h=%d rows=%d", self:layoutMode(), w, h, rows)
+  self.hitRows = {}
 end
 
 ----------------------------------------------------------------------
@@ -488,14 +951,125 @@ end
 function Panel:fixDialogIsOpen() return self.fixDlg ~= nil end
 
 ----------------------------------------------------------------------
+-- 选项窗（P7）：把 ask 的选项做成一排原生按钮，点一下就答
+--
+-- 复用 fix 对话框的写法：按钮在【创建时】定死尺寸，之后只能改 text/visible。
+-- 所以固定建 4 个按钮位，按选项个数显示前 n 个、把多余的 visible=false。
+-- 问题文本放 label（Aseprite 的 label 不自动折行，所以先手工折一下）。
+----------------------------------------------------------------------
+
+local ASK_WRAP = 46      -- 问题文本每行大致字符数（中英混排的折中）
+
+local function wrapText(s, width)
+  s = tostring(s or "")
+  if #s <= width then return s end
+  local out, line, n = {}, {}, 0
+  for _, code in utf8.codes(s) do
+    local ch = utf8.char(code)
+    if ch == "\n" then
+      out[#out + 1] = table.concat(line)
+      line, n = {}, 0
+    else
+      table.insert(line, ch)
+      n = n + 1
+      if n >= width then
+        out[#out + 1] = table.concat(line)
+        line, n = {}, 0
+      end
+    end
+  end
+  if #line > 0 then out[#out + 1] = table.concat(line) end
+  return table.concat(out, "\n")
+end
+
+-- 通用"选一个"对话框：ask（P7）和交付（P10）都用它。
+-- question 是问题正文，options 是最多 4 个按钮文字，onPick(index) / onPick("cancel")。
+function Panel:_showChoiceDialog(question, options, onPick, title)
+  if not self.dlg then return end
+  local d = self.askDlg
+  if not d then
+    d = Dialog{ title = title or i18n.t("askTitle"), resizeable = false,
+                onclose = function() self:_onAskDialogClosed() end }
+    if not d then return end
+
+    d:label{ id = "askQ", text = "" }
+    d:newrow()
+    for i = 1, 4 do
+      d:button{ id = "askOpt" .. i, text = "", hexpand = false,
+                onclick = function() self:_answerFromDialog(i) end }
+    end
+    self.askDlg = d
+  else
+    pcall(function() d:modify{ id = "askQ", text = "" } end)
+  end
+
+  self.askPick = onPick
+  pcall(function() d:modify{ id = "askQ", text = wrapText(question, ASK_WRAP) } end)
+  local opts = options or {}
+  for i = 1, 4 do
+    pcall(function()
+      if opts[i] then
+        d:modify{ id = "askOpt" .. i, text = tostring(opts[i]), visible = true }
+      else
+        d:modify{ id = "askOpt" .. i, text = " ", visible = false }
+      end
+    end)
+  end
+  self.askShownOptions = opts
+  pcall(function() d:show{ wait = false } end)
+end
+
+function Panel:_showAskDialog(ask)
+  self:_showChoiceDialog(ask.question, ask.options, function(i) 
+    if self.opts.onAskAnswer then self.opts.onAskAnswer(i) end
+  end, i18n.t("askTitle"))
+end
+
+-- 交付对话框（P10）：四个选项
+function Panel:showDeliverDialog(labels, onPick)
+  self:_showChoiceDialog(i18n.t("wsQuestion"), labels, onPick, i18n.t("wsTitle"))
+end
+
+function Panel:_answerFromDialog(i)
+  local pick = self.askPick
+  self:_closeAskDialog()
+  if pick then pick(i) end
+end
+
+-- 用户自己关掉选项窗 = 取消（别让桥那边挂着等 5 分钟）。
+-- 我们自己 close 的时候会置 askClosing，避免"点选项"被当成"取消"。
+function Panel:_onAskDialogClosed()
+  if self.askClosing then return end
+  local pick = self.askPick
+  self.askDlg = nil
+  self.askShownOptions = nil
+  self.askPick = nil
+  if pick then pick("cancel") end
+end
+
+function Panel:_closeAskDialog()
+  if self.askDlg then
+    self.askClosing = true
+    pcall(function() self.askDlg:close() end)
+    self.askClosing = false
+  end
+  self.askDlg = nil
+  self.askShownOptions = nil
+  self.askPick = nil
+end
+
+function Panel:askDialogIsOpen() return self.askDlg ~= nil end
+
+----------------------------------------------------------------------
 -- 小面板（6 个图标按钮，贴主窗口右下角）
 ----------------------------------------------------------------------
 
 function Panel:_miniItems()
-  local ids = { "snapshot", "rollback", "versions", "fix", "settings", "close" }
+  -- 小面板：形态切换也放进去了（P12），图标复用现有的（resize 形状的没有，用 fix 的方块）
+  local ids = { "snapshot", "rollback", "versions", "fix", "bar", "settings", "close" }
   local icons = {
     snapshot = "snapshot", rollback = "rollback", versions = "versions",
-    fix = "fix", settings = "settings", close = "clear",
+    fix = "fix", bar = "versions", settings = "settings", close = "clear",
   }
   local out = {}
   for _, id in ipairs(ids) do
@@ -555,30 +1129,10 @@ function Panel:_build()
     autoscaling = true,
     onpaint = function(ev) self:_paint(ev.context) end,
     onkeydown = function(ev) self:_onKeyDown(ev) end,
-    onmousemove = function(ev)
-      local idx = self:_menuIndexAt(ev.x or 0, ev.y or 0)
-      if (idx or 0) ~= (self.menuHover or 0) then
-        self.menuHover = idx or 0
-        self:repaint()          -- 悬浮高亮必须重绘，否则屏幕上什么都看不到
-      end
-    end,
-    onmousedown = function(ev)
-      -- 点空白处 = 把焦点还给输入点（终端习惯：点了就能接着打字）
-      if ev.button == MouseButton.LEFT and not self:_menuIndexAt(ev.x or 0, ev.y or 0) then
-        pcall(function() dlg:modify{ id = "input", focus = true } end)
-      end
-    end,
-    onmouseup = function(ev)
-      if ev.button == MouseButton.LEFT and self.menuOpen then
-        local idx = self:_menuIndexAt(ev.x or 0, ev.y or 0)
-        if idx then self:_runMenuIndex(idx) end
-      end
-    end,
-    onwheel = function(ev)
-      local dy = ev.deltaY or 0
-      self.scroll = math.max(0, self.scroll + (dy > 0 and 1 or -1) * 3)
-      self:repaint()
-    end,
+    onmousemove = function(ev) self:_onCanvasMouseMove(ev) end,
+    onmousedown = function(ev) self:_onCanvasMouseDown(ev, dlg) end,
+    onmouseup = function(ev) self:_onCanvasMouseUp(ev) end,
+    onwheel = function(ev) self:_onWheel(ev) end,
   }
 
   -- 底部只有三样：输入框、回车磁吸按钮、小面板开关。
@@ -683,8 +1237,42 @@ function Panel:_paint(gc)
   local w, h = gc.width, gc.height
   self.canvasW, self.canvasH = w, h
 
+  -- 第一次绘制 = 布局已定型，把窗口的"自然尺寸"记下来（P4 用：用户拖过之后就不再
+  -- 因为 modify 把窗口撑回去）。读 dlg.bounds 在窗口可见时是安全的。
+  -- 形态变了要重新记（栏的自然尺寸和面板不一样）。
+  if self.naturalFor ~= self:layoutMode() and self.dlg then
+    local ok, b = pcall(function() return self.dlg.bounds end)
+    if ok and b and (b.width or 0) > 0 and (b.height or 0) > 0 then
+      self.naturalBounds = { w = b.width, h = b.height }
+      self.naturalFor = self:layoutMode()
+    end
+  end
+
   gc.color = BG
   gc:fillRect(Rectangle(0, 0, w, h))
+
+  -- 栏形态走另一套布局（P12）
+  if self:isBar() then
+    self:_paintBar(gc)
+    return
+  end
+
+  -- 窗口太小：画什么都看不清，只给一行明确的提示（P4 症状 B）。
+  -- Aseprite 没暴露"给对话框设最小尺寸"的 API（Lua 的 Dialog:modify 只认
+  -- enabled/visible/text/label/focus），而且【实测】canvas 的 autoscaling 设成
+  -- true 或 false 都拦不住缩小（40x30 都设得进去，见 gui_resize_probe 输出），
+  -- 所以只能这样兜底：让用户知道"不是坏了，是窗口太小"。
+  if w < MIN_CANVAS_W or h < MIN_CANVAS_H then
+    local sz = gc:measureText("Ag")
+    local lh = math.max(10, sz and sz.height or 12)
+    gc.color = STATUS_BUSY
+    local msg = i18n.t("tooSmall")
+    local okW = self:_textWidth(gc, msg)
+    gc:fillText(msg, math.max(4, math.floor((w - okW) / 2)), math.max(4, math.floor((h - lh) / 2)))
+    self.dbg = string.format("too small: %dx%d", w, h)
+    self.hitRows = {}
+    return
+  end
 
   -- 行高要同时量拉丁与 CJK（中文字形更高，只按 "Ag" 算会让中文行互相压住）
   local szL = gc:measureText("Ag")
@@ -734,29 +1322,45 @@ function Panel:_paint(gc)
     #(self.input or ""), caretX and (caretX - 6 - markW) or -1)
 
   ----------------------------------------------------------------------
-  -- 2) 状态行（最上面）
+  -- 2) 状态行（最上面）：转圈 + 状态文本 + 当前文件 + 小面板/滚动标记
   ----------------------------------------------------------------------
   local statusY = 4
-  gc.color = STATUS
+  gc.color = STATUS_COLORS[self.statusKind or "ok"] or STATUS
   local extra = ""
+  if self.busy then extra = extra .. SPIN_FRAMES[self.spinIdx or 1] .. " " end
   if self.miniShown then extra = extra .. "  ▣" end
   if self.scroll > 0 then extra = extra .. "  ↕" end
-  gc:fillText(string.format(i18n.t("statusBar"), self.status) .. extra, 6, statusY)
+  local docSuffix = ""
+  if self.docName and self.docName ~= "" then
+    docSuffix = "   ｜ " .. tostring(self.docName)
+  end
+  gc:fillText(string.format(i18n.t("statusBar"), self.status) .. docSuffix .. extra, 6, statusY)
 
   local ruleY = statusY + lh + 2
   gc.color = RULE
   gc:fillRect(Rectangle(0, ruleY, w, 1))
 
+  -- 断联红字（有就占一行，把滚回区往下推）
+  local alertH = 0
+  if self.alert and self.alert ~= "" then
+    gc.color = STATUS_ERROR
+    gc:fillText(self.alert, 6, ruleY + 3)
+    alertH = rowH
+  end
+
   ----------------------------------------------------------------------
   -- 3) 中间：滚回输出（打印出来的命令表也在里面，可悬浮 / 可点击）
   ----------------------------------------------------------------------
-  local logTop = ruleY + 3
+  local logTop = ruleY + 3 + alertH
   local logBottom = inputTop - 6
   gc.color = RULE
   gc:fillRect(Rectangle(0, logBottom + 2, w, 1))
 
   local rows = self:_wrap(gc, w - 12)
   local visible = math.max(0, math.floor((logBottom - logTop) / rowH))
+  -- scroll 上界：最多翻到顶（再多也没有内容了）。滚轮处理里拿不到行数，只能在这儿钳。
+  local maxScroll = math.max(0, #rows - visible)
+  if self.scroll > maxScroll then self.scroll = maxScroll end
   local first = #rows - visible + 1 - self.scroll
   if first < 1 then first = 1 end
 
@@ -798,23 +1402,29 @@ function Panel:show()
   end
   if self.shown then
     pcall(function() dlg:modify{ id = "input", focus = true } end)
+    self.inputFocused = true
     return
   end
   dlg:show{ wait = false }
   self.shown = true
   pcall(function() dlg:modify{ id = "input", focus = true } end)
+  self.inputFocused = true
+  if self.busy then self:_startSpin() end     -- 关窗时停过表，重开要接着转
   self:repaint()
 end
 
 function Panel:hide()
   if self.dlg then pcall(function() self.dlg:close() end) end
   if self.fixDlg then pcall(function() self.fixDlg:close() end); self.fixDlg = nil end
+  if self.askDlg then pcall(function() self.askDlg:close() end); self.askDlg = nil end
   self.shown = false
   if self.mini then self.mini:hide() end
+  self:_stopSpin()          -- 窗口不在就别转（Timer 在 GUI 里是活的，会一直 repaint）
 end
 
 function Panel:destroy()
   self:hide()
+  if self.spinTimer then pcall(function() self.spinTimer:stop() end); self.spinTimer = nil end
   if self.mini then self.mini:destroy() end
   self.dlg = nil
 end

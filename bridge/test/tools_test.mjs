@@ -44,7 +44,8 @@ console.log('== 工具注册 ==');
 {
   const names = TOOLS.map((t) => t.function.name);
   const want = ['canvas_info', 'apply_ops', 'crop', 'scale', 'canvas_size',
-                'style_list', 'style_use', 'style_save',
+                'style_list', 'style_use', 'style_save', 'ask_user', 'capabilities',
+                'open_document', 'list_workspace',
                 'new_sprite', 'add_layer', 'draw_art',
                 'perfect_pixel', 'snapshot', 'rollback', 'list_versions',
                 'remember', 'recall', 'forget', 'remember_color', 'search_colors'];
@@ -187,6 +188,113 @@ console.log('== 参数校验 ==');
   const r = await dispatch('apply_ops', { ops: [] });
   ok(r.error !== undefined, '空 ops 被拒绝');
 }
+
+// ---------------------------------------------------------------- P8
+// 造图：scale=1 就是"已经被矫正过的"真像素画（1px 一格）
+function makePixelArt(scale, logical) {
+  const size = scale * logical;
+  const data = new Uint8Array(size * size * 4);
+  const palette = [[229, 57, 53], [46, 134, 222], [255, 224, 189], [74, 52, 40], [126, 211, 33]];
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const lx = Math.floor(x / scale), ly = Math.floor(y / scale);
+      const idx = ((lx - 8) ** 2 + (ly - 8) ** 2 < 36) ? ((lx + ly) % 3) + 1 : 0;
+      const [r, g, b] = palette[idx];
+      const o = (y * size + x) * 4;
+      data[o] = r; data[o + 1] = g; data[o + 2] = b; data[o + 3] = 255;
+    }
+  }
+  return data;
+}
+
+console.log('== P8 perfect_pixel 幂等：已矫正过的图不再被处理 ==');
+{
+  const { join } = await import('node:path');
+  const bundlePath = join(process.cwd(), 'vendor', 'perfectPixel.mjs');
+  const imports = [];
+  const says = [];
+  const sess = {
+    upload: { buf: makePixelArt(1, 16), w: 16, h: 16, name: 'already.ase' },
+    turnProcessed: new Set(),
+    async request() { return { ok: true }; },
+    sendImport(d, w, h) { imports.push({ w, h, len: d.length }); },
+    say(kind, text) { says.push(text); },
+  };
+  const d2 = makeDispatcher({
+    session: sess, bank: fakeBank, memory: fakeMemory, styles: fakeStyles,
+    cfg: {}, bundlePath,
+  });
+
+  const r = await d2('perfect_pixel', { source: 'uploaded' });
+  ok(r.detected === false && r.noGridDetected === true,
+    '16x16 真像素画：自动检测报"无网格"（这是核心算法的既定行为，不是 bug）');
+  ok(imports.length === 0, '没有导入 -> 不会开出一个一模一样的文档');
+  ok(/do NOT retry/i.test(r.note || ''), '明确告诉模型别盲目重试 gridSize');
+  ok(r.distinctColors > 0 && r.distinctColors < 64, '带上颜色数诊断，实际 ' + r.distinctColors);
+  ok(r.reason === undefined || typeof r.reason === 'string', '保留了核心给的原始原因');
+
+  // 模型仍然重试（同一个来源）-> 同一轮内直接挡掉，不重复劳动
+  const r2 = await d2('perfect_pixel', { source: 'uploaded', gridSize: [16, 16] });
+  ok(r2.alreadyProcessed === true, '同一轮里重复调用同一来源被挡');
+  ok(imports.length === 0, '仍然没有导入');
+
+  // 换来源：64x64 伪像素画，显式 gridSize -> 正常矫正 + 导入 + 诊断行
+  sess.turnProcessed = new Set();
+  sess.upload = { buf: makePixelArt(4, 16), w: 64, h: 64, name: 'blurry.ase' };
+  const r3 = await d2('perfect_pixel', { source: 'uploaded', gridSize: [16, 16] });
+  ok(r3.detected === true && r3.grid === '16x16', '显式 gridSize 照常矫正，实际 ' + r3.grid);
+  ok(imports.length === 1 && imports[0].w === 16 && imports[0].h === 16, '真的导入了 16x16');
+  ok(says.some((t) => /perfect_pixel: input=64x64/.test(t)), 'P9 诊断行推到了面板');
+
+  // 恒等变换：16x16 图 + gridSize [16,16] -> alreadyPerfect，且不导入
+  sess.turnProcessed = new Set();
+  sess.upload = { buf: makePixelArt(1, 16), w: 16, h: 16, name: 'identity.ase' };
+  const r4 = await d2('perfect_pixel', { source: 'uploaded', gridSize: [16, 16] });
+  ok(r4.alreadyPerfect === true, '每格 1px 的恒等变换被识别为 alreadyPerfect');
+  ok(imports.length === 1, '恒等变换没有导入（imports 还是 1 次）');
+  ok(/no-op|no processing/i.test(r4.note || ''), '说明"这是空操作"');
+}
+
+console.log('== P7 ask_user 转发与校验 ==');
+{
+  calls.length = 0;
+  const r = await dispatch('ask_user', { question: '要哪个？', options: ['A', 'B', 'C'] });
+  ok(last().kind === 'ask', '消息类型 = ask，实际 ' + last().kind);
+  ok(last().payload.question === '要哪个？', '问题转发');
+  ok(last().payload.options.length === 3, '选项转发');
+  ok(r.ok === true, '结果来自 Lua 侧的回答');
+
+  const r2 = await dispatch('ask_user', { question: '只有空选项', options: ['  ', ''] });
+  ok(typeof r2.error === 'string', '空选项被挡，实际 ' + JSON.stringify(r2));
+
+  const r3 = await dispatch('ask_user', { options: ['A', 'B'] });
+  ok(typeof r3.error === 'string', '没问题文本被挡');
+
+  const r4 = await dispatch('ask_user', { question: 'x', options: ['1', '2', '3', '4', '5', '6'] });
+  ok(r4.error === undefined, '超过 4 个选项时截断而不是报错');
+
+  calls.length = 0;
+  await dispatch('ask_user', { question: 'x', options: ['1', '2', '3', '4', '5'] });
+  ok(last().payload.options.length === 4, '真的只留了 4 个，实际 ' + last().payload.options.length);
+}
+
+console.log('== P14 capabilities 与注册表交叉核对（防漂移）==');
+{
+  const r = await dispatch('capabilities', {});
+  const names = TOOLS.map((t) => t.function.name).sort();
+  const listed = Object.keys(r.can.tools).sort();
+  ok(JSON.stringify(names) === JSON.stringify(listed),
+    'capabilities 列出的工具 == 实际注册的工具（不许漏报/多报）');
+  ok(r.cannot.length >= 4, `cannot 段至少 4 条，实际 ${r.cannot.length}`);
+  ok(r.cannot.some((x) => /network/i.test(x)), '明确说了不能联网');
+  ok(r.cannot.some((x) => /undo/i.test(x)), '明确说了不能自己撤销');
+  ok(/only promise/i.test(r.honesty), '带一句"只承诺清单里有的"');
+  for (const n of listed) {
+    ok(typeof r.can.tools[n] === 'string' && r.can.tools[n].length > 0, `${n} 有一句说明`);
+  }
+  ok(Array.isArray(r.can.edit_ops), 'edit_ops 是数组（测试替身没有 Aseprite 侧算子表，空数组也算）');
+}
+
 
 console.log(`\n==== tools_test: ${pass} 通过, ${fail} 失败 ====`);
 process.exit(fail === 0 ? 0 : 1);

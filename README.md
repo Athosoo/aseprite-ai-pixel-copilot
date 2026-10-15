@@ -39,6 +39,22 @@ Aseprite (Lua 扩展)  <--WebSocket-->  本地 Node 桥  <--HTTPS-->  LLM（Open
 - **备份/回滚/临时版本**：每次 AI 改动前自动快照；面板上有 Snapshot / Rollback / Versions 按钮；
   同时落盘 `.aseprite` 副本到 `%APPDATA%\Aseprite\ai-pixel-copilot\versions\`
 - **色值记忆**：记住色值 + 使用场景 + 标签，之后按关键词/颜色/标签检索
+- **工作文件夹**（可选）：设一个工作区根目录后，AI 改图前会**自动把原文件备份**到
+  `<工作区>/backups/<原文件夹名>_back/`，再复制出一份 `<时间戳>_<原名>_copy.ase` 并
+  **在 Aseprite 里打开它**，之后所有改动都落在副本上 —— 原文件在你点「交付」之前一个字节都不会动。
+  敲「交付 / deliver」选：覆盖原文件 / 保留副本 / 丢弃副本 / 继续修改
+- **上传图片**：工作区开启时，选中的图会先复制到 `<工作区>/uploads/` 再处理，原图不动
+- **打开文档**：直接跟 AI 说「打开 001.ase」，它会在工作区里找；异步列出工作区文件也能问
+- **选项式提问**：AI 需要你拍板时会弹一个按钮窗（也能在终端里敲数字回答），
+  不再是"请回复 1 或 2"那种要打字的
+- **随时可中断**：跑飞了敲「停止 / stop」或按 **Esc** 立刻中断当前任务；
+  整轮还有超时（默认 3 分钟）自动中断兜底
+- **状态可见**：状态栏有转圈动画 + 状态文本 + 当前文件名；思考/执行/出错/断联四种颜色，
+  断联时另给一行红字提示怎么修
+- **三种形态**：敲「栏 / bar」在 **面板 → 底边栏 → 侧边栏** 之间循环，
+  底边栏是一条贴底的宽条，侧边栏贴右侧，专门用来"缩起来不挡画布"
+- **能力清单**：AI 有一份从**真实工具表生成**的能力清单（`capabilities` 工具），
+  问它"你能做什么"会照实回答，做不到的明确说做不到
 
 ## 安装
 
@@ -126,6 +142,49 @@ powershell -ExecutionPolicy Bypass -File tools/pack-extension.ps1     # Windows
 ```
 
 它会把桥 bundle 成零依赖单文件（含 `ws`）一起塞进包里。
+
+## 关于那些"权限索取"弹窗（英文的）
+
+装上扩展后，Aseprite 可能会弹几段**英文**的 Security 询问框，例如：
+
+> **Security** — The following script: `.../main.lua` wants to access this file: `...`
+> [ Allow Read Access ]  [ Stop Script ]
+> ☐ Don't show this specific alert again for this script
+> ☐ Give full trust to this script
+
+**这些框是 Aseprite 本体的脚本沙箱机制，不是本扩展的界面**，所以它们的语言跟着
+Aseprite 自己的界面语言走 —— 扩展代码改不了它们（Aseprite 没有把沙箱对话框的文案
+暴露给脚本）。扩展自己的窗口（面板 / 设置 / 选项窗）全部走 `lib/i18n.lua`，默认中文。
+
+每个框在要什么、为什么需要：
+
+| 框里的动作 | 为什么需要 |
+|---|---|
+| **Access this file**（读） | 读 `__project.lua`（install.ps1 写的仓库路径）来定位 `bridge/`；读你选的图片文件 |
+| **Write to this file**（写） | 写工作区的备份/副本、写版本快照到 `%APPDATA%\Aseprite\ai-pixel-copilot\versions\` |
+| **Execute**（执行） | 打开面板时自动拉起本地桥（`node bridge/src/server.mjs`，可在设置里关掉） |
+| **OpenSocket**（网络） | 连本地桥（`ws://127.0.0.1:8777`），以及桥去连 LLM |
+
+建议：点 **"Don't show this specific alert again for this script"** 再 Allow，
+下次就不再问了。**别**点 "Give full trust" 除非你读过源码 —— 那等于给它全部权限。
+如果你不希望它自动起桥，把 `main.lua` 里 `autoStartBridge` 改成 `false`，
+授权框里就只剩"读/写"这两类。
+
+## 能力边界（它做不到什么）
+
+下面这份清单和扩展里的 `capabilities` 工具是同一份内容，工具那份是**从真实注册表生成**
+的（有测试盯着两边一致），所以你问它的时候得到的就是这个：
+
+- **不能联网**：不能搜索、不能访问网页、不能调任何除你配置的 LLM 以外的服务。
+- **不能随便读写文件**：只能打开图片/文档类文件（`.ase .aseprite .png .jpg .gif .webp .bmp`），
+  只能往工作区里写。工作区之外的任意文件读写是做不到的。
+- **不能做位图以外的创作**：没有矢量、音频、字体生成。
+- **不能自己撤销**：每次改动前会自动快照，但"回退"必须你明确说（Ctrl+Z 或 rollback）。
+- **不能画到画布外**：落在画布外的像素会被跳过并计数（面板会提示）。
+- **看不见你的屏幕**：它只知道画布状态、图层表、颜色直方图和文件列表，看不到渲染结果。
+- **不能把面板停靠进 Aseprite 布局**：Aseprite 没给脚本 dock 接口，
+  所以"栏模式"是一条**浮动**条（贴到主窗口底边/右侧），标题栏去不掉。
+- **不能改 Aseprite 本体的对话框语言**：见上一节。
 
 ## 用法
 
@@ -306,6 +365,7 @@ extension/            Aseprite 扩展（装到 %APPDATA%\Aseprite\extensions\ai-
   lib/ops.lua         7 个安全算子
   lib/sizelib.lua     文档级尺寸：crop / scale / canvas_size（crop 不重采样）
   lib/artlib.lua      作画：字符网格落像素 / 新建文档 / 建图层
+  lib/workspace.lua   工作区：备份 / 副本 / 打开 / 交付（v0.5.0）
   lib/versions.lua    快照 / 回滚 / 临时版本栈
   lib/ws.lua          WebSocket 封装
 bridge/               本地桥（Node，零第三方依赖除 ws）
@@ -330,6 +390,19 @@ STATUS.md             当前进度、踩坑记录、下一步
 ```
 
 ## 排错
+
+**"我已经矫正过的图，它又说要再处理一遍"** —— v0.5.0 修了。原因是 Perfect Pixel 的
+自动网格检测只找 **4 倍以上**的上采样因子，1px 一格的真像素画（也就是任何用这个算法
+处理过的结果）会检测失败报"无网格"，模型看到失败就想重试。现在桥侧会：
+① 这种情况下让你"不用处理"，并**明确禁止**模型盲目重试；
+② 如果模型仍然重试了同样的来源，同一轮内直接挡掉，不会再开一个一模一样的文档。
+
+**"矫正结果不对"怎么反馈** —— 每次矫正成功，面板里都会有一行诊断：
+`perfect_pixel: input=64x64 grid=16x16 refined=16x16 output=16x16 sample=center colors=5`。
+觉得不对的时候把这一行 + 原图 + 你期望的结果一起给开发者，有这三样才能定位。
+（`tests/lua/ws_api_probe.lua`、`tests/lua/gui_bar_probe.lua` 这些探针就是复现模板。）
+
+## 其他常见问题
 
 - **连不上桥**：浏览器开 http://127.0.0.1:8777/health 看是否 `{"ok":true}`；
   没有就手动 `cd bridge && node src/server.mjs` 看报错。
@@ -390,6 +463,15 @@ python tools/bdf2ttf.py <字体.bdf> -o fusion-pixel-10px.ttf --family "Fusion P
   输入框/控制台拿到焦点时才翻历史。
 - 模型看不到图像内容，只能看色值统计和尺寸；图像级工作一律走 Perfect Pixel 算法。
 - 逐像素算子有区域上限 512×512（防卡死）；大图请分区域处理。
+- **窗口最小尺寸拦不住**：Aseprite 没给脚本设置"对话框最小尺寸"的接口，canvas 的
+  `autoscaling` 开或关都不影响（实测能把窗口缩到 40×30）。所以缩太小的时候面板会
+  改画一行"窗口太小，请拖大一点"作为兜底提示。
+- **栏模式是浮动的**：Aseprite 对脚本既没 dock 接口，也**读不到主窗口的位置**
+  （`app.window` 只有 `width`/`height`，没有 `bounds`/`x`/`y`）。所以底边栏/侧边栏
+  是浮条：它按主窗口尺寸贴到右下角，但你把主窗口挪走它就跟着不对了，需要自己拖。
+- **面板窗口点一下会跳回原大小这件事已经修了**（v0.5.0）：根因是每次点画布都会
+  `dlg:modify` 改焦点，而那会触发重新布局把窗口撑回内容自然尺寸。现在只在
+  焦点确实不在输入框、且窗口还是自然尺寸时才 modify。
 
 ## 测试
 
@@ -400,20 +482,29 @@ aseprite.exe -b --script tests/lua/ops_test.lua       # 31 项
 aseprite.exe -b --script tests/lua/versions_test.lua  # 20 项
 aseprite.exe -b --script tests/lua/sizelib_test.lua   # 23 项（裁剪/缩放/包围盒）
 aseprite.exe -b --script tests/lua/artlib_test.lua    # 30 项（字符网格作画）
-aseprite.exe -b --script tests/lua/artop_test.lua     # 40 项（协议层：桥的消息 -> 真动画布）
+aseprite.exe -b --script tests/lua/artop_test.lua     # 63 项（协议层：桥的消息 -> 真动画布）
+aseprite.exe -b --script tests/lua/panel_test.lua     # 75 项（滚轮/状态转圈/Esc 中断/选项输入/三种形态）
 aseprite.exe -b --script tests/lua/path_test.lua      # 安装路径机制
+aseprite.exe -b --script tests/lua/workspace_test.lua # 80 项（工作区：备份/副本/交付/打开/上传，用真文件）
 
 # 桥的自测（mock LLM + mock Aseprite，不联网、不花 token）
-cd bridge && npm test                                 # 181 项，跑下面四个
-node test/selftest.mjs                                # 32 项（端到端：桥 <-> 假 LLM <-> 假 Aseprite）
+cd bridge && npm test                                 # 266 项，跑下面四个
+node test/selftest.mjs                                # 58 项（端到端：桥 <-> 假 LLM <-> 假 Aseprite）
 node test/memory_test.mjs                             # 23 项（记忆库）
 node test/styles_test.mjs                             # 41 项（风格库：优先级/清洗/只注入当前）
-node test/tools_test.mjs                              # 85 项（20 个工具的分发）
+node test/tools_test.mjs                              # 144 项（24 个工具的分发 + 幂等 + 能力清单交叉核对）
 
 # GUI 可视化验证（会短暂弹 Aseprite 窗口并自动截图）
 bash tests/run_gui_visual.sh --term        # 终端面板 + 命令表 + 小面板
 bash tests/run_key_test.sh                 # 真键盘：预填 abc 再发 3 次退格，看是否删空
+bash tests/run_gui_resize.sh               # 窗口尺寸行为（点一下跳不跳、能缩多小）
+bash tests/run_gui_bar.sh                  # 三种形态的窗口尺寸 + 底边栏截图
 ```
+
+四个探针脚本（`tests/lua/*_probe.lua`）是"只能靠真 Aseprite 才能问出答案"的那些问题的
+记录：`ws_api_probe` 验文件 API（saveCopyAs / OpenFile / 路径分隔符），
+`gui_resize_probe` 验窗口跳变的根因，`gui_bar_probe` 验主窗口几何和形态尺寸。
+改这些地方之前先看探针的结论，别重复踩。
 
 `run_key_test.sh` 是唯一能验证"输入光标"的测试：哨兵机制下的光标位置只有真实按键
 路径才暴露，纯 Lua 探针直接改文本会绕过它。

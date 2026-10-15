@@ -30,6 +30,7 @@ local panel = require("lib.panel")
 local settings = require("lib.settings")
 local ws = require("lib.ws")
 local i18n = require("lib.i18n")
+local workspace = require("lib.workspace")
 
 local agent = {}
 local Agent = {}
@@ -42,6 +43,8 @@ function agent.new(cfg)
     cfg = cfg or {},
     conn = nil,
     seq = 0,
+    pendingAskId = nil,      -- P7：正在等用户回答的提问 id
+    pendingAskOptions = nil,
   }, Agent)
 
   self.panel = panel.new{
@@ -50,13 +53,21 @@ function agent.new(cfg)
     onUpload = function(path) self:upload(path) end,
     onMiniAction = function(id) return self:miniAction(id) end,
     onFixRun = function(paths) self:runFixQueue(paths) end,
+    onAskAnswer = function(index) self:answerAsk(index) end,
+  }
+
+  -- 工作文件夹（P10）：备份 / 副本 / 打开 / 交付都交给它。
+  -- root 从桥推来的 config 里取（workspace.root），空 = 工作区模式关闭（现状行为）。
+  self.workspace = workspace.new{
+    getRoot = function() return self.workspaceRoot or "" end,
+    log = function(text, kind) self.panel:log(text, kind) end,
   }
 
   -- 插件内改 API：Save/Test 都走桥，桥负责写 config.json（改完立即生效，不用重启桥）
   self.settings = settings.new{
     port = self.cfg.port,
-    onSave = function(llm)
-      self:send{ type = "set_config", llm = llm }
+    onSave = function(llm, wsRoot)
+      self:send{ type = "set_config", llm = llm, workspace = { root = wsRoot or "" } }
     end,
     onTest = function()
       self.panel:log(i18n.t("testing"), "info")
@@ -133,11 +144,11 @@ end
 
 function Agent:connect(quiet)
   if self.conn and self.conn:isOpen() then return end
-  self.panel:setStatus(string.format(i18n.t("connecting"), self:url()))
+  self.panel:setStatus(string.format(i18n.t("connecting"), self:url()), "busy", self:docName())
 
   self.conn = ws.connect(self:url(), {
     onOpen = function()
-      self.panel:setStatus(i18n.t("connected"))
+      self.panel:setStatus(i18n.t("connected"), "ok", self:docName())
       self.panel:log(string.format(i18n.t("bridged"), self:url()), "info")
       self:send{
         type = "hello",
@@ -151,9 +162,9 @@ function Agent:connect(quiet)
     end,
     onText = function(msg) self:onMessage(msg) end,
     onBinary = function(header, data) self:onBinary(header, data) end,
-    onClose = function() self.panel:setStatus(i18n.t("disconnected")) end,
+    onClose = function() self.panel:setStatus(i18n.t("disconnected"), "error") end,
     onError = function(err)
-      self.panel:setStatus(i18n.t("connError"))
+      self.panel:setStatus(i18n.t("connError"), "error")
       self.panel:log(string.format(i18n.t("connErrorDetail"), tostring(err)), "error")
     end,
   })
@@ -172,6 +183,117 @@ end
 function Agent:nextId()
   self.seq = self.seq + 1
   return self.seq
+end
+
+-- 状态栏要显示"正在改哪个文件"（P5a）。未保存的新文档显示 (untitled)。
+-- 工作区模式下正在编辑副本时，后缀标出来，用户一眼知道现在改的是副本（P10）。
+function Agent:docName()
+  local spr = app.activeSprite
+  if not spr then return "" end
+  if spr.filename and spr.filename ~= "" then
+    local name = app.fs.fileName(spr.filename)
+    if self.workspace and self.workspace:isCopy(spr) then
+      return name .. " " .. i18n.t("wsCopyTag")
+    end
+    return name
+  end
+  return "(untitled)"
+end
+
+-- 改画布之前的工作区准备（P10）。返回 false = 这次编辑必须中止。
+-- 工作区没开时直接放行（保持现状行为）。
+function Agent:prepareEdit(what)
+  if not self.workspace or not self.workspace:enabled() then return true end
+
+  local rep = self.workspace:prepare(app.activeSprite)
+  if rep.skipped then return true end
+  if rep.ok then return true end
+
+  -- 任何一步失败都中止本次编辑，并让桥知道（否则模型会以为改成功了）
+  self.panel:log(tostring(rep.error), "error")
+  self:send{ type = "edit_blocked", what = what, error = tostring(rep.error) }
+  return false
+end
+
+-- 交付（P10）：弹四个选项，选完执行
+function Agent:deliver()
+  local ws = self.workspace
+  if not ws then return end
+  if not ws:enabled() then
+    self.panel:log(i18n.t("wsDisabled"), "info")
+    return
+  end
+  if not ws:hasPending() then
+    self.panel:log(i18n.t("wsNothingPending"), "info")
+    return
+  end
+
+  local labels = ws:deliverLabels()
+  local ids = workspace.DELIVER_CHOICES
+  self.panel:showDeliverDialog(labels, function(pick)
+    if pick == "cancel" then return end
+    local choice = ids[pick]
+    local rep = ws:deliver(choice)
+    if not rep.ok then
+      self.panel:log(tostring(rep.error), "error")
+    end
+    self.panel:setStatus(i18n.t("readyStatus"), "ok", self:docName())
+  end)
+end
+
+-- 按路径打开文档（P11）
+function Agent:openDocument(msg)
+  local id = msg.id
+  local ws = self.workspace
+  local path, err = ws:resolve(msg.path)
+  if not path then
+    self:send{ type = "open_doc_result", id = id, ok = false, error = tostring(err) }
+    return
+  end
+  if not ws:isOpenable(path) then
+    local why = string.format(i18n.t("wsOpenDocBadExt"), tostring(path))
+    self.panel:log(why, "error")
+    self:send{ type = "open_doc_result", id = id, ok = false, error = why }
+    return
+  end
+
+  -- 先试读：读不了就直接报错，别让 Aseprite 弹它自己的原生错误框
+  local readable, readErr = pcall(function()
+    local probe = Sprite{ fromFile = path }
+    if not probe then error("unreadable") end
+    return probe
+  end)
+  if not readable then
+    local why = string.format(i18n.t("wsOpenDocFailed"), tostring(path), tostring(readErr))
+    self.panel:log(why, "error")
+    self:send{ type = "open_doc_result", id = id, ok = false, error = why }
+    return
+  end
+
+  local ok, openErr = pcall(function() app.command.OpenFile{ filename = path, ui = false } end)
+  local spr = app.activeSprite
+  if not ok or not spr then
+    local why = string.format(i18n.t("wsOpenDocFailed"), tostring(path), tostring(openErr))
+    self.panel:log(why, "error")
+    self:send{ type = "open_doc_result", id = id, ok = false, error = why }
+    return
+  end
+
+  self.panel:log(string.format(i18n.t("wsOpened"), app.fs.fileName(spr.filename), spr.width, spr.height), "tool")
+  self:send{ type = "open_doc_result", id = id, ok = true,
+             name = app.fs.fileName(spr.filename), path = tostring(spr.filename),
+             width = spr.width, height = spr.height }
+end
+
+-- 紧急中断（P3）：告诉桥"这一轮别跑了"。
+-- 中断是 Lua -> 桥方向的单程消息，桥收到后 abort 掉当前的 fetch 和工具循环。
+function Agent:abort()
+  if not (self.conn and self.conn:isOpen()) then
+    self.panel:log(i18n.t("abortNothing"), "info")
+    return
+  end
+  self:send{ type = "abort" }
+  self.panel:log(i18n.t("abortSent"), "info")
 end
 
 ----------------------------------------------------------------------
@@ -312,6 +434,15 @@ function Agent:action(name)
   elseif name == "reconnect" then
     if self.conn then self.conn:close() end
     self:connect()
+  elseif name == "abort" then
+    self:abort()
+  elseif name == "deliver" then
+    self:deliver()
+  elseif name == "bar" then
+    self.panel:cycleMode()
+  elseif name == "open_doc" then
+    -- 没有路径参数：提示用户怎么用（真正打开是模型调 open_document 工具）
+    self.panel:log(i18n.t("openDocHint"), "info")
   elseif name == "settings" then
     self.settings:show(self.config)
   elseif name == "upload" or name == "fixadd" then
@@ -382,6 +513,21 @@ end
 ----------------------------------------------------------------------
 
 function Agent:upload(path, fromQueue)
+  -- 工作区开启时：先把图复制进 <root>/uploads/，之后一切操作都针对复制件，
+  -- 原图一个字节都不动（P13）
+  if self.workspace and self.workspace:enabled() then
+    local copied, cerr = self.workspace:copyIn(path)
+    if copied then
+      if copied ~= path then
+        self.panel:log(string.format(i18n.t("wsCopiedIn"), app.fs.fileName(copied)), "info")
+      end
+      path = copied
+    else
+      self.panel:log(string.format(i18n.t("readFailed"), tostring(cerr)), "error")
+      return
+    end
+  end
+
   if not fromQueue then
     self.panel:log(string.format(i18n.t("reading"), path), "info")
   end
@@ -448,17 +594,28 @@ function Agent:onMessage(msg)
   local t = msg.type
 
   if t == "status" then
-    self.panel:setStatus(msg.text or "")
+    -- kind 决定状态栏配色（busy/tool/ok/error）；docName 显示当前文件（P5a）
+    self.panel:setStatus(msg.text or "", msg.kind, self:docName())
 
   elseif t == "say" then
-    self.panel:log(msg.text or "", msg.kind or "ai")
+    -- 桥可以带 i18n 键，让面板用本地化文案显示（中断提示这类固定文案）
+    local text = msg.text or ""
+    if msg.i18n and msg.i18n ~= "" then
+      local local_ = i18n.t(msg.i18n)
+      if local_ ~= nil then text = local_ end
+    end
+    self.panel:log(text, msg.kind or "ai")
 
   elseif t == "clear" then
     self.panel:clear()
 
   elseif t == "config" then
     self.config = msg.llm or {}
-    self.settings:_fill(self.config)
+    if msg.workspace and type(msg.workspace.root) == "string" then
+      self.workspaceRoot = msg.workspace.root
+      if self.workspace then self.workspace:setRoot(self.workspaceRoot) end
+    end
+    self.settings:_fill(self.config, self.workspaceRoot)
     self.panel:log(string.format(
       "Settings: model=%s  baseURL=%s  apiKey=%s",
       self.config.model ~= "" and self.config.model or "(unset)",
@@ -466,6 +623,7 @@ function Agent:onMessage(msg)
       self.config.apiKeySet and ("set " .. tostring(self.config.apiKeyHint or "")) or "NOT SET"), "info")
 
   elseif t == "run_ops" then
+    if not self:prepareEdit("run_ops") then return end
     self:runOps(msg)
 
   elseif t == "snapshot" then
@@ -485,10 +643,23 @@ function Agent:onMessage(msg)
     self:send{ type = "canvas_info_result", id = msg.id, context = self:context() }
 
   elseif t == "crop" or t == "scale" or t == "canvas_size" then
+    if not self:prepareEdit(t) then return end
     self:sizeOp(t, msg)
 
   elseif t == "new_sprite" or t == "add_layer" or t == "draw_art" then
+    -- new_sprite 开的是全新文档，没有"改坏原文件"的风险，不需要副本
+    if t ~= "new_sprite" and not self:prepareEdit(t) then return end
     self:artOp(t, msg)
+
+  elseif t == "ask" then
+    self:askUser(msg)
+
+  elseif t == "open_doc" then
+    self:openDocument(msg)
+
+  elseif t == "list_workspace" then
+    self:send{ type = "workspace_result", id = msg.id, root = self.workspace and self.workspace:getRoot() or "",
+               files = self.workspace and self.workspace:listFiles() or {} }
 
   elseif t == "get_canvas" then
     self:sendCanvas(msg.id)
@@ -624,6 +795,49 @@ function Agent:artOp(kind, msg)
   else
     self.panel:log(string.format(i18n.t("artFailed"), tostring(res)), "error")
     self:send{ type = "art_result", id = id, ok = false, error = tostring(res) }
+  end
+end
+
+----------------------------------------------------------------------
+-- 选项式提问（P7）
+--
+-- 桥侧的 ask_user 工具会发 {type='ask', id, question, options}，然后挂着等
+-- （request 的超时是 5 分钟）。用户有三条路：终端里敲编号 / 弹窗里点按钮 /
+-- 直接把窗口关了（= 取消）。三条路都必须回一帧 answer，否则桥要等到超时。
+----------------------------------------------------------------------
+
+function Agent:askUser(msg)
+  -- 防重：已经有待答问题还来新的，先把旧的答成取消，别让桥挂死
+  if self.pendingAskId then
+    self.panel:log(i18n.t("askSuperseded"), "info")
+    self:send{ type = "answer", id = self.pendingAskId, cancelled = true }
+  end
+
+  self.pendingAskId = msg.id
+  self.pendingAskOptions = msg.options or {}
+
+  local ask = { id = msg.id, question = msg.question or "", options = self.pendingAskOptions }
+  self.panel:setAsk(ask)
+  self.panel:_showAskDialog(ask)
+end
+
+-- index：数字 = 选了第几个；"cancel" / nil = 取消
+function Agent:answerAsk(index)
+  local id = self.pendingAskId
+  if not id then return end
+
+  local opts = self.pendingAskOptions or {}
+  self.pendingAskId = nil
+  self.pendingAskOptions = nil
+  self.panel:setAsk(nil, true)
+  self.panel:_closeAskDialog()
+
+  if type(index) == "number" and opts[index] then
+    self.panel:log(string.format(i18n.t("askAnswered"), tostring(opts[index])), "tool")
+    self:send{ type = "answer", id = id, index = index, choice = opts[index] }
+  else
+    self.panel:log(i18n.t("askCancelled"), "info")
+    self:send{ type = "answer", id = id, cancelled = true }
   end
 end
 

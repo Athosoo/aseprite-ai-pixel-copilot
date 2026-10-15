@@ -14,6 +14,9 @@ import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from 'node
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import WebSocket from 'ws';
+import { TOOLS } from '../src/tools.mjs';
+
+const TOOL_COUNT = TOOLS.length;
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -67,6 +70,9 @@ function makePseudoPixelArt(scale = 4, logical = 16) {
 }
 
 // ------------------------------------------------------------ mock LLM
+// 脚本里放 HANG 表示"这个请求永不回复"，用来测中断 / 超时（P3）
+const HANG = Symbol('hang');
+
 function startMockLlm(script) {
   let call = 0;
   const server = createServer((req, res) => {
@@ -75,6 +81,7 @@ function startMockLlm(script) {
     req.on('end', () => {
       const step = script[Math.min(call, script.length - 1)];
       call++;
+      if (step === HANG) return;      // 故意不响应：模拟卡死的上游
       const payload = typeof step === 'function' ? step(JSON.parse(body || '{}'), call) : step;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(payload));
@@ -111,6 +118,7 @@ class MockAseprite {
     this.says = [];
     this.statuses = [];
     this.imports = [];
+    this.asks = [];
     this.autoReply = true;
     this.canvas = null;
     this.failNextOps = null;
@@ -218,6 +226,10 @@ class MockAseprite {
         );
         break;
       }
+      case 'ask':
+        // P7：把提问记下来，等测试脚本替用户回答（不自动回，模拟"人在看"）
+        this.asks.push({ id: msg.id, question: msg.question, options: msg.options });
+        break;
       case 'import_image':
         this.lastHeader = msg;
         break;
@@ -470,6 +482,203 @@ async function main() {
 
   bridge4.kill();
   ase4.close();
+  await sleep(200);
+
+  // ---- 场景 8：紧急中断 + 轮级超时（P3）
+  console.log('== 场景 8：abort 帧中断卡住的这一轮 / maxTurnMs 自动中断 ==');
+  // maxTurnMs 压到 1200ms：8b 不用等 3 分钟
+  const cfg5 = { ...testConfig, port: BRIDGE_PORT + 40, llm: { ...testConfig.llm, maxTurnMs: 1200 } };
+  const configPath5 = join(TMP, 'config5.json');
+  writeFileSync(configPath5, JSON.stringify(cfg5, null, 2), 'utf8');
+  const bridge5 = spawn(process.execPath, [join(ROOT, 'src', 'server.mjs'), '--config', configPath5], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  await sleep(700);
+  const ase5 = new MockAseprite(BRIDGE_PORT + 40);
+  await ase5.connect();
+  await sleep(200);
+
+  // 8a：第一步给个工具调用，之后上游永不回复 -> 用户在卡住时按「停止」
+  mockLlm.close();
+  mockLlm = await startMockLlm([
+    toolCall('call_8a', 'apply_ops', { label: '长活', ops: [{ op: 'replace_color', from: '#111111', to: '#222222' }] }),
+    HANG,
+  ]);
+  await sleep(150);
+  ase5.chat('做一件很久的事');
+  await sleep(500);                       // 让它走到第二个请求（卡住的那次）
+  const beforeAbort = Date.now();
+  ase5.send({ type: 'abort' });
+  await sleep(600);
+  check('手动中断后提示"已中断"',
+    ase5.says.some((s) => s.i18n === 'aborted'), ase5.says.slice(-3));
+  check('中断后状态回到 ready',
+    ase5.statuses[ase5.statuses.length - 1] === 'ready', ase5.statuses.slice(-3));
+  check('中断是立刻生效的（< 500ms 就有回复）', Date.now() - beforeAbort < 1500,
+    `${Date.now() - beforeAbort}ms`);
+
+  // 8b：不按停止 -> 轮级超时自动中断（maxTurnMs = 1200）
+  ase5.statuses.length = 0;
+  ase5.says.length = 0;
+  ase5.chat('再来一件很久的事');
+  await sleep(2400);
+  check('超时后提示"超时自动中断"',
+    ase5.says.some((s) => s.i18n === 'abortTimeout'), ase5.says.slice(-3));
+  check('超时后状态回到 ready',
+    ase5.statuses[ase5.statuses.length - 1] === 'ready', ase5.statuses.slice(-3));
+  check('超时中断和手动中断给的是不同提示',
+    !ase5.says.some((s) => s.i18n === 'aborted'), ase5.says.slice(-3));
+
+  // 8c：没有任务在跑时按停止，不能挂死
+  ase5.says.length = 0;
+  ase5.send({ type: 'abort' });
+  await sleep(300);
+  check('空闲时按停止 -> 明确说没有任务在跑',
+    ase5.says.some((s) => s.i18n === 'abortNothing'), ase5.says.slice(-2));
+
+  // ---- 场景 9：已经矫正过的图不再被处理（P8）
+  console.log('== 场景 9：已是真像素画 -> 不导入、不重试 ==');
+  ase5.says.length = 0;
+  ase5.imports.length = 0;
+  ase5.received.length = 0;
+  ase5.canvas = makePseudoPixelArt(1, 16);        // 16x16，每格 1px = 已矫正过
+  mockLlm.close();
+  mockLlm = await startMockLlm([
+    toolCall('call_9a', 'perfect_pixel', { source: 'active_canvas' }),
+    (body) => {
+      // 第二步：把工具结果记下来，断言桥返回的是"别重试"
+      const toolMsgs = (body.messages || []).filter((m) => m.role === 'tool');
+      global.__ppResult = toolMsgs.length ? JSON.parse(toolMsgs[toolMsgs.length - 1].content) : null;
+      return textReply('这张已经是真像素画了，不需要再处理。');
+    },
+  ]);
+  await sleep(150);
+  ase5.chat('把当前这张图矫正一下');
+  await sleep(1500);
+  check('桥向 Aseprite 索要了画布', ase5.received.some((m) => m.type === 'get_canvas'),
+    ase5.received.map((m) => m.type));
+  check('没有回传导入图像（不开多余文档）', ase5.imports.length === 0, ase5.imports);
+  check('工具结果标了 noGridDetected', global.__ppResult?.noGridDetected === true, global.__ppResult);
+  check('工具结果明确禁止盲目重试 gridSize',
+    /do NOT retry/i.test(global.__ppResult?.note || ''), global.__ppResult?.note);
+
+  bridge5.kill();
+  ase5.close();
+  await sleep(200);
+  // ---- 场景 10：选项式提问 ask_user（P7）
+  console.log('== 场景 10：ask_user 弹选项 -> 答案回到模型上下文 ==');
+  const cfg6 = { ...testConfig, port: BRIDGE_PORT + 50 };
+  const configPath6 = join(TMP, 'config6.json');
+  writeFileSync(configPath6, JSON.stringify(cfg6, null, 2), 'utf8');
+  const bridge6 = spawn(process.execPath, [join(ROOT, 'src', 'server.mjs'), '--config', configPath6], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  await sleep(700);
+  const ase6 = new MockAseprite(BRIDGE_PORT + 50);
+  await ase6.connect();
+  await sleep(200);
+
+  mockLlm.close();
+  global.__askResult = null;
+  mockLlm = await startMockLlm([
+    toolCall('call_10a', 'ask_user', {
+      question: '覆盖原图还是保留副本？',
+      options: ['覆盖原图', '保留副本'],
+    }),
+    (body) => {
+      const toolMsgs = (body.messages || []).filter((m) => m.role === 'tool');
+      global.__askResult = toolMsgs.length ? JSON.parse(toolMsgs[toolMsgs.length - 1].content) : null;
+      return textReply('好，保留副本。');
+    },
+  ]);
+  await sleep(150);
+  ase6.chat('这张图改完怎么处理？');
+  await sleep(700);
+
+  check('桥把提问下发到面板', ase6.asks.length === 1, ase6.asks);
+  check('问题原样下发', ase6.asks[0]?.question === '覆盖原图还是保留副本？', ase6.asks[0]);
+  check('选项原样下发', ase6.asks[0]?.options?.length === 2 && ase6.asks[0].options[0] === '覆盖原图',
+    ase6.asks[0]?.options);
+  check('用户回答之前工具没有返回（桥在等）', global.__askResult === null, global.__askResult);
+
+  ase6.send({ type: 'answer', id: ase6.asks[0].id, index: 2, choice: '保留副本' });
+  await sleep(800);
+  check('选择回到了模型上下文',
+    global.__askResult?.ok === true && global.__askResult?.choice === '保留副本', global.__askResult);
+  check('AI 基于选择给出了回复',
+    ase6.says.some((s) => s.kind === 'ai' && s.text.includes('保留')), ase6.says.slice(-3));
+
+  // 取消路径：用户关掉弹窗
+  ase6.asks.length = 0;
+  ase6.says.length = 0;
+  mockLlm.close();
+  global.__askResult = null;
+  mockLlm = await startMockLlm([
+    toolCall('call_10b', 'ask_user', { question: '还要继续吗？', options: ['继续', '停下'] }),
+    (body) => {
+      const toolMsgs = (body.messages || []).filter((m) => m.role === 'tool');
+      global.__askResult = toolMsgs.length ? JSON.parse(toolMsgs[toolMsgs.length - 1].content) : null;
+      return textReply('那先停在这里。');
+    },
+  ]);
+  await sleep(150);
+  ase6.chat('再问一次');
+  await sleep(700);
+  ase6.send({ type: 'answer', id: ase6.asks[0].id, cancelled: true });
+  await sleep(800);
+  check('取消也回到了模型上下文', global.__askResult?.cancelled === true, global.__askResult);
+
+  // 参数校验：少于 2 个选项不弹窗，直接把原因回给模型
+  mockLlm.close();
+  global.__askResult = null;
+  mockLlm = await startMockLlm([
+    toolCall('call_10c', 'ask_user', { question: '只有一个选项？', options: ['唯一'] }),
+    (body) => {
+      const toolMsgs = (body.messages || []).filter((m) => m.role === 'tool');
+      global.__askResult = toolMsgs.length ? JSON.parse(toolMsgs[toolMsgs.length - 1].content) : null;
+      return textReply('那我直接问你吧。');
+    },
+  ]);
+  await sleep(150);
+  ase6.asks.length = 0;
+  ase6.chat('再来一次');
+  await sleep(800);
+  check('少于 2 个选项被拒绝，没弹窗', ase6.asks.length === 0, ase6.asks);
+  check('拒绝了并告诉模型原因',
+    typeof global.__askResult?.error === 'string' && /options/.test(global.__askResult.error),
+    global.__askResult);
+
+  // ---- 场景 11：capabilities 清单（P14）
+  console.log('== 场景 11：capabilities 与真实工具表一致 ==');
+  mockLlm.close();
+  global.__cap = null;
+  mockLlm = await startMockLlm([
+    toolCall('call_11a', 'capabilities', {}),
+    (body) => {
+      const toolMsgs = (body.messages || []).filter((m) => m.role === 'tool');
+      global.__cap = toolMsgs.length ? JSON.parse(toolMsgs[toolMsgs.length - 1].content) : null;
+      return textReply('我能改画布、画像素画和矫正图片；不能联网。');
+    },
+  ]);
+  await sleep(150);
+  ase6.chat('你能做什么？');
+  await sleep(800);
+  const cap = global.__cap;
+  check('capabilities 返回了 can 段', !!cap?.can, cap);
+  check('can.tools 里有 ask_user 和 capabilities 自己',
+    !!cap?.can?.tools?.ask_user && !!cap?.can?.tools?.capabilities, Object.keys(cap?.can?.tools || {}));
+  check('can.tools 覆盖了所有注册工具（不会漏报能力）',
+    Object.keys(cap?.can?.tools || {}).length === TOOL_COUNT,
+    `${Object.keys(cap?.can?.tools || {}).length} vs ${TOOL_COUNT}`);
+  check('cannot 段非空，且明确要求别吹牛',
+    Array.isArray(cap?.cannot) && cap.cannot.length >= 4 && /only promise/i.test(cap?.honesty || ''),
+    [cap?.cannot?.length, cap?.honesty]);
+  check('cannot 里明确说了不能联网', cap?.cannot?.some((x) => /network/i.test(x)), cap?.cannot);
+  check('can.edit_ops 来自 Aseprite 侧的真实算子表',
+    Array.isArray(cap?.can?.edit_ops) && cap.can.edit_ops.includes('replace_color'), cap?.can?.edit_ops);
+
+  bridge6.kill();
+  ase6.close();
   await sleep(200);
 
   console.log(`\n==== selftest: ${passes} 通过, ${fails} 失败 ====`);

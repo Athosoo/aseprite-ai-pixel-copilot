@@ -3,7 +3,22 @@
 // 兼容 DeepSeek / 通义 / Kimi / 智谱 / 本地 Ollama 等任何 OpenAI 兼容端点：
 // 只要 config.json 里填对 baseUrl + apiKey + model。
 
-export async function chatCompletion(cfg, messages, tools) {
+/**
+ * 一轮对话被用户/超时中断时抛这个（和真正的错误区分开 —— 中断不是错误）。
+ */
+export class TurnAborted extends Error {
+  constructor(reason = 'user') {
+    super('turn aborted');
+    this.name = 'TurnAborted';
+    this.reason = reason;   // 'user' | 'timeout'
+  }
+}
+
+/**
+ * @param extraSignal 外部的中断信号（面板上的「停止」/ Esc / 轮级超时）。
+ *   它触发时我们 abort 掉内部的 ctrl，从而中断这次 fetch。
+ */
+export async function chatCompletion(cfg, messages, tools, extraSignal) {
   const url = String(cfg.baseUrl || '').replace(/\/+$/, '') + '/chat/completions';
   const body = {
     model: cfg.model,
@@ -18,6 +33,14 @@ export async function chatCompletion(cfg, messages, tools) {
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 120000);
+
+  // 外部信号 -> 内部 ctrl。已经 aborted 的要立刻生效（不能只等事件）。
+  const onAbort = () => ctrl.abort();
+  if (extraSignal) {
+    if (extraSignal.aborted) ctrl.abort();
+    else extraSignal.addEventListener('abort', onAbort, { once: true });
+  }
+
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -44,6 +67,7 @@ export async function chatCompletion(cfg, messages, tools) {
     return parsed;
   } finally {
     clearTimeout(timer);
+    if (extraSignal) extraSignal.removeEventListener('abort', onAbort);
   }
 }
 
@@ -88,10 +112,11 @@ export function buildUserMessage(userText, context) {
  *   tools      OpenAI 工具 schema 数组
  *   dispatch   async (name, args) => result
  *   onSay      (kind, text) => void
- *   onStatus   (text) => void
+ *   onStatus   (text, kind) => void
+ *   abortSignal 外部中断信号（见 chatCompletion）；中断时抛 TurnAborted
  */
 export async function runTurn(opts) {
-  const { cfg, systemPrompt, history, userText, context, tools, dispatch, onSay, onStatus } = opts;
+  const { cfg, systemPrompt, history, userText, context, tools, dispatch, onSay, onStatus, abortSignal } = opts;
 
   // 系统提示每步重取：模型可能在**同一轮**里 style_use 换了风格，
   // 那后面的作画步骤就得立刻按新风格来（否则"换个风格画个图标"要两轮才生效）。
@@ -104,10 +129,29 @@ export async function runTurn(opts) {
   const maxSteps = cfg.maxSteps ?? 8;
   let finalText = '';
 
+  // 中断检查点：每步开头、每次 HTTP 前后、每个工具调用前都要过一遍，
+  // 否则"停止"要等到当前这一步跑完才生效。
+  const reason = () => (abortSignal?.aborted ? (abortSignal.reason === 'timeout' ? 'timeout' : 'user') : null);
+  const checkAbort = () => {
+    const r = reason();
+    if (r) throw new TurnAborted(r);
+  };
+
   for (let step = 0; step < maxSteps; step++) {
+    checkAbort();
     messages[0] = { role: 'system', content: sysNow() };
-    onStatus(step === 0 ? 'thinking...' : `working (step ${step + 1})...`);
-    const resp = await chatCompletion(cfg, messages, tools);
+    onStatus(step === 0 ? 'thinking...' : `working (step ${step + 1})...`, 'busy');
+
+    let resp;
+    try {
+      resp = await chatCompletion(cfg, messages, tools, abortSignal);
+    } catch (e) {
+      // fetch 被 abort 时抛 AbortError —— 转成 TurnAborted，别当错误报给用户
+      if (abortSignal?.aborted) throw new TurnAborted(reason() || 'user');
+      throw e;
+    }
+    checkAbort();
+
     const msg = resp.choices?.[0]?.message;
     if (!msg) throw new Error('LLM response has no message field');
 
@@ -131,11 +175,12 @@ export async function runTurn(opts) {
     }
 
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
-      onStatus('ready');
+      onStatus('ready', 'ok');
       return finalText;
     }
 
     for (const call of msg.tool_calls) {
+      checkAbort();
       const name = call.function?.name;
       let args = {};
       try {
@@ -143,13 +188,14 @@ export async function runTurn(opts) {
       } catch (e) {
         args = { __parseError: String(e.message || e) };
       }
-      onStatus(`running ${name}...`);
+      onStatus(`running ${name}...`, 'tool');
       let result;
       try {
         result = await dispatch(name, args);
       } catch (e) {
         result = { error: String(e?.message || e) };
       }
+      checkAbort();
       messages.push({
         role: 'tool',
         tool_call_id: call.id,
@@ -158,7 +204,7 @@ export async function runTurn(opts) {
     }
   }
 
-  onStatus('ready');
+  onStatus('ready', 'ok');
   onSay('error', `Stopped: hit the ${maxSteps}-step tool limit. Try a smaller request.`);
   return finalText;
 }

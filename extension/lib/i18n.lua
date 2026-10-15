@@ -43,7 +43,10 @@ local LOCALES = {
     starting   = "starting...",
     readyStatus= "ready",
     connected  = "connected",
+    statusWorking = "working (step %d)...",
+    statusRunning = "running %s...",
     statusMap = {
+      ["thinking..."] = "thinking...",
       ["ready"] = "ready",
       ["connected, waiting for input"] = "connected, waiting for input",
       ["missing API key"] = "missing API key",
@@ -57,6 +60,59 @@ local LOCALES = {
     connError  = "connection error",
     connErrorDetail = "Connection error: %s",
     connectingLong = "Connecting to the local bridge. If it never connects, start it manually:",
+    bridgeDown = "Bridge is down -- type menu > Settings to check the config, or start the bridge manually.",
+    tooSmall   = "Window too small -- drag it bigger",
+    askTitle   = "Choose an option",
+    askOption  = "  %d) %s",
+    askHint    = "(type the number, or click a button in the dialog)",
+    askAnswered= "Answered: %s",
+    askCancelled = "Question dismissed.",
+    askSuperseded = "Previous question was replaced by a new one.",
+    -- P10 工作区
+    wsNoDoc    = "No document is open.",
+    wsNoPath   = "No path given, and there is no workspace or saved document to resolve it against.",
+    wsNeedSave = "This document has never been saved. Save it first (File > Save As) so there is an original to back up and deliver to.",
+    wsMakeDir  = "create the folder",
+    wsBackup   = "write the backup",
+    wsBackupVerify = "verify the backup file",
+    wsCopy     = "write the copy",
+    wsCopyIn   = "copy the file into the workspace",
+    wsOpen     = "open the copy",
+    wsStepFailed = "Workspace step failed (%s): %s -- the edit was aborted, nothing was changed.",
+    wsOpenWrong  = "Aseprite opened %s instead of the copy; aborting so the edit does not land on the wrong document.",
+    wsPrepared = "Backed up to %s -- now editing the copy %s. Type deliver when you are done.",
+    wsOverwrite = "Overwrite the original",
+    wsKeep     = "Keep the copy",
+    wsDiscard  = "Throw the copy away",
+    wsContinue = "Keep editing",
+    wsNothingPending = "Nothing to deliver: no copy is being edited.",
+    wsNotTheCopy = "The active document is not the working copy, so there is nothing to overwrite with.",
+    wsOverwritten = "Overwrote %s (backup kept at %s).",
+    wsKept      = "Kept the copy %s (backup at %s).",
+    wsDiscarded = "Deleted the copy %s (backup kept at %s).",
+    wsUnknownChoice = "Unknown delivery choice: %s",
+    wsTitle     = "Deliver the edit",
+    wsQuestion  = "This copy was edited. What should happen to it?",
+    wsCopiedIn  = "Copied into the workspace: %s",
+    wsNothing   = "(the workspace has no files yet)",
+    -- P11 打开文档
+    wsOpenDocFailed = "Cannot open %s: %s",
+    wsOpenDocBadExt = "Refusing to open %s: only image/document files can be opened (ase/aseprite/png/jpg/gif/webp/bmp).",
+    wsOpened    = "Opened %s (%dx%d).",
+    wsCopyTag   = "[copy]",
+    modePanel   = "panel",
+    modeBarBottom = "bottom bar",
+    modeBarSide = "side bar",
+    modeChanged = "Layout: %s",
+    barHint     = "Drag this strip to the bottom or side edge -- Aseprite gives scripts no dock API, so it stays a floating strip.",
+    wsDisabled  = "Workspace mode is off (set workspace.root in the settings to turn it on).",
+    wsListTitle = "Workspace files (%d):",
+    wsListNone  = "(no files in uploads/ or backups/ yet)",
+    openDocHint = "To open a file, just tell the assistant which one (e.g. \"open 001.ase\") -- it resolves paths inside the workspace.",
+    aborted    = "Task interrupted.",
+    abortTimeout = "Task timed out and was interrupted automatically.",
+    abortSent  = "Interrupt requested...",
+    abortNothing = "Nothing is running right now.",
     bridged    = "Connected to local bridge %s",
     testing    = "Testing LLM connection...",
     backedUp   = "Backed up: v%d \"%s\"  %s",
@@ -98,7 +154,7 @@ local LOCALES = {
     },
     mini = {
       snapshot = "Snapshot", rollback = "Rollback", versions = "Versions",
-      fix = "Fix images", settings = "Settings", close = "Hide",
+      fix = "Fix images", bar = "Layout", settings = "Settings", close = "Hide",
     },
     -- 内建命令 -> 动作 id
     builtins = {
@@ -106,6 +162,8 @@ local LOCALES = {
       settings = "settings", config = "settings", snapshot = "snapshot", backup = "snapshot",
       rollback = "rollback", undo = "rollback", versions = "versions", history = "versions",
       fix = "fix", upload = "upload", open = "upload", reconnect = "reconnect",
+      stop = "abort", abort = "abort", interrupt = "abort", cancel = "abort",
+      deliver = "deliver", opendoc = "open_doc", ["open-doc"] = "open_doc",
       exit = "@exit", quit = "@exit", close = "@exit", bye = "@exit",
     },
   },
@@ -139,7 +197,10 @@ local LOCALES = {
     starting   = "启动中...",
     readyStatus= "就绪",
     connected  = "已连接",
+    statusWorking = "正在处理（第 %d 步）…",
+    statusRunning = "正在执行 %s…",
     statusMap = {
+      ["thinking..."] = "思考中…",
       ["ready"] = "就绪",
       ["connected, waiting for input"] = "已连接，等待输入",
       ["missing API key"] = "缺少 API Key",
@@ -153,6 +214,59 @@ local LOCALES = {
     connError  = "连接出错",
     connErrorDetail = "连接出错：%s",
     connectingLong = "正在连接本地桥；如果一直连不上，手动启动它：",
+    bridgeDown = "桥断了 —— 敲 menu → 设置 检查配置，或手动启动桥（见上方提示）。",
+    tooSmall   = "窗口太小，请拖大一点",
+    askTitle   = "请选择",
+    askOption  = "  %d）%s",
+    askHint    = "（输入编号，或点弹窗里的按钮）",
+    askAnswered= "已选择：%s",
+    askCancelled = "已取消这次提问。",
+    askSuperseded = "上一个问题被新问题顶掉了。",
+    -- P10 工作区
+    wsNoDoc    = "当前没有打开的文档。",
+    wsNoPath   = "没给路径，也没有工作区或已保存的文档可以拿来定位。",
+    wsNeedSave = "这个文档从没保存过。请先另存为一个文件（文件 → 另存为），这样才有原文件可以备份和交付。",
+    wsMakeDir  = "建目录",
+    wsBackup   = "写备份",
+    wsBackupVerify = "校验备份文件",
+    wsCopy     = "写副本",
+    wsCopyIn   = "把文件复制进工作区",
+    wsOpen     = "打开副本",
+    wsStepFailed = "工作区步骤失败（%s）：%s —— 本次编辑已中止，画布没有被改动。",
+    wsOpenWrong  = "Aseprite 打开的是 %s，不是副本；为防止改错文档，已中止本次编辑。",
+    wsPrepared = "已备份到 %s，正在编辑副本 %s。改完敲「交付」。",
+    wsOverwrite = "覆盖原文件",
+    wsKeep     = "保留副本",
+    wsDiscard  = "丢弃副本",
+    wsContinue = "继续修改",
+    wsNothingPending = "没有待交付的内容：当前没有在编辑副本。",
+    wsNotTheCopy = "当前文档不是那份副本，没法用它覆盖原文件。",
+    wsOverwritten = "已覆盖 %s（备份留在 %s）。",
+    wsKept      = "已保留副本 %s（备份在 %s）。",
+    wsDiscarded = "已删除副本 %s（备份留在 %s）。",
+    wsUnknownChoice = "未知的交付选项：%s",
+    wsTitle     = "交付这次修改",
+    wsQuestion  = "这份副本已经改过了，要怎么处理？",
+    wsCopiedIn  = "已复制进工作区：%s",
+    wsNothing   = "（工作区里还没有文件）",
+    -- P11 打开文档
+    wsOpenDocFailed = "打不开 %s：%s",
+    wsOpenDocBadExt = "拒绝打开 %s：只能打开图片/文档类文件（ase/aseprite/png/jpg/gif/webp/bmp）。",
+    wsOpened    = "已打开 %s（%dx%d）。",
+    wsCopyTag   = "［副本］",
+    modePanel   = "面板",
+    modeBarBottom = "底边栏",
+    modeBarSide = "侧边栏",
+    modeChanged = "已切换形态：%s",
+    barHint     = "把这条拖到底边或侧边即可 —— Aseprite 没给脚本停靠接口，所以它是一条浮动条。",
+    wsDisabled  = "工作区模式没开（在设置里填「工作区路径」可以打开）。",
+    wsListTitle = "工作区文件（%d）：",
+    wsListNone  = "（uploads/ 和 backups/ 里还没有文件）",
+    openDocHint = "要打开文件，直接跟助手说文件名（例如「打开 001.ase」），它会在工作区里找。",
+    aborted    = "已中断当前任务。",
+    abortTimeout = "任务超时，已自动中断。",
+    abortSent  = "已发出中断请求…",
+    abortNothing = "当前没有正在执行的任务。",
     bridged    = "已连上本地桥 %s",
     testing    = "正在测试 LLM 连接...",
     backedUp   = "已备份：v%d \"%s\"  %s",
@@ -194,7 +308,7 @@ local LOCALES = {
     },
     mini = {
       snapshot = "快照", rollback = "回滚", versions = "版本栈",
-      fix = "矫正图片", settings = "设置", close = "收起",
+      fix = "矫正图片", bar = "切形态", settings = "设置", close = "收起",
     },
     builtins = {
       menu = "menu", ["菜单"] = "menu", ["命令"] = "menu", ["命令表"] = "menu",
@@ -207,6 +321,11 @@ local LOCALES = {
       fix = "fix", ["矫正"] = "fix",
       upload = "upload", open = "upload", ["选图"] = "upload", ["打开"] = "upload",
       reconnect = "reconnect", ["重连"] = "reconnect",
+      stop = "abort", abort = "abort", ["停止"] = "abort", ["中断"] = "abort",
+      deliver = "deliver", ["交付"] = "deliver", ["提交"] = "deliver",
+      opendoc = "open_doc", ["打开文档"] = "open_doc", ["打开路径"] = "open_doc",
+      bar = "bar", ["栏"] = "bar", ["边栏"] = "bar", ["侧栏"] = "bar", ["形态"] = "bar",
+      ["终止"] = "abort", ["打断"] = "abort",
       exit = "@exit", quit = "@exit", close = "@exit", bye = "@exit",
       ["退出"] = "@exit", ["关闭"] = "@exit",
     },
@@ -224,6 +343,10 @@ local BUILDER = {
       { id = "upload",    keys = "U", label = "Pick image file",                    note = "choose a source image" },
       { id = "settings",  keys = "T", label = "Settings (Base URL / Model / Key)",  note = "LLM connection" },
       { id = "reconnect", keys = "C", label = "Reconnect to bridge",                note = "retry the local bridge" },
+      { id = "abort",     keys = "X", label = "Interrupt the running task",         note = "same as pressing Esc" },
+      { id = "deliver",   keys = "D", label = "Deliver the edit (workspace)",       note = "overwrite / keep / discard" },
+      { id = "open_doc",  keys = "O", label = "Open a document by path",            note = "inside the workspace" },
+      { id = "bar",       keys = "B", label = "Switch layout",                     note = "panel / bottom bar / side bar" },
       { id = "clear",     keys = "L", label = "Clear console",                      note = "wipe the scrollback" },
       { id = "help",      keys = "H", label = "Help / examples",                    note = "how to talk to the AI" },
     }
@@ -237,6 +360,10 @@ local BUILDER = {
       { id = "upload",    keys = "U", label = "选择图片文件",            note = "挑选源图" },
       { id = "settings",  keys = "T", label = "设置（Base URL / 模型 / API Key）", note = "LLM 连接" },
       { id = "reconnect", keys = "C", label = "重连本地桥",              note = "重试 WebSocket" },
+      { id = "abort",     keys = "X", label = "中断当前任务",            note = "和按 Esc 一样" },
+      { id = "deliver",   keys = "D", label = "交付本次修改（工作区）",    note = "覆盖 / 保留 / 丢弃" },
+      { id = "open_doc",  keys = "O", label = "按路径打开文档",          note = "工作区里的文件" },
+      { id = "bar",       keys = "B", label = "切换形态",                note = "面板 / 底边栏 / 侧边栏" },
       { id = "clear",     keys = "L", label = "清屏",                    note = "清空回滚缓冲" },
       { id = "help",      keys = "H", label = "帮助 / 示例",             note = "怎么跟 AI 说话" },
     }
@@ -408,12 +535,24 @@ end
 -- 触发词
 ----------------------------------------------------------------------
 
--- 桥那边发来的状态是英文硬编码的，这里按表翻译（表里没有的原样显示）
+-- 桥那边发来的状态是英文硬编码的，这里按表翻译（表里没有的原样显示）。
+-- 有些状态带变量（"working (step 2)..." / "running crop..."），所以除了查表还要认前缀。
 function i18n.statusText(text)
   local s = tostring(text or "")
   local loc = LOCALES[i18n.lang()] or LOCALES.zh_hans
   local map = loc.statusMap or {}
-  return map[s] or s
+  if map[s] then return map[s] end
+
+  local step = s:match("^working %(step (%d+)%)")
+  if step then
+    return string.format(loc.statusWorking or "working (step %d)...", tonumber(step) or 0)
+  end
+  local opname = s:match("^running (.+)$")
+  if opname then
+    opname = opname:gsub("%.+$", "")       -- 桥那边自带 "...", 免得叠成 "........"
+    return string.format(loc.statusRunning or "running %s...", opname)
+  end
+  return s
 end
 
 -- 终端内建命令：返回 动作 id（"@exit" 表示退出控制台），不匹配返回 nil

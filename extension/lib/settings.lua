@@ -17,7 +17,7 @@ function Settings:isShown()
   return self.shown
 end
 
-function Settings:_fill(current)
+function Settings:_fill(current, wsRoot)
   if not (self.dlg and self.shown) then return end
   current = current or {}
   local data = {
@@ -26,6 +26,9 @@ function Settings:_fill(current)
   }
   pcall(function() self.dlg:modify{ id = "baseUrl", text = data.baseUrl } end)
   pcall(function() self.dlg:modify{ id = "model", text = data.model } end)
+  if wsRoot ~= nil then
+    pcall(function() self.dlg:modify{ id = "wsRoot", text = tostring(wsRoot) } end)
+  end
   pcall(function()
     self.dlg:modify{
       id = "apiKey",
@@ -88,13 +91,15 @@ function Settings:_values()
     baseUrl = tostring(d.baseUrl or ""),
     model = tostring(d.model or ""),
     apiKey = tostring(d.apiKey or ""),
+    wsRoot = tostring(d.wsRoot or ""),
   }
 end
 
 function Settings:_save()
-  local llm = self:_values()
+  local v = self:_values()
   if self.dlg then pcall(function() self.dlg:modify{ id = "apiKey", text = "" } end) end
-  if self.opts.onSave then self.opts.onSave(llm) end
+  local llm = { baseUrl = v.baseUrl, model = v.model, apiKey = v.apiKey }
+  if self.opts.onSave then self.opts.onSave(llm, v.wsRoot) end
 end
 
 function Settings:_test()

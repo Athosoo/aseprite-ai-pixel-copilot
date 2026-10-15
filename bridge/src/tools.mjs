@@ -6,6 +6,19 @@
 
 import { perfectPixel } from './perfectpixel.mjs';
 
+// RGBA 里有多少种不同的颜色（忽略全透明像素）。
+// 给 perfect_pixel 当诊断数据：像素画通常几十色以内，照片则成千上万。
+function countDistinctColors(rgba, cap = 4096) {
+  const seen = new Set();
+  for (let i = 0; i < rgba.length; i += 4) {
+    if (rgba[i + 3] === 0) continue;
+    const key = (rgba[i] << 16) | (rgba[i + 1] << 8) | rgba[i + 2];
+    seen.add(key);
+    if (seen.size > cap) return cap + 1;   // 够多了，不用数完
+  }
+  return seen.size;
+}
+
 const REGION_SCHEMA = {
   type: 'object',
   description: 'Rectangular region in pixel coordinates (origin at top-left). Omit = whole canvas.',
@@ -201,6 +214,69 @@ export const TOOLS = [
         },
         required: ['name'],
       },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ask_user',
+      description:
+        'Ask the user to pick one of a few options. The panel turns this into clickable buttons, so it is ' +
+        'much better than asking in prose when you genuinely need the user to decide something ' +
+        '(overwrite the original or keep the copy, which of two looks, which file, which size). ' +
+        'Do NOT use it for small talk or for things you can figure out yourself. ' +
+        'Returns the chosen option text, or { cancelled: true } if the user dismissed it.',
+      parameters: {
+        type: 'object',
+        properties: {
+          question: { type: 'string', description: 'One short question, in the user\'s language' },
+          options: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '2 to 4 options, each under 30 characters, in the user\'s language',
+          },
+        },
+        required: ['question', 'options'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'capabilities',
+      description:
+        'Read your own capability list: which tools you actually have, and what you explicitly cannot do. ' +
+        'Call it before answering "can you do X?" style questions, and whenever the user asks what you are ' +
+        'able to do. Never promise anything that is not in this list.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'open_document',
+      description:
+        'Open an image or Aseprite document in Aseprite, by path. Relative paths resolve against the ' +
+        'workspace root, then against the folder of the current document. Use it when the user says ' +
+        '"open X" or wants to work on another file. Returns the document name and size.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'absolute path, or a path relative to the workspace root' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_workspace',
+      description:
+        'List the files the assistant has put in the workspace (uploads/ and backups/). ' +
+        'Use it to answer "where is the file you made?" or to find the right name for open_document. ' +
+        'Returns { root, files: [{name, path, dir}] }.',
+      parameters: { type: 'object', properties: {}, required: [] },
     },
   },
   {
@@ -433,8 +509,44 @@ export const TOOLS = [
   },
 ];
 
-export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath, getActiveStyle, setActiveStyle }) {
-  return async function dispatch(name, args) {
+// 明确做不到的事（P14）。这份清单必须诚实 —— 用户就是要求"做不到的时候要诚实"，
+// 所以宁可写得保守，也不要吹。
+const CANNOT = [
+  'No network access: you cannot search the web, fetch URLs, or call any service other than the configured LLM.',
+  'No arbitrary file access: you can only open image documents (through open_document / the workspace) and write inside the workspace. You cannot read or write other files on the machine.',
+  'No vector / audio / font generation. Raster pixel art only.',
+  'You cannot undo silently. Every edit is snapshotted first, but going back is an explicit rollback.',
+  'You cannot paint outside the canvas: pixels that fall outside are skipped and counted.',
+  "You cannot see the screen or the user's UI. You only know the canvas state, layer list, colour histogram and file list you are given.",
+  "You cannot dock the panel into the Aseprite layout, and you cannot change Aseprite's own script-permission dialogs (those follow Aseprite's language setting).",
+  "You cannot run other Aseprite commands or scripts on the user's behalf beyond the tools listed here.",
+];
+
+// 能力清单从【真实注册表】生成，不手写 —— 手写的清单会随代码漂移，那就等于骗人。
+// 测试里会和 TOOLS 交叉核对（tools_test.mjs 的 P14 段）。
+export function buildCapabilities(session) {
+  const toolList = {};
+  for (const t of TOOLS) {
+    // 描述取第一句，够用且省 token
+    const desc = String(t.function.description || '').split(/(?<=[.。])\s/)[0];
+    toolList[t.function.name] = desc;
+  }
+  const can = {
+    edit_ops: session?.info?.ops || [],
+    tools: toolList,
+    drawing: 'Character-grid drawing (one character per pixel + a char->colour palette), new documents, layers with opacity and blend modes, reusable art styles.',
+    images: 'Open an image/aseprite document, run Perfect Pixel grid correction, and (when a workspace is configured) list and open the files in it.',
+    memory: 'Remember colours and free-form notes across sessions, and search them back.',
+    snapshots: 'Snapshot and roll back the document version stack.',
+  };
+  return {
+    can,
+    cannot: CANNOT,
+    honesty: 'Only promise what is in "can". If something is in "cannot", say so plainly instead of guessing or pretending. If the user asks for something not listed, say you cannot do it.',
+  };
+}
+
+export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath, getActiveStyle, setActiveStyle }) {  return async function dispatch(name, args) {
     switch (name) {
       case 'canvas_info':
         return await session.request('canvas_info');
@@ -469,13 +581,14 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
 
       case 'perfect_pixel': {
         const source = args.source || 'uploaded';
-        let buf, w, h, note;
+        let buf, w, h, note, sourceKey;
         if (source === 'uploaded') {
           if (!session.upload) {
             return { error: 'No image has been uploaded yet. Pick a file in the panel and click "Fix Image".' };
           }
           ({ buf, w, h } = session.upload);
           note = `from upload ${session.upload.name}`;
+          sourceKey = `upload:${session.upload.name}`;
         } else {
           const got = await session.request('get_canvas');
           if (got.error) return got;
@@ -483,6 +596,15 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
           w = got.width;
           h = got.height;
           note = 'from the active canvas';
+          sourceKey = `canvas:${w}x${h}`;
+        }
+
+        // 同一轮里已经矫正过这个来源了 —— 模型在复读，别再开一个文档（P8）
+        if (session.turnProcessed?.has(sourceKey)) {
+          return {
+            alreadyProcessed: true,
+            note: 'This source was already corrected in this turn. Do not run perfect_pixel again -- report the result you already have.',
+          };
         }
 
         const res = await perfectPixel(bundlePath, buf, w, h, {
@@ -491,17 +613,46 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
           fixSquare: args.fixSquare,
         });
 
+        // 不同颜色数：既是 P9 的诊断数据，也是判断"是不是像素画"的便宜信号
+        const distinctColors = countDistinctColors(buf);
+
         if (!res.detected) {
+          // 检测不出来最常见的原因不是"图坏了"，而是**它本来就是 1:1 的像素画**：
+          // detectGridScale 只找 >=4 倍的上采样因子（minSize=4），1px 一格时
+          // 梯度峰值间距太小，直接判定"无网格"。这正是用户反馈的
+          // 「已经处理过的图还会被再次处理」的根源 —— 模型看到 hint 就盲目重试 gridSize，
+          // 结果开出一个和输入一模一样的文档。
+          // 所以这里改成：**明确告诉模型别盲目重试**，只有用户点了逻辑尺寸才重试。
+          session.turnProcessed?.add(sourceKey);
           return {
             detected: false,
-            inputWidth: res.inputWidth,
-            inputHeight: res.inputHeight,
+            noGridDetected: true,
+            input: `${w}x${h}`,
+            distinctColors,
             reason: res.message,
-            hint: 'Detection failed. Ask the user for the logical grid size and retry with gridSize, e.g. [32,32].',
+            note: 'No pixel grid detected. Detection only finds upscale factors of 4x or more, so an image that is ALREADY at 1:1 pixel size (typical for anything previously corrected) reports no grid here. Unless the user asked for a specific logical size, tell them it needs no processing and stop -- do NOT retry with gridSize. Retry with gridSize ONLY when the user names the size they want.',
           };
         }
 
+        // 幂等（P8）：网格 == 图片尺寸 => 每格恰好 1px => 输出和输入逐字节相同。
+        // 这时"矫正"是恒等变换，导入只会开出一个一模一样的文档，所以**不导入**。
+        if (res.gridW === w && res.gridH === h) {
+          session.turnProcessed?.add(sourceKey);
+          return {
+            detected: true,
+            alreadyPerfect: true,
+            input: `${w}x${h}`,
+            grid: `${w}x${h}`,
+            distinctColors,
+            note: 'This image is already true pixel art (every grid cell is exactly 1px), so the correction would be a no-op. Tell the user it needs no processing and move on -- do NOT retry with gridSize.',
+          };
+        }
+
+        session.turnProcessed?.add(sourceKey);
         await session.sendImport(res.data, res.outWidth, res.outHeight, note);
+
+        // 诊断（P9）：把四组尺寸推到面板，用户觉得结果不对时可以直接截图
+        session.say?.('info', `perfect_pixel: input=${res.inputWidth}x${res.inputHeight} grid=${res.gridW}x${res.gridH} refined=${res.refinedW}x${res.refinedH} output=${res.outWidth}x${res.outHeight} sample=${args.sampleMethod || 'center'} colors=${distinctColors}`);
 
         return {
           detected: true,
@@ -509,9 +660,34 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
           grid: `${res.gridW}x${res.gridH}`,
           refined: `${res.refinedW}x${res.refinedH}`,
           output: `${res.outWidth}x${res.outHeight}`,
+          distinctColors,
           note: 'Result opened as a new document; the user can copy from it.',
         };
       }
+
+      case 'ask_user': {
+        const question = String(args.question ?? '').trim();
+        if (!question) return { error: 'ask_user needs a question' };
+        const options = (Array.isArray(args.options) ? args.options : [])
+          .map((s) => String(s).trim()).filter((s) => s !== '').slice(0, 4);
+        if (options.length < 2) {
+          return { error: 'ask_user needs 2 to 4 non-empty options' };
+        }
+        // 5 分钟：用户可能正在看图，别急着超时（request 的第三参就是超时）
+        return await session.request('ask', { question, options }, 300000);
+      }
+
+      case 'capabilities':
+        return buildCapabilities(session);
+
+      case 'open_document': {
+        const path = String(args.path ?? '').trim();
+        if (!path) return { error: 'path is required' };
+        return await session.request('open_doc', { path }, 30000);
+      }
+
+      case 'list_workspace':
+        return await session.request('list_workspace', {}, 20000);
 
       case 'snapshot':
         return await session.request('snapshot', { label: args.label || 'AI snapshot' });

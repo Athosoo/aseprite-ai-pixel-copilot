@@ -14,6 +14,7 @@ if not ROOT or ROOT == "" then ROOT = "." end
 package.path = package.path .. ";" .. ROOT .. "/extension/?.lua"
 
 local agent = require("lib.agent")
+local i18n = require("lib.i18n")
 
 local pass, fail = 0, 0
 local function ok(cond, name, extra)
@@ -30,8 +31,14 @@ local a = agent.new{ port = 1 }
 
 -- 收集发出去的帧 + 面板日志（别真往对话框里写）
 local sent, logs = {}, {}
+local statuses = {}
 a.send = function(_, msg) sent[#sent + 1] = msg end
-a.panel = { log = function(_, text, kind) logs[#logs + 1] = { text = text, kind = kind } end }
+a.panel = {
+  log = function(_, text, kind) logs[#logs + 1] = { text = text, kind = kind } end,
+  setStatus = function(_, text, kind, doc)
+    statuses[#statuses + 1] = { text = text, kind = kind, doc = doc }
+  end,
+}
 
 -- 喂一条消息，返回它发出的第一帧
 local function feed(msg)
@@ -146,6 +153,88 @@ do
   local r3 = feed{ type = "canvas_size", id = 9, width = 10, height = 10, anchor = "center" }
   ok(r3.type == "size_result" and r3.ok == true, "canvas_size 成功")
   ok(app.activeSprite.width == 10, "画布改成 10")
+end
+
+print("== P3 中断：命令 -> 发出 abort 帧 ==")
+do
+  -- 连上之后才发得出去（未连接时只提示）
+  a.conn = { isOpen = function() return true end }
+  sent, logs = {}, {}
+  a:action("abort")
+  ok(#sent == 1 and sent[1].type == "abort", "action('abort') 发出了 abort 帧，实际 " ..
+    tostring(sent[1] and sent[1].type))
+  ok(#logs == 1 and logs[1].text == i18n.t("abortSent"), "面板回显了「已发出中断请求」")
+
+  -- 没连上时别静默失败
+  a.conn = nil
+  sent, logs = {}, {}
+  a:abort()
+  ok(#sent == 0, "未连接时不发帧")
+  ok(#logs == 1 and logs[1].text == i18n.t("abortNothing"), "未连接时给出提示")
+  a.conn = nil
+end
+
+print("== P2/P5a 状态帧：kind 和当前文件名都要转发 ==")
+do
+  statuses = {}
+  a:onMessage{ type = "status", text = "running crop...", kind = "tool" }
+  ok(#statuses == 1, "状态被转给面板")
+  ok(statuses[1].text == "running crop...", "文本原样转发")
+  ok(statuses[1].kind == "tool", "kind 原样转发（决定状态栏配色），实际 " .. tostring(statuses[1].kind))
+  ok(type(statuses[1].doc) == "string" and statuses[1].doc ~= "",
+    "带上了当前文档名（P5a），实际 " .. tostring(statuses[1].doc))
+end
+
+print("== P7 选项式提问：双通道 + 防重 ==")
+do
+  -- panel 换成真的？不用：只断言发出去的帧和面板收到的调用
+  local asks = {}
+  a.panel.setAsk = function(_, ask, silent) asks[#asks + 1] = { ask = ask, silent = silent } end
+  a.panel._showAskDialog = function() end
+  a.panel._closeAskDialog = function() end
+  a.conn = { isOpen = function() return true end }
+
+  sent, logs, asks = {}, {}, {}
+  a:onMessage{ type = "ask", id = 77, question = "覆盖原图还是保留副本？",
+               options = { "覆盖原图", "保留副本" } }
+  ok(#sent == 0, "刚收到提问时不立刻回答")
+  ok(a.pendingAskId == 77, "记下了待答 id，实际 " .. tostring(a.pendingAskId))
+  ok(#asks == 1 and asks[1].ask.question == "覆盖原图还是保留副本？", "问题转给了面板")
+
+  -- 通道 1：终端敲数字
+  a:answerAsk(2)
+  ok(#sent == 1 and sent[1].type == "answer", "回了 answer 帧，实际 " ..
+    tostring(sent[1] and sent[1].type))
+  ok(sent[1].id == 77, "id 原样回传")
+  ok(sent[1].index == 2 and sent[1].choice == "保留副本", "选项内容和下标都对，实际 " ..
+    tostring(sent[1].choice))
+  ok(a.pendingAskId == nil, "答完清掉待答状态")
+  ok(#logs >= 1 and logs[#logs].text == string.format(i18n.t("askAnswered"), "保留副本"),
+    "面板回显了选择")
+
+  -- 通道 2：取消（关窗 / 敲 x）
+  sent, logs, asks = {}, {}, {}
+  a:onMessage{ type = "ask", id = 78, question = "继续吗？", options = { "继续", "算了" } }
+  a:answerAsk("cancel")
+  ok(#sent == 1 and sent[1].cancelled == true, "取消回的是 cancelled 帧")
+  ok(sent[1].id == 78, "取消也带 id")
+  ok(#logs >= 1 and logs[#logs].text == i18n.t("askCancelled"), "面板提示已取消")
+
+  -- 防重：连来两个 ask，第一个必须被自动取消，否则桥要等到 5 分钟超时
+  sent, logs, asks = {}, {}, {}
+  a:onMessage{ type = "ask", id = 79, question = "第一个？", options = { "A", "B" } }
+  a:onMessage{ type = "ask", id = 80, question = "第二个？", options = { "C", "D" } }
+  ok(#sent == 1 and sent[1].id == 79 and sent[1].cancelled == true,
+    "第一个提问被自动取消，实际 " .. tostring(sent[1] and sent[1].id))
+  ok(a.pendingAskId == 80, "现在等的是第二个")
+  a:answerAsk(1)
+  ok(sent[2].id == 80 and sent[2].choice == "C", "第二个正常回答")
+
+  -- 没有待答问题时回答 -> 什么都不发
+  sent = {}
+  a:answerAsk(1)
+  ok(#sent == 0, "没有待答问题时回答不发帧")
+  a.conn = nil
 end
 
 print("== 未知消息类型不炸 ==")

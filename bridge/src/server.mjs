@@ -82,6 +82,7 @@ function configPayload() {
     port: PORT,
     colorBank: BANK_PATH,
     perfectPixelReady: existsSync(BUNDLE),
+    workspace: { root: cfg.workspace?.root || '' },
   };
 }
 
@@ -89,6 +90,7 @@ function configPayload() {
 function saveConfig() {
   const raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
   raw.llm = { ...(raw.llm || {}), ...cfg.llm };
+  if (cfg.workspace) raw.workspace = { ...(raw.workspace || {}), ...cfg.workspace };
   writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2), 'utf8');
 }
 
@@ -104,18 +106,21 @@ class Session {
     this.busy = false;
     this.queue = [];
     this.info = {};
+    this.turnAbort = null;     // 当前这一轮的中断控制器（P3）
+    this.turnProcessed = new Set();  // 本轮已经处理过的图片来源（P8 防复读）
   }
 
   send(obj) {
     if (this.ws.readyState === 1) this.ws.send(JSON.stringify(obj));
   }
 
-  say(kind, text) {
-    this.send({ type: 'say', kind, text });
+  // i18nKey 有值时，面板会用本地化文案覆盖 text（P3 的中断提示等）
+  say(kind, text, i18nKey) {
+    this.send({ type: 'say', kind, text, i18n: i18nKey });
   }
 
-  status(text) {
-    this.send({ type: 'status', text });
+  status(text, kind) {
+    this.send({ type: 'status', text, kind });
   }
 
   request(kind, payload = {}, timeoutMs = 60000) {
@@ -164,9 +169,18 @@ class Session {
   async handleChat(text, context) {
     if (!cfg.llm?.apiKey) {
       this.say('error', 'No API key configured. Click Settings in the panel and paste one.');
-      this.status('missing API key');
+      this.status('missing API key', 'error');
       return;
     }
+
+    // 轮级中断（P3）：面板「停止」/ Esc 发 {type:'abort'}，超时也走同一个控制器。
+    // 单次 HTTP 超时（chatCompletion 内部）< 整轮超时（这里），层级不同。
+    const ac = new AbortController();
+    this.turnAbort = ac;
+    this.turnProcessed = new Set();
+    const maxTurnMs = cfg.llm?.maxTurnMs ?? 180000;
+    const turnTimer = setTimeout(() => ac.abort('timeout'), maxTurnMs);
+
     try {
       const dispatch = makeDispatcher({
         session: this, bank, memory, styles, cfg, bundlePath: BUNDLE,
@@ -195,15 +209,35 @@ class Session {
         context,
         tools: TOOLS,
         dispatch,
-        onSay: (kind, t) => this.say(kind, t),
-        onStatus: (t) => this.status(t),
+        abortSignal: ac.signal,
+        onSay: (kind, t, key) => this.say(kind, t, key),
+        onStatus: (t, kind) => this.status(t, kind),
       });
       // 只保留最近若干轮，避免上下文无限增长
       this.history = this.history.slice(-12);
     } catch (e) {
-      this.say('error', `Error: ${e?.message || e}`);
-      this.status('error');
+      if (e?.name === 'TurnAborted') {
+        // 中断不是错误：手动和超时给不同的提示
+        if (e.reason === 'timeout') this.say('info', 'Task timed out and was interrupted automatically.', 'abortTimeout');
+        else this.say('info', 'Task interrupted.', 'aborted');
+      } else {
+        this.say('error', `Error: ${e?.message || e}`);
+      }
+      this.status('ready', 'ok');
+    } finally {
+      clearTimeout(turnTimer);
+      this.turnAbort = null;
+      this.turnProcessed = new Set();
     }
+  }
+
+  // 面板按了「停止」/ Esc（P3）。中断是"尽力而为"：没有在跑的任务就当无事发生。
+  abortTurn() {
+    if (!this.turnAbort) {
+      this.say('info', 'Nothing is running right now.', 'abortNothing');
+      return;
+    }
+    this.turnAbort.abort('user');
   }
 
   // 用当前配置做一次最小请求，验证 baseUrl / apiKey / model 是否可用
@@ -213,7 +247,7 @@ class Session {
       return;
     }
     const t0 = Date.now();
-    this.status('testing LLM...');
+    this.status('testing LLM...', 'busy');
     try {
       const r = await chatCompletion(cfg.llm, [
         { role: 'user', content: 'Reply with exactly: pong' },
@@ -223,7 +257,7 @@ class Session {
     } catch (e) {
       this.say('error', `Connection failed: ${e?.message || e}`);
     }
-    this.status('ready');
+    this.status('ready', 'ok');
   }
 
   onText(msg) {
@@ -231,7 +265,7 @@ class Session {
       case 'hello': {
         this.info = msg;
         this.say('info', `Bridge ready. Aseprite ${msg.aseprite}, ${(msg.ops || []).length} ops available.`);
-        this.status('ready');
+        this.status('ready', 'ok');
         this.send(configPayload());
         if (!cfg.llm?.apiKey) {
           this.say('info', 'No API key yet -- click Settings in the panel to paste one.');
@@ -250,6 +284,10 @@ class Session {
         // 空 apiKey = 保持不变（面板里不回显真 key）
         if (llm.clearApiKey) cfg.llm.apiKey = '';
         else if (typeof llm.apiKey === 'string' && llm.apiKey.trim()) cfg.llm.apiKey = llm.apiKey.trim();
+        // 工作区根目录（P10）：空字符串 = 关闭工作区模式
+        if (typeof msg.workspace?.root === 'string') {
+          cfg.workspace = { ...(cfg.workspace || {}), root: msg.workspace.root.trim() };
+        }
         try {
           saveConfig();
           this.say('info', 'Settings saved to bridge/config.json (effective immediately).');
@@ -262,6 +300,9 @@ class Session {
 
       case 'test_llm':
         this.testLlm();
+        break;
+      case 'abort':
+        this.abortTurn();
         break;
       case 'chat':
         this.enqueueChat(msg.text || '', msg.context || {});
@@ -298,6 +339,24 @@ class Session {
       case 'request_error':
         this.resolvePending(msg.id, { error: msg.error || 'Aseprite 侧拒绝了请求' });
         break;
+      case 'open_doc_result':
+        this.resolvePending(msg.id, msg.ok
+          ? { ok: true, name: msg.name, path: msg.path, width: msg.width, height: msg.height }
+          : { error: msg.error || 'open failed' });
+        break;
+      case 'workspace_result':
+        this.resolvePending(msg.id, { ok: true, root: msg.root, files: msg.files || [] });
+        break;
+      case 'edit_blocked':
+        // 工作区准备失败 -> 这次编辑被中止，直接推给用户看（工具那边也会拿到错误）
+        this.say('error', msg.error || 'The edit was blocked by the workspace.');
+        break;
+      case 'answer':
+        // P7：面板弹出的选项被点了（或用户取消了）。工具结果原样回到模型上下文。
+        this.resolvePending(msg.id, msg.cancelled
+          ? { cancelled: true }
+          : { ok: true, choice: msg.choice, index: msg.index });
+        break;
       default:
         console.log('[bridge] unhandled message', msg.type);
     }
@@ -313,7 +372,7 @@ class Session {
     if (header.kind === 'upload') {
       this.upload = { buf, w: header.width, h: header.height, name: header.name || '(未命名)' };
       this.say('info', `Received image ${header.name} (${header.width}x${header.height}). Say "fix this image".`);
-      this.status('ready');
+      this.status('ready', 'ok');
     } else if (header.kind === 'canvas_pixels') {
       this.resolvePending(header.id, { buf, width: header.width, height: header.height });
     }
@@ -338,7 +397,7 @@ wss.on('connection', (ws) => {
   const session = new Session(ws);
   sessions.add(session);
   console.log('[bridge] Aseprite connected');
-  session.status('connected, waiting for input');
+  session.status('connected, waiting for input', 'ok');
 
   ws.on('message', (data, isBinary) => {
     if (isBinary) {
