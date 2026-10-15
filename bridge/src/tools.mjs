@@ -162,6 +162,121 @@ export const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'style_list',
+      description: 'List the available art styles (palette + layer structure + drawing rules). Call this before guessing what style the user means.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'style_use',
+      description:
+        'Switch to an art style. From then on its palette, layer structure and rules are part of your instructions, ' +
+        'and you should follow them for anything you draw. Pass an empty name to clear the style. ' +
+        'Call style_list first if you are not sure of the exact name.',
+      parameters: {
+        type: 'object',
+        properties: { name: { type: 'string', description: 'style name; empty string clears it' } },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'style_save',
+      description:
+        'Save a reusable art style. Use when the user describes a style they want to keep, or after you have settled on a palette and rules together.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'short id, letters/digits/hyphen/CJK' },
+          label: { type: 'string', description: 'human-readable name' },
+          size: { type: 'array', items: { type: 'integer' }, description: '[width, height] the style is drawn at' },
+          palette: { type: 'array', items: { type: 'string' }, description: 'colours as #RRGGBB' },
+          layers: { type: 'array', items: { type: 'string' }, description: 'layer names, bottom to top' },
+          rules: { type: 'array', items: { type: 'string' }, description: 'short drawing rules, one per entry' },
+          notes: { type: 'string' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'new_sprite',
+      description:
+        'Create a new empty document. Use it before drawing from scratch. ' +
+        'If an art style is active, prefer the size that style recommends unless the user asked for something else.',
+      parameters: {
+        type: 'object',
+        properties: {
+          width: { type: 'integer' },
+          height: { type: 'integer' },
+          colorMode: { type: 'string', enum: ['rgb', 'indexed', 'grayscale'], description: 'default rgb' },
+        },
+        required: ['width', 'height'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'add_layer',
+      description:
+        'Add a layer to the current document (placed above the active one). ' +
+        'When a style defines a layer structure, create those layers so later edits can target them by name. ' +
+        'draw_art also creates the layer if it does not exist, so this is only needed when you want an empty layer up front.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          opacity: { type: 'integer', description: '0-255, default 255' },
+          blendMode: { type: 'string', enum: ['normal', 'multiply', 'screen', 'overlay', 'addition'] },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'draw_art',
+      description:
+        'Draw pixels from a character grid — this is how you draw, do NOT emit pixel coordinate lists. ' +
+        'Each character in rows is one pixel, mapped through palette. Example: ' +
+        'palette {".": "", "X": "#2E86DE", "o": "#7EE2A8"}, rows ["..XX..", ".XooX.", "XooooX"] ' +
+        '(a "." or empty colour means transparent). Every row must be the same length. ' +
+        'The whole grid becomes one undo step. The layer is created if it does not exist. ' +
+        'Keep grids modest: up to about 32x32 is reliable. For bigger pieces, draw in passes — ' +
+        'one draw_art per layer (base colours, then shading, then highlights).',
+      parameters: {
+        type: 'object',
+        properties: {
+          rows: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'one string per pixel row, all the same length',
+          },
+          palette: {
+            type: 'object',
+            description: '{ character: "#RRGGBB" }; map a character to "" for transparent',
+            additionalProperties: { type: 'string' },
+          },
+          layer: { type: 'string', description: 'target layer name; created if missing' },
+          x: { type: 'integer', description: 'left offset in the canvas, default 0' },
+          y: { type: 'integer', description: 'top offset in the canvas, default 0' },
+          label: { type: 'string', description: 'short description for the undo step' },
+        },
+        required: ['rows', 'palette'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'perfect_pixel',
       description:
         'Run Perfect Pixel Studio\'s core algorithm: detect the pixel grid of an image that only looks like pixel art (skewed cells, blurry edges) and resample it into true pixel art. ' +
@@ -318,7 +433,7 @@ export const TOOLS = [
   },
 ];
 
-export function makeDispatcher({ session, bank, memory, cfg, bundlePath }) {
+export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath, getActiveStyle, setActiveStyle }) {
   return async function dispatch(name, args) {
     switch (name) {
       case 'canvas_info':
@@ -409,6 +524,84 @@ export function makeDispatcher({ session, bank, memory, cfg, bundlePath }) {
 
       case 'remember':
         return memory.remember(args);
+
+      // ---- 风格 ----------------------------------------------------------
+      case 'style_list': {
+        const cur = getActiveStyle ? getActiveStyle() : '';
+        return {
+          active: cur || null,
+          styles: styles.names().map((n) => {
+            const s = styles.get(n);
+            return {
+              name: n,
+              label: s.label || n,
+              size: s.size ? `${s.size[0]}x${s.size[1]}` : null,
+              colors: s.palette?.length || 0,
+              layers: s.layers || [],
+            };
+          }),
+        };
+      }
+
+      case 'style_use': {
+        const want = String(args.name ?? '').trim();
+        if (want === '') {
+          setActiveStyle('');
+          return { ok: true, active: null, note: 'style cleared' };
+        }
+        const s = styles.get(want);
+        if (!s) {
+          return { error: `no style named "${want}"`, available: styles.names() };
+        }
+        setActiveStyle(s.name);
+        return {
+          ok: true,
+          active: s.name,
+          label: s.label || s.name,
+          note: 'This style is now part of your instructions for the rest of the session.',
+        };
+      }
+
+      case 'style_save':
+        return styles.save(args.name, args);
+
+      // ---- 作画 ----------------------------------------------------------
+      case 'new_sprite':
+        return await session.request('new_sprite', {
+          width: args.width, height: args.height, colorMode: args.colorMode,
+        });
+
+      case 'add_layer':
+        return await session.request('add_layer', {
+          name: args.name, opacity: args.opacity, blendMode: args.blendMode,
+        });
+
+      case 'draw_art': {
+        if (!Array.isArray(args.rows) || args.rows.length === 0) {
+          return { error: 'rows is empty: pass an array of strings, one per pixel row' };
+        }
+        // 先把"行宽不一致"挡在桥这一侧：模型写歪一行，报错要比让 Lua 抛更早、更好懂
+        const w = String(args.rows[0]).length;
+        const badRow = args.rows.findIndex((r) => String(r).length !== w);
+        if (badRow >= 0) {
+          return {
+            error: `row ${badRow + 1} has ${String(args.rows[badRow]).length} characters but row 1 has ${w}; every row must be the same length`,
+          };
+        }
+        const chars = new Set(args.rows.join('').split(''));
+        const pal = args.palette || {};
+        const unmapped = [...chars].filter((c) => !(c in pal) && c !== ' ' && c !== '.');
+        if (unmapped.length) {
+          return {
+            error: `these characters appear in rows but have no palette entry: ${unmapped.join(' ')}`,
+            hint: 'add them to palette, or use "." for transparent',
+          };
+        }
+        return await session.request('draw_art', {
+          label: args.label || `draw ${w}x${args.rows.length}`,
+          layer: args.layer, palette: pal, rows: args.rows, x: args.x, y: args.y,
+        });
+      }
 
       case 'recall':
         return memory.recall(args);

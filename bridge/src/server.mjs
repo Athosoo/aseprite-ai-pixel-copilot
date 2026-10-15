@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path';
 
 import { ColorBank } from './colorbank.mjs';
 import { Memory } from './memory.mjs';
+import { Styles } from './styles.mjs';
 import { TOOLS, makeDispatcher } from './tools.mjs';
 import { runTurn, chatCompletion } from './llm.mjs';
 
@@ -51,6 +52,15 @@ const bank = new ColorBank(BANK_PATH);
 // 但同一个 data/ 目录，方便用户直接翻看、手工编辑。
 const MEMORY_PATH = join(ROOT, cfg.paths?.memory || 'data/memory.json');
 const memory = new Memory(MEMORY_PATH);
+
+// 风格库：调色板 + 图层结构 + 作画规矩的模板。切换风格时**只注入当前那一个**，
+// 不是把整库塞进 prompt —— 这是省 token 的关键。
+const styles = new Styles({
+  builtinDir: join(ROOT, cfg.paths?.styles || 'styles'),
+  userDir: join(ROOT, 'data', 'styles'),
+});
+// 当前风格名持久化在 config.json 里，重启桥也记得
+let activeStyle = cfg.activeStyle || '';
 
 // ------------------------------------------------------- 配置读写（供插件内设置面板用）
 // 只把"是否已设置 + 掩码提示"发给 Aseprite，绝不外传完整 key。
@@ -158,10 +168,24 @@ class Session {
       return;
     }
     try {
-      const dispatch = makeDispatcher({ session: this, bank, memory, cfg, bundlePath: BUNDLE });
+      const dispatch = makeDispatcher({
+        session: this, bank, memory, styles, cfg, bundlePath: BUNDLE,
+        getActiveStyle: () => activeStyle,
+        setActiveStyle: (n) => {
+          activeStyle = n || '';
+          try {
+            const raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
+            raw.activeStyle = activeStyle;
+            writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2), 'utf8');
+          } catch { /* 存不下来不影响本次会话 */ }
+        },
+      });
+
+      // 只把【当前】风格的约束拼在系统提示后面。没选风格就一个字都不加。
+      const styleText = activeStyle ? styles.describe(activeStyle) : null;
       await runTurn({
         cfg: cfg.llm,
-        systemPrompt: SYSTEM_PROMPT,
+        systemPrompt: styleText ? `${SYSTEM_PROMPT}\n\n${styleText}` : SYSTEM_PROMPT,
         history: this.history,
         userText: text,
         context,
@@ -249,6 +273,10 @@ class Session {
         break;
       case 'size_result':
         // 裁剪 / 整体缩放 / 改画布尺寸共用这一个结果类型
+        this.resolvePending(msg.id, msg.ok ? { ok: true, ...msg.report } : { error: msg.error });
+        break;
+      case 'art_result':
+        // 新建文档 / 建图层 / 字符网格作画共用
         this.resolvePending(msg.id, msg.ok ? { ok: true, ...msg.report } : { error: msg.error });
         break;
       case 'snapshot_result':

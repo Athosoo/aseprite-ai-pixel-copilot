@@ -24,6 +24,7 @@
 local util = require("lib.util")
 local ops = require("lib.ops")
 local sizelib = require("lib.sizelib")
+local artlib = require("lib.artlib")
 local versions = require("lib.versions")
 local panel = require("lib.panel")
 local settings = require("lib.settings")
@@ -486,6 +487,9 @@ function Agent:onMessage(msg)
   elseif t == "crop" or t == "scale" or t == "canvas_size" then
     self:sizeOp(t, msg)
 
+  elseif t == "new_sprite" or t == "add_layer" or t == "draw_art" then
+    self:artOp(t, msg)
+
   elseif t == "get_canvas" then
     self:sendCanvas(msg.id)
 
@@ -568,6 +572,58 @@ function Agent:sizeOp(kind, msg)
   else
     self.panel:log(string.format(i18n.t("sizeFailed"), tostring(res)), "error")
     self:send{ type = "size_result", id = id, ok = false, error = tostring(res) }
+  end
+end
+
+-- 作画类：新建文档 / 建图层 / 字符网格落像素。
+-- new_sprite 会开出新文档，没有"改坏"的风险，不备份；
+-- add_layer 和 draw_art 改的是现有文档，照例先备份。
+function Agent:artOp(kind, msg)
+  local id = msg.id
+
+  if kind ~= "new_sprite" then
+    local spr = app.activeSprite
+    if not spr then
+      self:send{ type = "art_result", id = id, ok = false, error = "no document is open" }
+      return
+    end
+    local okSnap, meta = pcall(versions.push, "before: " .. (msg.label or kind), spr)
+    if okSnap then
+      self.panel:log(string.format(i18n.t("autoBacked"), meta.id, meta.label), "tool")
+    end
+  end
+
+  local ok, res = pcall(function()
+    if kind == "new_sprite" then
+      local spr, info = artlib.newSprite(msg.width, msg.height, msg.colorMode)
+      return { changed = true, op = "new_sprite", size = info.width .. "x" .. info.height,
+               colorMode = info.colorMode }
+    elseif kind == "add_layer" then
+      local layer, info = artlib.addLayer(app.activeSprite, msg.name, msg)
+      return { changed = true, op = "add_layer", layer = info.name,
+               opacity = info.opacity, blendMode = info.blendMode }
+    else
+      local r = artlib.drawArt(app.activeSprite, msg)
+      r.op = "draw_art"
+      r.changed = r.painted > 0
+      return r
+    end
+  end)
+
+  if ok then
+    if kind == "draw_art" then
+      self.panel:log(string.format(i18n.t("artDrawn"),
+        res.painted, res.width, res.height, res.layer), "tool")
+      if res.skippedOutOfBounds and res.skippedOutOfBounds > 0 then
+        self.panel:log(string.format(i18n.t("artClipped"), res.skippedOutOfBounds), "info")
+      end
+    else
+      self.panel:log(string.format(i18n.t("artDoc"), res.op, res.layer or res.size or ""), "tool")
+    end
+    self:send{ type = "art_result", id = id, ok = true, report = res }
+  else
+    self.panel:log(string.format(i18n.t("artFailed"), tostring(res)), "error")
+    self:send{ type = "art_result", id = id, ok = false, error = tostring(res) }
   end
 end
 

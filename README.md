@@ -26,6 +26,12 @@ Aseprite (Lua 扩展)  <--WebSocket-->  本地 Node 桥  <--HTTPS-->  LLM（Open
   `fill_region` 填区域 / `outline` 描边 / `despeckle` 清孤立杂点 / `palette_map` 批量换色+改调色板
 - **尺寸操作**：`crop` 裁剪（像素不动）/ `scale` 整体缩放（重采样）/ `canvas_size` 改画布
   （内容不变）。AI 靠内容包围盒和留白量判断该用哪个，拿不准会先问你
+- **风格包**：把「调色板 + 图层结构 + 作画规矩」打包成一个可切换的风格（内置像素图标 /
+  星露谷风 / 极简扁平，也能自己存）。切换后 AI 按该风格的颜色和图层作画。
+  **只有当前那一个风格进 prompt（约 200 字符）**，不是把整库塞进去
+- **作画**：`new_sprite` 建画布 → `add_layer` 按风格建图层 → `draw_art` 落像素。
+  AI 输出的是**字符网格**（一个字符 = 一个像素 + 一张字符→颜色表），不是坐标数组 ——
+  同样的 16×16 内容，字符网格约 100 token，坐标数组要几千，而且行宽写歪了会被当场挡住
 - **记忆**：把配色、风格规矩、项目约定记下来，之后按关键词检索。**不占常驻 token**，
   越常被用到越留得住
 - **整张矫正**：面板里选一张 GPT 生成的图 → 调 Perfect Pixel Studio 核心算法检测网格并重采样
@@ -162,6 +168,40 @@ AI ❯ _                                 ← 提示符 + 输入行（中文输�
 
 判断依据是 `canvas_info` 里的**内容包围盒和四边留白**：留白多而你又说"缩小"，AI 就知道该裁剪而不是缩放。**真的说不清时它会先问你一句**，而不是猜。
 
+### 风格：让它的画风听你的
+
+风格 = **调色板 + 推荐尺寸 + 图层结构 + 作画规矩**四件套，可以切换、可以自己存。
+
+内置三个：`pixel-icon`（像素图标）、`stardew`（星露谷风）、`flat-minimal`（极简扁平）。
+
+- 「换个星露谷风格」→ 它先 `style_list` 看有什么，再 `style_use` 切过去
+- 切过去之后，该风格的**颜色、图层名、规矩**就写进了它的指令里，之后画什么都照这个来
+- 你描述了一个它没有的风格？它用 `style_save` 存下来再切过去，下次还在
+- 自定义风格落在 `bridge/data/styles/*.json`，纯文本，可以直接手改
+
+**省 token 的关键**：切风格时只把**当前那一个**渲染进 prompt（约 200 字符），
+不是把整库塞进去。所以风格可以随便加。
+
+### 作画：它自己画，而不是让你动手
+
+`new_sprite` 建画布 → `add_layer` 按风格建图层 → `draw_art` 落像素。
+
+**AI 不输出像素坐标**——它输出的是**字符网格**：
+
+```
+palette = { ".": "", "X": "#2E86DE", "o": "#7EE2A8" }
+rows    = [ "..XX..",
+            ".XooX.",
+            "XooooX" ]
+```
+
+一个字符 = 一个像素，配一张字符→颜色的表。同样的内容，字符网格约 100 token，
+坐标数组要几千；而且它是"所见即所得"的，行宽写歪了一行会被**当场挡住并指出是第几行**，
+不会画出半张错图。
+
+画大件时它分**多趟**画，一趟一个图层（先铺大色块 → 阴影 → 细节 → 高光），
+每一趟是一个独立的撤销步骤。单趟网格建议不超过 32×32。
+
 ### 记忆：让它越用越懂你
 
 - **你说「记住…」** → 存进记忆库
@@ -262,8 +302,10 @@ extension/            Aseprite 扩展（装到 %APPDATA%\Aseprite\extensions\ai-
   lib/menu.lua        命令表：纵向表格、悬浮变蓝、点击/编号/键位执行
   lib/miniwindow.lua  贴边小面板：自绘图标按钮的无标题栏小窗，可拖动
   lib/i18n.lua        中/英双语文案 + 终端内建命令词表 + 语言判定（默认中文）
-  lib/agent.lua       编排：协议、画布上下文、导入新文档
+  lib/agent.lua       编排：协议、画布上下文、导入新文档、尺寸/作画请求
   lib/ops.lua         7 个安全算子
+  lib/sizelib.lua     文档级尺寸：crop / scale / canvas_size（crop 不重采样）
+  lib/artlib.lua      作画：字符网格落像素 / 新建文档 / 建图层
   lib/versions.lua    快照 / 回滚 / 临时版本栈
   lib/ws.lua          WebSocket 封装
 bridge/               本地桥（Node，零第三方依赖除 ws）
@@ -271,9 +313,13 @@ bridge/               本地桥（Node，零第三方依赖除 ws）
   src/llm.mjs         OpenAI 兼容调用 + 工具调用循环
   src/tools.mjs       工具 schema + 分发
   src/colorbank.mjs   色值+场景记忆库（data/colors.json）
+  src/memory.mjs      通用记忆库（data/memory.json）
+  src/styles.mjs      风格库（内置 + data/styles/*.json）
   vendor/             Perfect Pixel 核心（esbuild 从原仓库 src/core 打包而来）
 tests/                测试与 GUI 探针（见 STATUS.md）
   lua/menu_test.lua           命令表/语言/历史 无头单测（89 项）
+  lua/sizelib_test.lua        裁剪/缩放/画布尺寸（23 项）
+  lua/artlib_test.lua         字符网格作画（30 项）
   lua/path_test.lua           安装路径机制验证（__project.lua -> bridge）
   lua/gui_menu_probe.lua      命令表 + 小面板的 GUI 可视化探针
   lua/gui_key_probe.lua       真键盘探针（配 run_key_test.sh，验连续退格）
@@ -352,13 +398,15 @@ aseprite.exe -b --script tests/lua/menu_test.lua      # 89 项
 aseprite.exe -b --script tests/lua/ops_test.lua       # 31 项
 aseprite.exe -b --script tests/lua/versions_test.lua  # 20 项
 aseprite.exe -b --script tests/lua/sizelib_test.lua   # 23 项（裁剪/缩放/包围盒）
+aseprite.exe -b --script tests/lua/artlib_test.lua    # 30 项（字符网格作画）
 aseprite.exe -b --script tests/lua/path_test.lua      # 安装路径机制
 
 # 桥的自测（mock LLM + mock Aseprite，不联网、不花 token）
-cd bridge
+cd bridge && npm test                                 # 149 项，跑下面三个
 node test/selftest.mjs                                # 22 项
 node test/memory_test.mjs                             # 23 项（记忆库）
-node test/tools_test.mjs                              # 46 项（工具分发）
+node test/styles_test.mjs                             # 41 项（风格库：优先级/清洗/只注入当前）
+node test/tools_test.mjs                              # 85 项（20 个工具的分发）
 
 # GUI 可视化验证（会短暂弹 Aseprite 窗口并自动截图）
 bash tests/run_gui_visual.sh --term        # 终端面板 + 命令表 + 小面板

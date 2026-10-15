@@ -10,7 +10,36 @@
 扩展已安装到 `%APPDATA%\Aseprite\extensions\ai-pixel-copilot`。
 只差：填 API Key → 重启 Aseprite → 首次实跑。
 
-### 最近一轮（尺寸能力 + 通用记忆）
+### 最近一轮（风格包 + 作画，v0.4.0）
+
+让助手从"只能改图"变成"能自己画"：**风格约束 + 字符网格作画**。核心思路是用户要的
+"约束 AI 写命令并执行"——**模型只输出结构化参数，像素由确定性 Lua 代码落下去**。
+
+**风格库**（`bridge/src/styles.mjs`，工具 `style_list` / `style_use` / `style_save`）：
+- 一个风格 = 调色板 + 推荐尺寸 + 图层结构 + 作画规矩
+- 内置 `pixel-icon` / `stardew` / `flat-minimal`；自定义落在 `bridge/data/styles/*.json`
+- **三层优先级：用户目录 > 仓库 `styles/` > 代码内置**（`all()` 里三次 Object.assign）
+- **省 token 的关键**：`describe()` 只渲染**当前那一个**风格（实测 278 字符），
+  不是把整库塞进 prompt。`styles_test.mjs` 里有条断言专门查"别的风格的颜色有没有漏进来"
+- 当前风格名持久化在 `config.json` 的 `activeStyle`，重启桥还记得
+
+**作画**（`extension/lib/artlib.lua`，工具 `new_sprite` / `add_layer` / `draw_art`）：
+- `stampGrid(img, rows, palette, x, y)`：一个字符 = 一个像素，配 字符→颜色 表
+- **省 token**：16×16 用字符网格约 100 token，坐标数组要几千；而且行宽写歪会被挡住
+- **出界不是静默丢弃**：返回 `skippedOutOfBounds`，面板另起一行提示"有 N 像素落在画布外"
+- `ensureLayer` 找不到就建，**并且把名字设上去**（这里踩过坑：`spr:newLayer()`
+  出来的层叫 "Layer"，不改名的话后面按名字找图层全部落空 —— artlib_test 里 4 项就是这么挂的）
+- 整个网格是**一个**撤销步骤（`app.transaction` 包住）
+- 桥侧 `draw_art` 先校验一遍（空 rows / 行宽不一致 / 字符没进调色板），
+  报错能指出是第几行，省一次 Lua 往返
+
+**提示词**：`config.example.json` 的 `systemPrompt` 加 10~13 条（风格怎么用、
+字符网格格式、分趟作画、新建文档流程）。`config.json` 同步更新了（不进版本库）。
+
+**测试**：新增 artlib 30 + styles 41，tools 分发从 46 涨到 85（覆盖 20 个工具）。
+合计 Lua 198 + 桥 149 = **347 项**全绿。
+
+### 上一轮（尺寸能力 + 通用记忆）
 
 **新增三个文档级尺寸工具**，解决"AI 分不清裁剪和缩放"：
 - `crop` —— 切画布，**像素原样保留**（去掉留白用这个）
