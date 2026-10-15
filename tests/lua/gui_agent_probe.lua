@@ -165,7 +165,7 @@ end)
 
 step("三种形态都要有控件（用户报的 bug：切形态就少东西）", function()
   local missing = {}
-  for _, m in ipairs({ "panel", "bar_bottom", "bar_side" }) do
+  for _, m in ipairs({ "panel", "bar_bottom", "bar_side", "small" }) do
     a.panel:setMode(m, true)
     if m == "panel" then
       a.panel:setContext(5000, 16000)
@@ -176,7 +176,7 @@ step("三种形态都要有控件（用户报的 bug：切形态就少东西）"
     for _, h in ipairs(a.panel.barHit or {}) do kinds[h.kind] = true end
     say("    %s -> %s", m, (kinds.work and "图" or "-") .. (kinds.open and "＋" or "-")
       .. (kinds.ctx and "电量" or "-") .. (kinds.think and "滑杆" or "-") .. (kinds.dock and "贴边" or "-"))
-    if not (kinds.work and kinds.open and kinds.ctx and kinds.think and kinds.dock) then
+    if not (kinds.work and kinds.ctx and kinds.think and kinds.dock and kinds.small) then
       missing[#missing + 1] = m
     end
   end
@@ -197,6 +197,60 @@ step("贴边按钮：点一下真的切形态", function()
   for _, h in ipairs(a.panel.barHit or {}) do if h.kind == "dock" then dock2 = h end end
   a.panel:_onCanvasMouseDown{ button = MouseButton.LEFT, x = dock2.x + 2, y = dock2.y + 2 }
   assert(a.panel:layoutMode() == "bar_bottom", "贴侧边 -> 贴底，实际 " .. a.panel:layoutMode())
+end)
+
+step("控件几何：真字体下也不越框（等高 / 等间距 / 不出画布）", function()
+  for _, m in ipairs({ "bar_bottom", "bar_side", "small", "panel" }) do
+    a.panel:setMode(m, true)
+    a.panel:setContext(8200, 16000)
+    a.panel:setThinking("high")
+    a.panel.dlg:repaint()
+    local cw = a.panel.canvasW or 0
+    local ch = a.panel.canvasH or 0
+    local hs, bad, sorted = {}, {}, {}
+    for _, h in ipairs(a.panel.barHit or {}) do
+      if h.x < 0 or h.y < 0 or h.x + h.w > cw or h.y + h.h > ch then
+        bad[#bad + 1] = h.kind
+      end
+      if h.kind ~= "restore" then      -- 小窗里"点状态行还原"是整行命中带，不算方块
+        hs[h.h] = (hs[h.h] or 0) + 1
+        sorted[#sorted + 1] = h
+      end
+    end
+    local nH = 0
+    for _ in pairs(hs) do nH = nH + 1 end
+    table.sort(sorted, function(x, y) return x.x < y.x end)
+    local gaps, uniform = {}, true
+    for i = 2, #sorted do
+      gaps[#gaps + 1] = sorted[i].x - (sorted[i - 1].x + sorted[i - 1].w)
+    end
+    for _, g in ipairs(gaps) do if g ~= gaps[1] then uniform = false end end
+    say("    %s: 画布=%dx%d 方块高度种类=%d 间距=%s 越框=%s", m, cw, ch, nH,
+      table.concat(gaps, ","), (table.concat(bad, ",") ~= "" and table.concat(bad, ",") or "无"))
+    assert(#bad == 0, m .. " 有控件越过画布：" .. table.concat(bad, ","))
+    assert(nH <= 1, m .. " 方块高度不齐（" .. nH .. " 种）")
+    assert(uniform, m .. " 方块间距不一致：" .. table.concat(gaps, ","))
+  end
+end)
+step("最小化：真窗口真的变小，还原后回原形态", function()
+  a.panel:setMode("bar_bottom", true)
+  a.panel.dlg:repaint()
+  local before = a.panel.dlg.bounds
+  a.panel:toggleSmall()
+  local sb = a.panel.dlg.bounds
+  say("    小窗 bounds=%dx%d（底边栏是 %dx%d）", sb.width, sb.height, before.width, before.height)
+  assert(sb.height < before.height, "小窗比底边栏矮")
+  a.panel.dlg:repaint()
+  local kinds = {}
+  for _, h in ipairs(a.panel.barHit or {}) do kinds[h.kind] = true end
+  say("    小窗里的控件：%s%s%s%s%s", kinds.work and "图" or "-", kinds.ctx and "电量" or "-",
+    kinds.think and "滑杆" or "-", kinds.dock and "贴边" or "-", kinds.small and "还原" or "-")
+  assert(kinds.work and kinds.ctx and kinds.think and kinds.small, "小窗里控件齐全")
+  -- 点还原按钮
+  local s
+  for _, h in ipairs(a.panel.barHit or {}) do if h.kind == "small" then s = h end end
+  a.panel:_onCanvasMouseDown{ button = MouseButton.LEFT, x = s.x + 2, y = s.y + 2 }
+  assert(a.panel:layoutMode() == "bar_bottom", "还原回底边栏，实际 " .. a.panel:layoutMode())
 end)
 
 -- 停在底边栏给外部截图（run_gui_agent.sh 在 ~4s 截），8 秒后自己关

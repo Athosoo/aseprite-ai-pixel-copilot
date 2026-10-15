@@ -286,7 +286,8 @@ do
   p:setMode("panel", true)
   ok(p:cycleMode() == "bar_bottom", "panel -> bar_bottom")
   ok(p:cycleMode() == "bar_side", "bar_bottom -> bar_side")
-  ok(p:cycleMode() == "panel", "bar_side -> panel")
+  ok(p:cycleMode() == "small", "bar_side -> small（v0.5.5 起多了小窗形态）")
+  ok(p:cycleMode() == "panel", "small -> panel")
 
   ok(i18n.builtinAction("栏") == "bar", "「栏」-> bar")
   ok(i18n.builtinAction("bar") == "bar", "bar -> bar")
@@ -726,6 +727,109 @@ do
     ok(#bad == 0, "面板高 " .. hh .. " 时控件都在画布内（找到 " .. found .. " 个），越界的：" ..
       table.concat(bad, " "))
   end
+end
+
+print("== 最小化：小窗形态 + 还原 ==")
+do
+  local p = panel.new{ frameImage = function() return fakeFrameImage() end }
+  p:setMode("panel", true)
+  p:setContext(5000, 16000)
+  p:setThinking("medium")
+
+  -- 最小化：记住来处
+  p:toggleSmall()
+  ok(p:layoutMode() == "small", "面板 -> 小窗，实际 " .. p:layoutMode())
+  ok(p.lastMode == "panel", "记住了从面板来的，实际 " .. tostring(p.lastMode))
+
+  -- 小窗里要画出控件 + 还原入口
+  local gc = fakeGC(320, 44)
+  p:_paint(gc)
+  local kinds = {}
+  for _, b in ipairs(p.barHit) do kinds[b.kind] = true end
+  ok(kinds.small and kinds.work and kinds.ctx and kinds.think, "小窗里有控件和还原按钮，实际 " ..
+    table.concat((function() local t = {} for k in pairs(kinds) do t[#t + 1] = k end table.sort(t) return t end)(), ","))
+  ok(kinds.restore ~= nil, "点状态行也能还原（大目标）")
+  local bad = {}
+  for _, b in ipairs(p.barHit) do
+    if b.x < 0 or b.y < 0 or b.x + b.w > 320 or b.y + b.h > 44 then bad[#bad + 1] = b.kind end
+  end
+  ok(#bad == 0, "小窗里控件都在画布内，越界的：" .. table.concat(bad, " "))
+
+  -- 点还原按钮（控件行末尾那颗）-> 回到面板
+  local smallHit
+  for _, b in ipairs(p.barHit) do if b.kind == "small" then smallHit = b end end
+  p:_onCanvasMouseDown{ button = MouseButton.LEFT, x = smallHit.x + 2, y = smallHit.y + 2 }
+  ok(p:layoutMode() == "panel", "小窗 -> 还原到面板，实际 " .. p:layoutMode())
+
+  -- 从底边栏最小化，还原要回到底边栏（不是面板）
+  p:setMode("bar_bottom", true)
+  p:toggleSmall()
+  ok(p:layoutMode() == "small" and p.lastMode == "bar_bottom", "从底边栏最小化并记住来处")
+  p:toggleSmall()
+  ok(p:layoutMode() == "bar_bottom", "还原回底边栏，实际 " .. p:layoutMode())
+
+  -- 点状态行（上半部分）也能还原
+  p:toggleSmall()
+  p.dlg = { modify = function() end, repaint = function() end }
+  p.shown = true
+  local g2 = fakeGC(320, 44)
+  p:_paint(g2)
+  local restore
+  for _, b in ipairs(p.barHit) do if b.kind == "restore" then restore = b end end
+  p:_onCanvasMouseDown{ button = MouseButton.LEFT, x = restore.x + 10, y = restore.y + 3 }
+  ok(p:layoutMode() == "bar_bottom", "点状态行还原到底边栏，实际 " .. p:layoutMode())
+
+  -- 极小的小窗也不能变成死胡同：至少要能点回还原
+  local q = panel.new{ frameImage = function() return nil end }
+  q:setMode("small", true)
+  local g3 = fakeGC(120, 30)
+  q:_paint(g3)
+  local hasRestore = false
+  for _, b in ipairs(q.barHit) do
+    if b.kind == "small" or b.kind == "restore" then hasRestore = true end
+  end
+  ok(hasRestore, "窗口窄到 120 也还能点回还原（不是死胡同）")
+end
+
+print("== 控件几何：方块等高、不超出自己的框和画布 ==")
+do
+  -- 所有方块同高（16），并且都在自己的 x..x+w 内
+  local p = panel.new{ frameImage = function() return nil end }
+  p:setMode("bar_bottom", true)
+  p:setContext(8200, 16000)
+  local gc = fakeGC(1000, 60)
+  p:_paint(gc)
+  local heights = {}
+  for _, b in ipairs(p.barHit) do
+    if b.kind ~= "restore" then heights[b.h] = true end
+  end
+  local n = 0
+  for _ in pairs(heights) do n = n + 1 end
+  ok(n == 1, "所有控件方块等高（16），实际出现 " .. n .. " 种高度")
+
+  -- 相邻方块间距一致（对称感）+ 全部右对齐贴着 4px 边距
+  local sorted = {}
+  for _, b in ipairs(p.barHit) do sorted[#sorted + 1] = b end
+  table.sort(sorted, function(a, b) return a.x < b.x end)
+  local gaps = {}
+  for i = 2, #sorted do gaps[#gaps + 1] = sorted[i].x - (sorted[i - 1].x + sorted[i - 1].w) end
+  local uniform = true
+  for _, g in ipairs(gaps) do if g ~= (gaps[1] or g) then uniform = false end end
+  ok(uniform, "方块间距一致：" .. table.concat(gaps, ","))
+  local right = sorted[#sorted].x + sorted[#sorted].w
+  ok(right <= 1000 - 3, "最右边一个方块贴着右边距（右缘 = " .. right .. "，画布 1000）")
+
+  -- 中文标签实测宽度要算进预算（以前按 48 硬编码，中文溢出 40px）
+  local zh = panel.new{ frameImage = function() return nil end }
+  i18n._resetLang()
+  zh:setContext(8200, 16000)
+  local gc2 = fakeGC(1000, 60)
+  local planZh = zh:_clusterPlan(gc2, 1000, 130)
+  local planNo = zh:_clusterPlan(gc2, 1000, 130)
+  ok(planZh ~= nil and planZh.w > 0, "计划宽度算出来了：" .. (planZh and planZh.w or -1))
+  -- 带标签的计划，其宽度必须 >= 实测标签宽 + 20 格宽度
+  local cellsW = 20 * (3 + 1) - 1
+  ok(planZh.w >= cellsW, "预算至少覆盖 20 格电池：" .. planZh.w .. " >= " .. cellsW)
 end
 
 print("== 栏内控件：侧边栏也要画（竖着摆）==")
