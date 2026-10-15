@@ -10,7 +10,34 @@
 扩展已安装到 `%APPDATA%\Aseprite\extensions\ai-pixel-copilot`。
 只差：填 API Key → 重启 Aseprite → 首次实跑。
 
-### 最近一轮（输入修复 + 底部行 + 小面板位置 + 菜单瘦身）
+### 最近一轮（单文件安装 + 跨平台）
+
+- **能打成单文件 `.aseprite-extension` 了**（`tools/pack-extension.ps1`）。这个格式就是 zip，
+  压缩包内路径 = 扩展目录的相对路径、`package.json` 必须在根
+  （依据 Aseprite 自己的 `src/app/extensions_tests.cpp:98` 构造方式）。
+  两个坑：`Compress-Archive` **只认 `.zip` 后缀**（先打 zip 再改名）；
+  它生成的条目路径是正斜杠（实测合规）。
+- **桥也 bundle 进包了**，所以单文件安装**只要系统有 Node.js，不用 clone、不用 npm install**：
+  - `bridge/scripts/bundle-for-extension.mjs` 用 **esbuild 的 Node API**（不是 spawn npx：
+    Windows 上 npx 实际是 `npx.cmd`，`execFileSync('npx', ...)` 找不到）。
+  - `ws` 是 CJS，bundle 成 ESM 后它内部 `require('events')` 会报
+    "Dynamic require of events is not supported" → 必须注入 `createRequire` banner。
+  - `bufferutil` / `utf-8-validate` 是 ws 的可选 native 加速模块，`--external` 排除。
+  - Perfect Pixel 核心是**运行时动态 import** 的（`perfectpixel.mjs` 里 `import(file://…)`），
+    esbuild 打不进去 → 作为文件一起放（`bridge/vendor/perfectPixel.mjs`）。
+  - bundle 放在 `extension/bridge/dist/bridge.mjs`，这样 `ROOT = HERE/..` 正好是 `bridge/`，
+    config / vendor / data 的相对路径全部对上，不用传 `--config`。
+- **扩展优先用自带的桥**：`bridgeEntry()` 先看 `<ext>/bridge/dist/bridge.mjs` 在不在，
+  没有才回落到仓库的 `bridge/src/server.mjs`。两条装法共用一份代码。
+- **跨平台**：起桥按 `package.config:sub(1,1)` 判断（`\` = Windows → `start /MIN`；
+  否则 `nohup … &`）。Aseprite 用的是 **Lua 5.4，没有 `jit.os`**，别想着用 LuaJIT 那套。
+- **桥缺失时不再静默失败**：面板里直接打出该做什么（换带桥的包 / 克隆仓库跑 install.ps1 /
+  确认装了 Node）。
+- 实测：把包解压到扩展目录、**删掉 `__project.lua`**（模拟纯单文件安装），
+  桥能独立启动、自动从 `config.example.json` 生成配置、`/health` 返回 `{"ok":true}`。
+- 版本号统一到 **0.2.0**（`extension/package.json`、`bridge/package.json`、`main.lua` 之前不一致）。
+
+### 上一轮（输入修复 + 底部行 + 小面板位置 + 菜单瘦身）
 
 - **退格只能删一个字 —— 已修**。根因：哨兵机制每次变化后把 Entry 重置成"一个空格"，
   而 `Entry::onSetText` **只把 caret 往下 clamp、不会挪到末尾**（entry.cpp:506），

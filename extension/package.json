@@ -2,9 +2,11 @@
   "name": "ai-pixel-copilot",
   "displayName": "AI Pixel Copilot",
   "description": "控制台式 AI 对话框：用自然语言操作画布（换色/擦除/描边/清杂点/调色板映射）、调用 Perfect Pixel Studio 矫正网格、快照回滚与色值场景记忆。",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
-  "categories": ["Scripts"],
+  "categories": [
+    "Scripts"
+  ],
   "contributes": {
     "scripts": [
       {

@@ -23,3 +23,9 @@ tests/lua/_*.png
 # README 里引用的两张是单独复制到 docs/ 的（不随测试变化）。
 tests/lua/gui_*.png
 tests/lua/*_result.txt
+
+# 打包产物（用 tools/pack-extension.ps1 生成）
+dist/
+
+# 扩展包内的桥（tools/pack-extension.ps1 生成）
+extension/bridge/

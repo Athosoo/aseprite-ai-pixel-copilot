@@ -37,35 +37,51 @@ Aseprite (Lua 扩展)  <--WebSocket-->  本地 Node 桥  <--HTTPS-->  LLM（Open
 | 需要 | 说明 |
 |---|---|
 | **Aseprite 1.3.x** | 在 1.3.18.6-dev 上开发验证。1.2 及更早没有扩展系统，装不了 |
-| **Node.js 18+** | 跑本地桥。整个桥只有一个第三方依赖（`ws`） |
-| **Windows** | `install.ps1` 与"自动拉起桥"是 PowerShell 写的。macOS / Linux 可以手动起桥（见下） |
+| **Node.js 18+** | 本地桥要用。**装法 A 也只需要这一个** |
 
-### 步骤
+Windows / macOS / Linux 都支持（起桥按平台分支；`install.ps1` 是 Windows 的，其他平台手动两步即可）。
+
+### 装法 A：单文件安装（推荐）
+
+**不需要 clone 仓库、不需要 npm install。**
+
+1. 到 [Releases](https://github.com/Athosoo/aseprite-ai-pixel-copilot/releases) 下载
+   `ai-pixel-copilot-<版本>.aseprite-extension`
+2. 把它**拖进 Aseprite 窗口**（或 `Edit > Preferences > Extensions > Add Extension`）
+3. 重启 Aseprite，按 **Ctrl+Shift+A** 打开面板
+4. 首次会弹 3~4 个授权框（每个脚本文件一次），勾选"不再提示"即可
+
+桥（那个本地 Node 进程）**已经打包在扩展里**，装完就能用。首次打开面板时它会在
+扩展目录下自动生成 `bridge/config.json` —— 在面板里敲 `menu` 选「设置」把 API Key 填进去就行。
+
+### 装法 B：从源码安装（想改代码 / 跑测试）
 
 ```bash
-# 1) 克隆到任意位置（下面用 <repo> 代指）
-git clone https://github.com/<你的用户名>/aseprite-ai-pixel-copilot.git
+# 1) 克隆到任意位置
+git clone https://github.com/Athosoo/aseprite-ai-pixel-copilot.git
 cd aseprite-ai-pixel-copilot
 
 # 2) 装桥的依赖
 cd bridge && npm install && cd ..
 
 # 3) 生成配置（config.json 不进版本库 —— 里面有 API Key）
-#    Windows:  copy bridge\config.example.json bridge\config.json
-#    或直接复制一份改名也行
-copy bridge\config.example.json bridge\config.json
+copy bridge\config.example.json bridge\config.json      # Windows
+# cp bridge/config.example.json bridge/config.json      # macOS / Linux
 
 # 4) 装扩展：把 extension/ 复制到 Aseprite 扩展目录，
-#    并把【本仓库的绝对路径】写进扩展，让扩展知道去哪找 bridge
-powershell -ExecutionPolicy Bypass -File install.ps1
+#    并把【本仓库的绝对路径】写进扩展，让扩展知道去哪找桥
+powershell -ExecutionPolicy Bypass -File install.ps1    # Windows
+# macOS / Linux 见下面的「其他平台」
 
 # 5) 重启 Aseprite（扩展只在启动时加载一次）
 ```
 
-> **为什么要有第 4 步**：Aseprite 的 Lua 沙箱里没有 HTTP，只有 WebSocket，
-> 所以必须有个本地 Node 桥替它调 LLM。扩展本身不知道桥在哪，
+> **为什么第 4 步要写路径**：Aseprite 的 Lua 沙箱里没有 HTTP、只有 WebSocket，
+> 所以必须有个本地 Node 桥替它调 LLM。扩展不知道自己被 clone 到哪，
 > `install.ps1` 会把仓库路径写进扩展目录的 `__project.lua`，扩展启动时读它。
-> 所以仓库 clone 到哪都行，源码里没有写死任何路径。
+> 这样源码里不用写死任何人的路径，仓库 clone 到哪都能用。
+>
+> 装法 B 的好处是改完 `extension/` 里的代码跑一下 `install.ps1` 就生效，方便开发。
 
 打开：菜单 **File > Scripts > AI Pixel Copilot (AI console)**，或 **Ctrl+Shift+A**。
 菜单里**只有这一条**——其余命令（命令表 / 小面板 / 快照 / 回滚 / 设置）都不挂菜单，
@@ -75,17 +91,31 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 `lib/agent.lua` 读上传图片、`main.lua` 执行命令拉起桥），每个勾选"不再提示"即可，一次性。
 面板会自动拉起本地桥。
 
-### 非 Windows / 不想让它自动起桥
+### 其他平台 / 不想让它自动起桥
 
-手动在仓库根起桥即可，扩展会连上来：
+装法 B 在 macOS / Linux 上等价于手动两步（把 `extension/` 复制进扩展目录，
+并写一个 `__project.lua` 指向仓库），或者直接手动起桥：
 
 ```bash
 cd bridge && node src/server.mjs      # 监听 ws://127.0.0.1:8777
 ```
 
-扩展那边只需要 `extension/` 被 Aseprite 加载到（放进
-`~/.config/aseprite/extensions/ai-pixel-copilot/` 之类的位置），
-并让 `__project.lua` 指向本仓库。
+扩展会连上来。扩展目录位置：
+- macOS：`~/Library/Application Support/Aseprite/extensions/ai-pixel-copilot/`
+- Linux：`~/.config/aseprite/extensions/ai-pixel-copilot/`
+- Windows：`%APPDATA%\Aseprite\extensions\ai-pixel-copilot\`
+
+### 自己打包 .aseprite-extension
+
+改完代码想重新发一个单文件包：
+
+```bash
+powershell -ExecutionPolicy Bypass -File tools/pack-extension.ps1     # Windows
+# macOS / Linux:  node bridge/scripts/bundle-for-extension.mjs
+#                 cd extension && zip -r ../dist/ai-pixel-copilot.zip . 
+```
+
+它会把桥 bundle 成零依赖单文件（含 `ws`）一起塞进包里。
 
 ## 用法
 
