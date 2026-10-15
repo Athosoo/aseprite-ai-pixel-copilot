@@ -83,6 +83,11 @@ function startMockLlm(script) {
       call++;
       if (step === HANG) return;      // 故意不响应：模拟卡死的上游
       const payload = typeof step === 'function' ? step(JSON.parse(body || '{}'), call) : step;
+      if (payload && payload.__status) {          // 想造 4xx 的步骤用这个
+        res.writeHead(payload.__status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(payload.body || {}));
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(payload));
     });
@@ -477,7 +482,7 @@ async function main() {
     record(toolCall('call_7a', 'style_use', { name: 'pixel-icon' })),
     record(toolCall('call_7b', 'new_sprite', { width: 16, height: 16 })),
     record(toolCall('call_7c', 'draw_art', {
-      layer: '主体',
+      layer: 'base',
       palette: { '.': '', X: '#2E86DE', o: '#7EE2A8' },
       rows: ['..XX..', '.XooX.', 'XooooX'],
     })),
@@ -495,7 +500,7 @@ async function main() {
   check('draw_art 下发到 Aseprite', !!drawPayload, ase4.received.map((m) => m.type));
   check('字符网格原样转发（不是坐标数组）', drawPayload?.rows?.length === 3 && drawPayload.rows[0] === '..XX..', drawPayload?.rows);
   check('调色板原样转发', drawPayload?.palette?.X === '#2E86DE', drawPayload?.palette);
-  check('落到指定图层', drawPayload?.layer === '主体', drawPayload?.layer);
+  check('落到指定图层', drawPayload?.layer === 'base', drawPayload?.layer);
   check('new_sprite 下发', ase4.received.some((m) => m.type === 'new_sprite_payload' && m.width === 16), ase4.received.map((m) => m.type));
   check('画完后 AI 有回复', ase4.says.some((s) => s.kind === 'ai' && s.text.includes('画好')), ase4.says.slice(-3));
 
@@ -755,6 +760,156 @@ async function main() {
 
   bridge6.kill();
   ase6.close();
+  await sleep(200);
+
+  // ---- 场景 13：上下文记忆（v0.5.2 上下文管理）
+  console.log('== 场景 13：对话记忆落盘 -> 跨桥重启还在 -> 可清空 -> 步数/思考可调 ==');
+  const HIST = join(TMP, 'history13.json');
+  rmSync(HIST, { force: true });
+  const cfg7 = {
+    ...testConfig,
+    port: BRIDGE_PORT + 60,
+    llm: { ...testConfig.llm, maxSteps: 24 },
+    paths: { ...testConfig.paths, history: 'test/.tmp/history13.json' },
+  };
+  const configPath7 = join(TMP, 'config7.json');
+  writeFileSync(configPath7, JSON.stringify(cfg7, null, 2), 'utf8');
+
+  let bridge7 = spawn(process.execPath, [join(ROOT, 'src', 'server.mjs'), '--config', configPath7], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  bridge7.stderr.on('data', (d) => process.stdout.write(`[bridge:err] ${d}`));
+  await sleep(700);
+  let ase7 = new MockAseprite(BRIDGE_PORT + 60);
+  await ase7.connect();
+  await sleep(200);
+
+  mockLlm.close();
+  mockLlm = await startMockLlm([
+    () => textReply('记住了：外壳用 #2E86DE。'),
+  ]);
+  await sleep(150);
+  ase7.chat('记住：外壳用 #2E86DE');
+  await sleep(900);
+
+  check('配置里的步数发到了面板', ase7.cfgMsgs.some((m) => m.llm?.maxSteps === 24),
+    ase7.cfgMsgs.at(-1)?.llm);
+  check('配置里带了上下文预算', ase7.cfgMsgs.some((m) => m.llm?.contextTokens === 16000),
+    ase7.cfgMsgs.at(-1)?.llm);
+  check('对话落盘了', existsSync(HIST), HIST);
+  const saved = JSON.parse(readFileSync(HIST, 'utf8'));
+  // 用户那条前面带着画布上下文（buildUserMessage 拼的），所以用 includes 判断
+  check('落盘内容 = 用户那句 + 助手那句', saved.messages.length === 2
+    && saved.messages[0].role === 'user'
+    && String(saved.messages[0].content).includes('记住：外壳用 #2E86DE')
+    && saved.messages[1].role === 'assistant', saved.messages.map((m) => m.role));
+
+  // 重启桥：历史要读回来，并在握手后提示用户
+  bridge7.kill();
+  ase7.close();
+  await sleep(300);
+  bridge7 = spawn(process.execPath, [join(ROOT, 'src', 'server.mjs'), '--config', configPath7], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  bridge7.stderr.on('data', (d) => process.stdout.write(`[bridge:err] ${d}`));
+  await sleep(700);
+  const ase7b = new MockAseprite(BRIDGE_PORT + 60);
+  await ase7b.connect();
+  await sleep(300);
+  check('重启后握手就告诉用户"上下文已恢复"',
+    ase7b.says.some((s) => s.i18n === 'ctxRestored'), ase7b.says.map((s) => s.i18n));
+
+  mockLlm.close();
+  global.__sentMessages = null;
+  mockLlm = await startMockLlm([
+    (body) => { global.__sentMessages = body.messages; return textReply('记得，外壳是 #2E86DE。'); },
+  ]);
+  await sleep(150);
+  ase7b.chat('我的外壳是什么颜色？');
+  await sleep(900);
+  const seePrev = (global.__sentMessages || []).some(
+    (m) => typeof m.content === 'string' && m.content.includes('记住：外壳用 #2E86DE'));
+  check('重启后模型仍拿到之前那轮对话（不是失忆）', seePrev,
+    (global.__sentMessages || []).map((m) => String(m.content).slice(0, 20)));
+
+  // history_info：面板能查当前上下文
+  ase7b.send({ type: 'history_info', id: 77 });
+  await sleep(300);
+  const info = ase7b.received.filter((m) => m.type === 'history_result').at(-1);
+  check('history_info 报出条数与预算', info?.messages >= 3 && info?.budgetTokens === 16000, info);
+
+  // 清空上下文：历史文件要真的空
+  ase7b.send({ type: 'reset_history', id: 78 });
+  await sleep(400);
+  const cleared = ase7b.received.filter((m) => m.type === 'history_result').at(-1);
+  check('reset 回执', cleared?.reset === true, cleared);
+  check('清空后桥提示了用户（带本地化键）',
+    ase7b.says.some((s) => s.i18n === 'ctxCleared'), ase7b.says.map((s) => s.i18n));
+  const afterReset = JSON.parse(readFileSync(HIST, 'utf8'));
+  check('清空后文件里没有消息了', afterReset.messages.length === 0 && afterReset.summary === '',
+    afterReset.messages.length);
+
+  // 设置面板改高级项 -> 立刻生效（回执里能看到新值）
+  ase7b.send({
+    type: 'set_config', id: 79,
+    llm: { maxSteps: 12, contextTokens: 4000, temperature: 0.5, thinking: 'high' },
+  });
+  await sleep(400);
+  const cfg7b = ase7b.cfgMsgs.at(-1)?.llm;
+  check('设置保存后回执里是新步数', cfg7b?.maxSteps === 12, cfg7b);
+  check('设置保存后回执里是新上下文预算', cfg7b?.contextTokens === 4000, cfg7b);
+  check('设置保存后回执里是新温度', cfg7b?.temperature === 0.5, cfg7b);
+  check('设置保存后回执里是思考强度', cfg7b?.thinking === 'high', cfg7b);
+  const savedCfg7 = JSON.parse(readFileSync(configPath7, 'utf8'));
+  check('高级项落到了 config.json（重启桥还在）',
+    savedCfg7.llm.maxSteps === 12 && savedCfg7.llm.contextTokens === 4000 && savedCfg7.llm.thinking === 'high',
+    savedCfg7.llm);
+
+  ase7b.send({ type: 'set_config', id: 80, llm: { maxSteps: 9999, contextTokens: 999999 } });
+  await sleep(400);
+  check('越界步数被夹到 200', ase7b.cfgMsgs.at(-1)?.llm?.maxSteps === 200, ase7b.cfgMsgs.at(-1)?.llm);
+  check('越界上下文被夹到 200000', ase7b.cfgMsgs.at(-1)?.llm?.contextTokens === 200000,
+    ase7b.cfgMsgs.at(-1)?.llm);
+
+  // thinking=high -> 请求里要带 reasoning_effort
+  mockLlm.close();
+  global.__reqBody = null;
+  mockLlm = await startMockLlm([
+    (body) => { global.__reqBody = body; return textReply('好。'); },
+  ]);
+  await sleep(150);
+  ase7b.chat('随便说一句');
+  await sleep(900);
+  check('思考强度发到了请求体里', global.__reqBody?.reasoning_effort === 'high',
+    global.__reqBody?.reasoning_effort);
+
+  // 端点不认这个字段 -> 去掉重试一次，并告诉用户
+  mockLlm.close();
+  ase7b.says.length = 0;
+  global.__reqBody = null;
+  global.__retryHad = null;
+  mockLlm = await startMockLlm([
+    (body) => {
+      if (body.reasoning_effort) {
+        global.__retryHad = body.reasoning_effort;
+        return { __status: 400, body: { error: { message: 'unknown field reasoning_effort' } } };
+      }
+      global.__reqBody = body;
+      return textReply('好。');
+    },
+  ]);
+  await sleep(150);
+  ase7b.chat('再说一句');
+  await sleep(1200);
+  check('第一次带了 thinking（被端点拒掉）', global.__retryHad === 'high', global.__retryHad);
+  check('去掉 thinking 后重试成功',
+    global.__reqBody !== null && global.__reqBody.reasoning_effort === undefined,
+    global.__reqBody?.reasoning_effort);
+  check('降级告诉了用户（本地化键 thinkingDropped）',
+    ase7b.says.some((s) => s.i18n === 'thinkingDropped'), ase7b.says.map((s) => s.i18n));
+
+  bridge7.kill();
+  ase7b.close();
   await sleep(200);
 
   console.log(`\n==== selftest: ${passes} 通过, ${fails} 失败 ====`);

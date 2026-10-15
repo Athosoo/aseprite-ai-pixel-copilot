@@ -34,6 +34,19 @@ local function makeColorLookup(palette)
   return map
 end
 
+-- 把一行拆成"字符"数组。
+--
+-- 【必须按 UTF-8 字符切，不能按字节】—— 这一条是踩出来的：
+-- 模型经常用方块字符（█ ▒ 口）之类当"像素"，一个字符 3 个字节，
+-- 而 string.sub/#str 都是字节级的 → 每个格子取到半个字符 → 一个都匹配不上调色板
+-- → painted=0 但没报错，模型以为画好了，一遍遍重画直到步数耗尽。
+-- 见 tests/lua/artlib_test.lua 的「非 ASCII 像素字符」段。
+local function splitChars(line)
+  local out = {}
+  for _, code in utf8.codes(line) do out[#out + 1] = utf8.char(code) end
+  return out
+end
+
 -- 把字符网格画到目标 image 上。(x,y) 是网格左上角在画布里的位置。
 -- 返回：画了多少像素、用了多少种颜色、以及网格尺寸。
 function artlib.stampGrid(img, rows, palette, x, y)
@@ -42,23 +55,27 @@ function artlib.stampGrid(img, rows, palette, x, y)
   end
 
   local lookup = makeColorLookup(palette)
-  local w = #rows[1]
-  for i, line in ipairs(rows) do
-    if #line ~= w then
+
+  local grid = {}
+  for i, line in ipairs(rows) do grid[i] = splitChars(tostring(line)) end
+  local w = #grid[1]
+  for i, chars in ipairs(grid) do
+    if #chars ~= w then
       error(string.format(
         "row %d has %d characters but row 1 has %d -- every row must be the same width",
-        i, #line, w))
+        i, #chars, w))
     end
   end
 
   x = math.floor(tonumber(x) or 0)
   y = math.floor(tonumber(y) or 0)
 
-  local painted, skipped = 0, 0
+  local painted, skipped, transparent = 0, 0, 0
   local used = {}
-  for ry, line in ipairs(rows) do
+  local transparentChars = {}
+  for ry, chars in ipairs(grid) do
     for rx = 1, w do
-      local ch = line:sub(rx, rx)
+      local ch = chars[rx]
       local col = lookup[ch]
       if col then
         local px, py = x + rx - 1, y + ry - 1
@@ -69,6 +86,9 @@ function artlib.stampGrid(img, rows, palette, x, y)
         else
           skipped = skipped + 1     -- 出界：不报错，但要告诉模型，免得它以为画全了
         end
+      else
+        transparent = transparent + 1
+        transparentChars[ch] = (transparentChars[ch] or 0) + 1
       end
     end
   end
@@ -76,6 +96,8 @@ function artlib.stampGrid(img, rows, palette, x, y)
   return {
     painted = painted,
     skippedOutOfBounds = skipped,
+    transparent = transparent,
+    transparentChars = transparentChars,   -- 全透明时用来给模型解释为什么啥都没画
     width = w,
     height = #rows,
     distinctColors = (function()

@@ -23,13 +23,26 @@ mkdirSync(builtinDir, { recursive: true });
 
 const s = new Styles({ builtinDir, userDir });
 
+console.log('== v0.5.2 图层名必须 ASCII ==');
+{
+  const bad = s.save('layer-name-check', { layers: ['主体', 'base'] });
+  ok(bad.error !== undefined, '中文图层名被拒');
+  ok(/ASCII/.test(bad.error), '报错说明是 ASCII 的问题');
+
+  const good = s.save('layer-name-ok', { layers: ['shadow', 'base', 'detail', 'highlight'] });
+  ok(good.ok === true, '全英文图层名可以保存');
+  const g = s.get('layer-name-ok');
+  ok(g.layers.length === 4 && g.layers[0] === 'shadow', '图层顺序保留（从底到顶）');
+}
+
 console.log('== 内置风格 ==');
 {
   const names = s.names();
   ok(names.includes('pixel-icon'), '有 pixel-icon');
   ok(names.includes('stardew'), '有 stardew');
   ok(names.includes('flat-minimal'), '有 flat-minimal');
-  ok(names.length === 3, '默认 3 个，实际 ' + names.length);
+  // 用户目录里可能有自己存的风格，所以只断言三个内置都在（不再断言恰好 3 个）
+  ok(['pixel-icon', 'stardew', 'flat-minimal'].every((n) => names.includes(n)), '内置三个都在');
   ok(names.join(',') === names.slice().sort().join(','), '名字是排好序的');
 
   const st = s.get('pixel-icon');
@@ -64,7 +77,7 @@ console.log('== save：清洗 + 落盘 ==');
     label: '我的风格',
     size: [24, 24],
     palette: ['#FFFFFF', '  #000000  ', 'not-a-colour', '#GGGGGG'],
-    layers: ['底', '上'],
+    layers: ['base', 'top'],
     rules: ['规则一', '规则二'],
     notes: '随手记',
   });
@@ -76,7 +89,7 @@ console.log('== save：清洗 + 落盘 ==');
   ok(st.palette.length === 2, '非法色值被过滤掉，实际 ' + st.palette.length);
   ok(st.palette[1] === '#000000', '色值首尾空格被去掉');
   ok(st.size[0] === 24 && st.size[1] === 24, '尺寸保留');
-  ok(st.layers[0] === '底', '图层顺序保留（底 -> 上）');
+  ok(st.layers[0] === 'base' && st.layers[1] === 'top', '图层顺序保留（底 -> 上）');
 }
 
 console.log('== save：名字校验 ==');
@@ -85,7 +98,10 @@ console.log('== save：名字校验 ==');
   ok(s.save('   ', {}).error !== undefined, '纯空格被拒');
   ok(s.save('a/b', {}).error !== undefined, '带斜杠被拒（会跑到目录外）');
   ok(s.save('a.b', {}).error !== undefined, '带点被拒');
-  ok(s.save('中文风格', {}).ok === true, '中文名字允许');
+  // v0.5.2：名字会当文件名，改成只允许 ASCII（用户要求：无论界面语言一律英文）
+  ok(s.save('中文风格', {}).error !== undefined, '中文名字现在被拒（它会变成文件名）');
+  ok(/ASCII/.test(s.save('中文风格', {}).error), '报错里说清了原因');
+  ok(s.save('note-paper', { label: '便签纸风格' }).ok === true, '英文名 + 中文 label 照常可以');
   ok(s.save('my-style-2', {}).ok === true, '字母数字连字符允许');
 }
 

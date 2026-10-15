@@ -26,6 +26,12 @@ export async function chatCompletion(cfg, messages, tools, extraSignal) {
     temperature: cfg.temperature ?? 0.2,
     stream: false,
   };
+  // 思考强度：只有用户显式选了（auto 以外的值）才发。很多兼容端点不认这个字段，
+  // 认不出就 400 —— 下面 catch 到会去掉它重试一次，绝不因此连不上。
+  const thinking = String(cfg.thinking || 'auto').toLowerCase();
+  if (thinking === 'low' || thinking === 'medium' || thinking === 'high') {
+    body.reasoning_effort = thinking;
+  }
   if (tools && tools.length) {
     body.tools = tools;
     body.tool_choice = 'auto';
@@ -41,19 +47,39 @@ export async function chatCompletion(cfg, messages, tools, extraSignal) {
     else extraSignal.addEventListener('abort', onAbort, { once: true });
   }
 
-  try {
+  const post = async (payload) => {
     const res = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${cfg.apiKey || ''}`,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
       signal: ctrl.signal,
     });
     const text = await res.text();
     if (!res.ok) {
-      throw new Error(`LLM endpoint returned HTTP ${res.status}: ${text.slice(0, 600)}`);
+      const err = new Error(`LLM endpoint returned HTTP ${res.status}: ${text.slice(0, 600)}`);
+      err.status = res.status;
+      throw err;
+    }
+    return text;
+  };
+
+  let droppedThinking = false;
+  try {
+    let text;
+    try {
+      text = await post(body);
+    } catch (e) {
+      // 端点不认 reasoning_effort：去掉它重试一次，并把"已降级"标在返回值上
+      if (body.reasoning_effort && (e.status === 400 || e.status === 422)) {
+        delete body.reasoning_effort;
+        text = await post(body);
+        droppedThinking = true;
+      } else {
+        throw e;
+      }
     }
     let parsed;
     try {
@@ -64,6 +90,7 @@ export async function chatCompletion(cfg, messages, tools, extraSignal) {
     if (parsed.error) {
       throw new Error(`LLM error: ${parsed.error.message || JSON.stringify(parsed.error)}`);
     }
+    if (droppedThinking) parsed.droppedThinking = true;
     return parsed;
   } finally {
     clearTimeout(timer);
@@ -116,7 +143,7 @@ export function buildUserMessage(userText, context) {
  *   abortSignal 外部中断信号（见 chatCompletion）；中断时抛 TurnAborted
  */
 export async function runTurn(opts) {
-  const { cfg, systemPrompt, history, userText, context, tools, dispatch, onSay, onStatus, abortSignal } = opts;
+  const { cfg, systemPrompt, history, userText, context, tools, dispatch, onSay, onStatus, abortSignal, onHistory } = opts;
 
   // 系统提示每步重取：模型可能在**同一轮**里 style_use 换了风格，
   // 那后面的作画步骤就得立刻按新风格来（否则"换个风格画个图标"要两轮才生效）。
@@ -126,8 +153,17 @@ export async function runTurn(opts) {
   const messages = [{ role: 'system', content: sysNow() }, ...history];
   messages.push({ role: 'user', content: buildUserMessage(userText, context) });
 
-  const maxSteps = cfg.maxSteps ?? 8;
+  const maxSteps = Math.max(1, Number(cfg.maxSteps) || 24);
   let finalText = '';
+
+  // 这一轮新产生的消息（不含系统提示）回写给调用方落盘。
+  // 正常结束 / 撞步数上限 / 被中断，三条路都要回写：否则用户那句提问会凭空消失。
+  let saidThinkingDrop = false;
+
+  const flush = () => {
+    if (!onHistory) return;
+    try { onHistory(messages.slice(1)); } catch { /* 存不下来不影响这一轮 */ }
+  };
 
   // 中断检查点：每步开头、每次 HTTP 前后、每个工具调用前都要过一遍，
   // 否则"停止"要等到当前这一步跑完才生效。
@@ -137,74 +173,83 @@ export async function runTurn(opts) {
     if (r) throw new TurnAborted(r);
   };
 
-  for (let step = 0; step < maxSteps; step++) {
-    checkAbort();
-    messages[0] = { role: 'system', content: sysNow() };
-    onStatus(step === 0 ? 'thinking...' : `working (step ${step + 1})...`, 'busy');
-
-    let resp;
-    try {
-      resp = await chatCompletion(cfg, messages, tools, abortSignal);
-    } catch (e) {
-      // fetch 被 abort 时抛 AbortError —— 转成 TurnAborted，别当错误报给用户
-      if (abortSignal?.aborted) throw new TurnAborted(reason() || 'user');
-      throw e;
-    }
-    checkAbort();
-
-    const msg = resp.choices?.[0]?.message;
-    if (!msg) throw new Error('LLM response has no message field');
-
-    // 去掉厂商特有字段，避免回传时被接口拒绝
-    const clean = { role: 'assistant', content: msg.content ?? '' };
-    if (msg.tool_calls && msg.tool_calls.length) clean.tool_calls = msg.tool_calls;
-    messages.push(clean);
-
-    // 推理模型的思考过程（DeepSeek reasoner 等）→ 灰色
-    if (msg.reasoning_content && String(msg.reasoning_content).trim()) {
-      const r = String(msg.reasoning_content).trim();
-      onSay('think', r.length > 600 ? r.slice(0, 600) + ' …' : r);
-    }
-
-    if (msg.content && msg.content.trim()) {
-      const text = msg.content.trim();
-      const hasTools = !!(msg.tool_calls && msg.tool_calls.length);
-      // 带工具调用的那段话是"中间叙述/思考"，最终回答才是输出
-      onSay(hasTools ? 'think' : 'ai', text);
-      if (!hasTools) finalText = text;
-    }
-
-    if (!msg.tool_calls || msg.tool_calls.length === 0) {
-      onStatus('ready', 'ok');
-      return finalText;
-    }
-
-    for (const call of msg.tool_calls) {
+  try {
+    for (let step = 0; step < maxSteps; step++) {
       checkAbort();
-      const name = call.function?.name;
-      let args = {};
+      messages[0] = { role: 'system', content: sysNow() };
+      onStatus(step === 0 ? 'thinking...' : `working (step ${step + 1})...`, 'busy');
+
+      let resp;
       try {
-        args = JSON.parse(call.function?.arguments || '{}');
+        resp = await chatCompletion(cfg, messages, tools, abortSignal);
       } catch (e) {
-        args = { __parseError: String(e.message || e) };
-      }
-      onStatus(`running ${name}...`, 'tool');
-      let result;
-      try {
-        result = await dispatch(name, args);
-      } catch (e) {
-        result = { error: String(e?.message || e) };
+        // fetch 被 abort 时抛 AbortError —— 转成 TurnAborted，别当错误报给用户
+        if (abortSignal?.aborted) throw new TurnAborted(reason() || 'user');
+        throw e;
       }
       checkAbort();
-      messages.push({
-        role: 'tool',
-        tool_call_id: call.id,
-        content: JSON.stringify(result).slice(0, 8000),
-      });
+
+      if (resp.droppedThinking && !saidThinkingDrop) {
+        saidThinkingDrop = true;
+        onSay('warn', 'This endpoint does not accept a thinking-effort setting; it is being ignored.', 'thinkingDropped');
+      }
+
+      const msg = resp.choices?.[0]?.message;
+      if (!msg) throw new Error('LLM response has no message field');
+
+      // 去掉厂商特有字段，避免回传时被接口拒绝
+      const clean = { role: 'assistant', content: msg.content ?? '' };
+      if (msg.tool_calls && msg.tool_calls.length) clean.tool_calls = msg.tool_calls;
+      messages.push(clean);
+
+      // 推理模型的思考过程（DeepSeek reasoner 等）→ 灰色
+      if (msg.reasoning_content && String(msg.reasoning_content).trim()) {
+        const r = String(msg.reasoning_content).trim();
+        onSay('think', r.length > 600 ? r.slice(0, 600) + ' …' : r);
+      }
+
+      if (msg.content && msg.content.trim()) {
+        const text = msg.content.trim();
+        const hasTools = !!(msg.tool_calls && msg.tool_calls.length);
+        // 带工具调用的那段话是"中间叙述/思考"，最终回答才是输出
+        onSay(hasTools ? 'think' : 'ai', text);
+        if (!hasTools) finalText = text;
+      }
+
+      if (!msg.tool_calls || msg.tool_calls.length === 0) {
+        onStatus('ready', 'ok');
+        return finalText;
+      }
+
+      for (const call of msg.tool_calls) {
+        checkAbort();
+        const name = call.function?.name;
+        let args = {};
+        try {
+          args = JSON.parse(call.function?.arguments || '{}');
+        } catch (e) {
+          args = { __parseError: String(e.message || e) };
+        }
+        onStatus(`running ${name}...`, 'tool');
+        let result;
+        try {
+          result = await dispatch(name, args);
+        } catch (e) {
+          result = { error: String(e?.message || e) };
+        }
+        checkAbort();
+        messages.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: JSON.stringify(result).slice(0, 8000),
+        });
+      }
     }
+
+    onStatus('ready', 'ok');
+    onSay('warn', `Stopped at this turn's limit of ${maxSteps} steps. Say "continue" and I will carry on from here.`, 'stepLimit');
+    return finalText;
+  } finally {
+    flush();
   }
-
-  onStatus('ready', 'ok');
-  onSay('error', `Stopped: hit the ${maxSteps}-step tool limit. Try a smaller request.`);
-  return finalText;
 }

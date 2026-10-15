@@ -80,9 +80,11 @@ local STATUS_OK    = Color(126, 226, 168)
 local STATUS_BUSY  = Color(255, 206, 92)
 local STATUS_TOOL  = Color(128, 200, 220)
 local STATUS_ERROR = Color(255, 122, 122)
+local STATUS_WARN  = Color(255, 196, 110)
 
 local STATUS_COLORS = {
   ok = STATUS_OK, busy = STATUS_BUSY, tool = STATUS_TOOL, error = STATUS_ERROR,
+  warn = STATUS_WARN,
 }
 
 -- 桥侧 / 面板侧给的 kind -> 四类之一
@@ -90,6 +92,7 @@ local STATUS_KIND_ALIAS = {
   ok = "ok", ready = "ok", connected = "ok", done = "ok",
   busy = "busy", thinking = "busy", working = "busy", connecting = "busy", waiting = "busy",
   tool = "tool", running = "tool", op = "tool",
+  warn = "warn", warning = "warn", limited = "warn",
   error = "error", disconnected = "error", failed = "error",
 }
 
@@ -113,12 +116,15 @@ local ERROR_STATUS_PREFIX = {
   "disconnected", "connection error", "已断开", "连接出错",
 }
 
+local WARN = Color(255, 196, 110)
+
 local KIND_COLOR = {
   user  = USER,
   ai    = AI,
   think = THINK,
   tool  = TOOL,
   info  = DIM,
+  warn  = WARN,
   error = ERROR,
   menu  = MENU_TX,
 }
@@ -127,6 +133,7 @@ local KIND_PREFIX = {
   user  = "▸ ",
   think = "│ ",
   tool  = "· ",
+  warn  = "! ",
   error = "! ",
 }
 
@@ -174,9 +181,6 @@ function panel.new(opts)
     askDlg = nil,
     askClosing = false,
     askShownOptions = nil,
-    -- P4 窗口自然尺寸（第一次绘制时记下来）
-    naturalBounds = nil,
-    naturalFor = nil,
     inputFocused = false,
     -- P12 形态
     mode = "panel",
@@ -394,7 +398,7 @@ end
 function Panel:_resetEntry(restoreCaret)
   if not self.dlg then return end
   self.entrySyncing = true
-  pcall(function()
+  self:_preserveBounds(function()
     self.dlg:modify{ id = "input", text = SENTINEL }
     if restoreCaret then
       self.dlg:modify{ id = "send", focus = true }
@@ -454,7 +458,7 @@ function Panel:_history(delta)
   local text = (pos == 0) and (self.draft or "") or self.history[n - pos + 1]
   self:fillInput(text)
   if self.dlg then
-    pcall(function() self.dlg:modify{ id = "input", focus = true } end)
+    self:_preserveBounds(function() self.dlg:modify{ id = "input", focus = true } end)
     self.inputFocused = true
   end
   self:repaint()
@@ -559,23 +563,43 @@ end
 --   2) 焦点状态没有 API 可读，只能自己记（self.inputFocused）。
 -- 所以：焦点已经在输入框 -> 什么都不做；窗口已经不是自然尺寸（用户拖过）-> 也不动，
 -- 免得把用户调好的尺寸冲掉。自然尺寸在第一次绘制时（_paint）记下来。
-function Panel:_windowIsNatural()
-  local nb = self.naturalBounds
-  if not nb or not self.dlg then return true end
-  local ok, b = pcall(function() return self.dlg.bounds end)
-  if not ok or not b then return true end        -- 读不到就当自然尺寸，行为退回旧版
-  return (b.width or 0) == nb.w and (b.height or 0) == nb.h
+-- 所有 dlg:modify 都要包在这里面。
+--
+-- 原因（实测）：`modify` 会触发一次重新布局，Aseprite 顺手把窗口**按内容自然尺寸
+-- 撑开**。用户手动缩小窗口之后，每敲一个字（输入要重置哨兵 = 一次 modify）、
+-- 每点一下画布（改焦点 = 一次 modify）都会"跳回原大小"。
+-- 所以这里在 modify 前后各读一次 bounds，变了就放回去 —— 比"猜什么时候不该 modify"
+-- 可靠得多，也不会牺牲点一下就能接着打字的手感。
+function Panel:_preserveBounds(fn)
+  local before = nil
+  if self.dlg and self.shown then
+    local ok, b = pcall(function() return self.dlg.bounds end)
+    if ok and b and (b.width or 0) > 0 and (b.height or 0) > 0 then
+      before = { x = b.x, y = b.y, w = b.width, h = b.height }
+    end
+  end
+
+  local ok, err = pcall(fn)
+
+  if before and self.dlg then
+    local ok2, b2 = pcall(function() return self.dlg.bounds end)
+    if ok2 and b2 and ((b2.width or 0) ~= before.w or (b2.height or 0) ~= before.h) then
+      pcall(function()
+        self.dlg.bounds = Rectangle(before.x, before.y, before.w, before.h)
+      end)
+    end
+  end
+
+  if not ok then error(err) end
 end
 
 function Panel:_onCanvasMouseDown(ev, dlg)
   if ev.button ~= MouseButton.LEFT then return end
   if self:_menuIndexAt(ev.x or 0, ev.y or 0) then return end
   if self.inputFocused then return end
-  -- 用户拖过窗口大小：不再 modify，否则会把尺寸冲回内容自然尺寸
-  if self.naturalBounds and not self:_windowIsNatural() then return end
   dlg = dlg or self.dlg
   if not dlg then return end
-  pcall(function() dlg:modify{ id = "input", focus = true } end)
+  self:_preserveBounds(function() dlg:modify{ id = "input", focus = true } end)
   self.inputFocused = true
 end
 
@@ -696,8 +720,6 @@ function Panel:setMode(mode, quiet)
   for _, m in ipairs(MODE_ORDER) do if m == mode then valid = true end end
   if not valid then mode = "panel" end
   self.mode = mode
-  self.naturalBounds = nil          -- 形态变了，自然尺寸要重新记
-  self.naturalFor = nil
 
   if self.dlg and self.shown then
     local ww, wh = self:_modeSize(mode)
@@ -720,9 +742,6 @@ function Panel:setMode(mode, quiet)
     if x and y then
       pcall(function() self.dlg.bounds = Rectangle(x, y, ww, wh) end)
     end
-    -- 刚设完的尺寸就是它的"自然尺寸"，不然点击逻辑会以为用户拖过而不再给焦点
-    self.naturalBounds = { w = ww, h = wh }
-    self.naturalFor = mode
   end
 
   if not quiet then self:log(string.format(i18n.t("modeChanged"), self:modeLabel()), "info") end
@@ -1272,17 +1291,6 @@ end
 function Panel:_paint(gc)
   local w, h = gc.width, gc.height
   self.canvasW, self.canvasH = w, h
-
-  -- 第一次绘制 = 布局已定型，把窗口的"自然尺寸"记下来（P4 用：用户拖过之后就不再
-  -- 因为 modify 把窗口撑回去）。读 dlg.bounds 在窗口可见时是安全的。
-  -- 形态变了要重新记（栏的自然尺寸和面板不一样）。
-  if self.naturalFor ~= self:layoutMode() and self.dlg then
-    local ok, b = pcall(function() return self.dlg.bounds end)
-    if ok and b and (b.width or 0) > 0 and (b.height or 0) > 0 then
-      self.naturalBounds = { w = b.width, h = b.height }
-      self.naturalFor = self:layoutMode()
-    end
-  end
 
   -- 栏模式下底色可配置（G5）：Aseprite 读不到主题色（实测真名假名都返回 0,0,0），
   -- 所以给用户一个填色口来贴合自己的主题；没填就用面板默认深色。

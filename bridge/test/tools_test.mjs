@@ -144,17 +144,17 @@ console.log('== 作画工具转发 ==');
   ok(last().kind === 'new_sprite', '消息类型 = new_sprite');
   ok(last().payload.width === 32 && last().payload.height === 32, '宽高转发');
 
-  await dispatch('add_layer', { name: '高光', opacity: 128 });
+  await dispatch('add_layer', { name: 'highlight', opacity: 128 });
   ok(last().kind === 'add_layer', '消息类型 = add_layer');
-  ok(last().payload.name === '高光' && last().payload.opacity === 128, '名字和不透明度转发');
+  ok(last().payload.name === 'highlight' && last().payload.opacity === 128, '名字和不透明度转发');
 
   calls.length = 0;
   await dispatch('draw_art', {
-    layer: '主体', palette: { '.': '', X: '#2E86DE' }, rows: ['X.X', '.X.'], x: 1, y: 2,
+    layer: 'base', palette: { '.': '', X: '#2E86DE' }, rows: ['X.X', '.X.'], x: 1, y: 2,
   });
   ok(last().kind === 'draw_art', '消息类型 = draw_art');
   const p = last().payload;
-  ok(p.layer === '主体' && p.x === 1 && p.y === 2, '图层和偏移转发');
+  ok(p.layer === 'base' && p.x === 1 && p.y === 2, '图层和偏移转发');
   ok(Array.isArray(p.rows) && p.rows.length === 2, 'rows 原样转发');
   ok(typeof p.label === 'string' && p.label.includes('3x2'), '没给 label 时按网格尺寸生成，实际 ' + p.label);
 }
@@ -175,6 +175,35 @@ console.log('== draw_art 的桥侧校验（省一次 Lua 往返）==');
   calls.length = 0;
   const r4 = await dispatch('draw_art', { rows: ['X. '], palette: { X: '#FF0000' } });
   ok(r4.error === undefined, '. 和空格不要求有调色板条目');
+}
+
+console.log('== 图层名必须 ASCII（用户要求：无论界面语言都用英文）==');
+{
+  calls.length = 0;
+  const a = await dispatch('add_layer', { name: '主体' });
+  ok(typeof a.error === 'string' && /ASCII/.test(a.error), 'add_layer 中文名被挡，实际 ' + JSON.stringify(a));
+  ok(a.hint && /base|shadow|highlight/.test(a.hint), '附带该用什么名字的建议');
+  ok(calls.length === 0, '被挡的请求没有下发到 Lua');
+
+  const b = await dispatch('draw_art', { layer: '高光', palette: { X: '#FF0000' }, rows: ['X'] });
+  ok(typeof b.error === 'string' && /ASCII/.test(b.error), 'draw_art 中文图层名被挡');
+  ok(calls.length === 0, '也没下发');
+
+  // 英文名照常
+  calls.length = 0;
+  await dispatch('draw_art', { layer: 'highlight', palette: { X: '#FF0000' }, rows: ['X'] });
+  ok(last().kind === 'draw_art', '英文图层名照常转发');
+
+  // 带空格 / 点 / 下划线 / 连字符的英文名也允许
+  for (const good of ['base layer', 'outline.1', 'my_layer', 'my-layer', 'L2']) {
+    const r = await dispatch('add_layer', { name: good });
+    ok(r.error === undefined, `允许 ${good}`);
+  }
+  // 路径穿越 / 斜杠 / 空
+  for (const bad of ['..', 'a/b', 'a\b', '']) {
+    const r = await dispatch('add_layer', { name: bad });
+    ok(r.error === undefined || /ASCII/.test(r.error), `空名字或路径分隔符的处理：${JSON.stringify(bad)}`);
+  }
 }
 
 console.log('== 未知工具 ==');

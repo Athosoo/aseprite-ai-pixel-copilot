@@ -5,6 +5,7 @@
 // Pixel Studio's core algorithm instead of asking the model to guess.
 
 import { perfectPixel } from './perfectpixel.mjs';
+import { isAsciiName } from './styles.mjs';
 
 // RGBA 里有多少种不同的颜色（忽略全透明像素）。
 // 给 perfect_pixel 当诊断数据：像素画通常几十色以内，照片则成千上万。
@@ -756,6 +757,13 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
         });
 
       case 'add_layer':
+        // 和 draw_art 同一条规矩：图层名必须 ASCII（见 isAsciiName 的注释）
+        if (args.name != null && String(args.name).trim() !== '' && !isAsciiName(args.name)) {
+          return {
+            error: `layer name must be ASCII: ${args.name}`,
+            hint: 'use english layer names like base / shadow / highlight / outline / detail',
+          };
+        }
         return await session.request('add_layer', {
           name: args.name, opacity: args.opacity, blendMode: args.blendMode,
         });
@@ -764,12 +772,23 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
         if (!Array.isArray(args.rows) || args.rows.length === 0) {
           return { error: 'rows is empty: pass an array of strings, one per pixel row' };
         }
-        // 先把"行宽不一致"挡在桥这一侧：模型写歪一行，报错要比让 Lua 抛更早、更好懂
-        const w = String(args.rows[0]).length;
-        const badRow = args.rows.findIndex((r) => String(r).length !== w);
+        // 先把"行宽不一致"挡在桥这一侧：模型写歪一行，报错要比让 Lua 抛更早、更好懂。
+        // 宽度按【码点】算 —— JS 的 .length 是 UTF-16 单元数（emoji 算 2），
+        // 而 Lua 侧用 utf8.codes 按码点数。两边不一致会让校验放过、Lua 再报错。
+        // 图层名统一英文（用户要求：无论界面语言，名字一律 ASCII —— 它们会进
+        // .aseprite 文件，也会出现在用户要手打的路径里）
+        if (args.layer != null && String(args.layer).trim() !== '' && !isAsciiName(args.layer)) {
+          return {
+            error: `layer name must be ASCII: ${args.layer}`,
+            hint: 'use english layer names like base / shadow / highlight / outline / detail',
+          };
+        }
+        const cps = (s2) => [...String(s2)].length;
+        const w = cps(args.rows[0]);
+        const badRow = args.rows.findIndex((r) => cps(r) !== w);
         if (badRow >= 0) {
           return {
-            error: `row ${badRow + 1} has ${String(args.rows[badRow]).length} characters but row 1 has ${w}; every row must be the same length`,
+            error: `row ${badRow + 1} has ${cps(args.rows[badRow])} characters but row 1 has ${w}; every row must be the same length`,
           };
         }
         const chars = new Set(args.rows.join('').split(''));
@@ -779,6 +798,15 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
           return {
             error: `these characters appear in rows but have no palette entry: ${unmapped.join(' ')}`,
             hint: 'add them to palette, or use "." for transparent',
+          };
+        }
+        // "." 和 " " 永远是透明的，给它们配颜色不会生效。与其让模型画出 0 像素
+        // 再反复重试，不如在这里就说清楚（这个坑真的踩过：见 artlib 的 UTF-8 那段）。
+        const dotPainted = ['.', ' '].filter((c) => typeof pal[c] === 'string' && pal[c].trim() !== '');
+        if (dotPainted.length && [...chars].every((c) => c === '.' || c === ' ')) {
+          return {
+            error: `every character in the grid is ${dotPainted.map((c) => `"${c}"`).join(' or ')}, which are always transparent; palette entries for them are ignored`,
+            hint: 'use a real character (a letter or digit) for pixels that should be painted, and keep "." for the background',
           };
         }
         return await session.request('draw_art', {

@@ -11,6 +11,15 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+// 图层/文件类名字的统一判据：ASCII 字母数字开头，后面可跟空格 . _ -，
+// 且不能是点或双点（路径穿越）。用户要求无论界面语言都用英文，
+// 因为这些名字会进 .aseprite 文件，也会出现在路径里。
+export function isAsciiName(name) {
+  const s = String(name ?? '').trim();
+  if (s === '' || s === '.' || s === '..') return false;
+  return /^[A-Za-z0-9][A-Za-z0-9 ._-]*$/.test(s);
+}
+
 const MAX_RULES = 12;
 const MAX_TEXT = 300;
 
@@ -21,7 +30,7 @@ const BUILTIN = {
     label: '像素图标',
     size: [16, 16],
     palette: ['#1B1B1B', '#2E86DE', '#7EE2A8', '#F5F5F5', '#B03A3A', '#E8C170'],
-    layers: ['主体', '高光', '轮廓'],
+    layers: ['base', 'highlight', 'outline'],
     rules: [
       '轮廓固定 1px，用调色板里最深的颜色',
       '光源在左上：高光偏左上，暗部在右下',
@@ -36,7 +45,7 @@ const BUILTIN = {
     label: '星露谷风',
     size: [16, 32],
     palette: ['#3A2412', '#8B5A2B', '#C98A4B', '#E8C170', '#5A8F3D', '#8FBF5A', '#2E4A7D', '#6B9BD1'],
-    layers: ['阴影', '主体', '细节', '高光'],
+    layers: ['shadow', 'base', 'detail', 'highlight'],
     rules: [
       '暖色调为主，棕色/土黄/草绿占多数',
       '轮廓用深棕而不是纯黑',
@@ -51,7 +60,7 @@ const BUILTIN = {
     label: '极简扁平',
     size: [32, 32],
     palette: ['#2C3E50', '#3498DB', '#1ABC9C', '#ECF0F1', '#E74C3C', '#F39C12'],
-    layers: ['主体', '强调'],
+    layers: ['base', 'accent'],
     rules: [
       '不要轮廓线，靠色块区分形状',
       '形状尽量几何化（圆/方/三角）',
@@ -119,8 +128,14 @@ export class Styles {
   save(name, spec = {}) {
     const key = String(name || '').trim();
     if (!key) return { error: 'style needs a name' };
-    if (!/^[\w\u4e00-\u9fa5-]+$/.test(key)) {
-      return { error: 'name may only contain letters, digits, hyphen, underscore or CJK' };
+    // 名字会直接当文件名（data/styles/<name>.json），所以强制 ASCII ——
+    // 中文名 NTFS 能存，但一旦过 shell / 别的工具就是路径安全隐患。
+    // 要显示中文请用 label（label 不进文件名）。
+    if (!/^[A-Za-z0-9_-]+$/.test(key)) {
+      return {
+        error: 'style name must be ASCII letters, digits, hyphen or underscore (it becomes a file name)',
+        hint: 'use a short english id such as note-paper; put the user-facing name in label',
+      };
     }
 
     const clean = { name: key };
@@ -135,6 +150,13 @@ export class Styles {
         .slice(0, 32);
     }
     if (Array.isArray(spec.layers)) {
+      const bad = spec.layers.map((l) => String(l)).filter((l) => !isAsciiName(l));
+      if (bad.length) {
+        return {
+          error: `layer names must be ASCII: ${bad.join(', ')}`,
+          hint: 'layer names go into the .aseprite file and get typed by hand; use english like base / shadow / highlight / outline / detail',
+        };
+      }
       clean.layers = spec.layers.map((l) => String(l).slice(0, 40)).slice(0, 12);
     }
     if (Array.isArray(spec.rules)) {

@@ -67,6 +67,8 @@ function agent.new(cfg)
   -- 插件内改 API：Save/Test 都走桥，桥负责写 config.json（改完立即生效，不用重启桥）
   self.settings = settings.new{
     port = self.cfg.port,
+    wsRoot = self.workspaceRoot or "",
+    barBg = self.uiBarBg or "",
     onSave = function(llm, wsRoot, barBg)
       self.uiBarBg = barBg or ""
       self.lastUiMode = nil                     -- 强制回写一次，把底色也带上
@@ -390,6 +392,15 @@ function Agent:open()
   self.panel:log(i18n.t("tipMenu"), "info")
 end
 
+-- 清空对话上下文（桥侧的历史 + 摘要）。没连上就没法清：桥才是记忆的持有者。
+function Agent:resetHistory()
+  if not (self.conn and self.conn:isOpen()) then
+    self.panel:log(i18n.t("ctxFailed"), "error")
+    return
+  end
+  self:send{ type = "reset_history", id = self:nextId() }
+end
+
 -- 连接是异步的：用户可能在握手完成前就敲了指令。先排队，连上再发。
 -- 注意：回显由面板负责（终端里输入总是显示出来），这里不要再 log 一遍。
 function Agent:sendChat(text)
@@ -455,6 +466,8 @@ function Agent:action(name)
     self:abort()
   elseif name == "deliver" then
     self:deliver()
+  elseif name == "reset_history" then
+    self:resetHistory()
   elseif name == "bar" then
     self.panel:cycleMode()
   elseif name == "open_file" or name == "open_doc_pick" then
@@ -463,7 +476,7 @@ function Agent:action(name)
     -- 没有路径参数：提示用户怎么用（真正打开是模型调 open_document 工具）
     self.panel:log(i18n.t("openDocHint"), "info")
   elseif name == "settings" then
-    self.settings:show(self.config)
+    self.settings:show(self.config, self.workspaceRoot or "", self.uiBarBg or "")
   elseif name == "upload" or name == "fixadd" then
     self:pickFile()                 -- 选一张 -> 进队列 -> 弹小确认窗
   elseif name == "fix" then
@@ -707,6 +720,16 @@ function Agent:onMessage(msg)
   elseif t == "ask" then
     self:askUser(msg)
 
+  elseif t == "history_result" then
+    if msg.reset then
+      self.panel:log(i18n.t("ctxCleared"), "info")
+    elseif (msg.messages or 0) == 0 then
+      self.panel:log(i18n.t("ctxEmpty"), "info")
+    else
+      self.panel:log(string.format(i18n.t("ctxStats"), msg.messages or 0,
+        msg.summaryChars or 0), "info")
+    end
+
   elseif t == "open_doc" then
     self:openDocument(msg)
 
@@ -835,6 +858,26 @@ function Agent:artOp(kind, msg)
   end)
 
   if ok then
+    -- 一个像素都没画上：**必须当失败报**。
+    -- 之前这里报 ok，模型以为画好了，就一遍遍重画同一个网格直到步数耗尽 ——
+    -- 用户看到的是"画 0 像素"刷屏 + "hit the 8-step tool limit"。
+    -- 真正的原因（网格全是透明字符）要原样告诉模型，它才知道改哪儿。
+    if kind == "draw_art" and (res.painted or 0) == 0 then
+      local why = i18n.t("artNothing")
+      if res.transparentChars then
+        local parts = {}
+        for ch, n in pairs(res.transparentChars) do
+          parts[#parts + 1] = string.format("%q×%d", ch, n)
+        end
+        if #parts > 0 then
+          why = why .. " " .. string.format(i18n.t("artNothingChars"), table.concat(parts, " "))
+        end
+      end
+      self.panel:log(why, "error")
+      self:send{ type = "art_result", id = id, ok = false, error = why, report = res }
+      return
+    end
+
     if kind == "draw_art" then
       self.panel:log(string.format(i18n.t("artDrawn"),
         res.painted, res.width, res.height, res.layer), "tool")

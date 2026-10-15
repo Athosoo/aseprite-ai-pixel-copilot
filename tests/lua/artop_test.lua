@@ -256,6 +256,31 @@ do
   ok(modeCalls[1].quiet == true, "启动恢复时不要刷日志（quiet）")
 end
 
+print("== 画 0 像素必须当失败报（否则模型以为成功了，重画到步数耗尽）==")
+do
+  -- 用方块字符画：修复前这里 painted=0 而且报 ok，模型就会一遍遍重试
+  local r = feed{
+    type = "draw_art", id = 90, layer = "方块",
+    palette = { ["."] = "", ["█"] = "#FF0000" },
+    rows = { "██..", ".██." },
+  }
+  ok(r.type == "art_result" and r.ok == true, "方块字符能正常画出来")
+  ok(r.report.painted == 4, "画了 4 个像素，实际 " .. tostring(r.report.painted))
+
+  -- 全透明的网格：必须 ok=false，而且要说清是哪些字符没颜色
+  sent, logs = {}, {}
+  local r2 = feed{
+    type = "draw_art", id = 91, layer = "空的",
+    palette = { ["."] = "" },
+    rows = { "....", "...." },
+  }
+  ok(r2.ok == false, "一个像素都没画 -> ok=false（不能报成功）")
+  ok(type(r2.error) == "string" and r2.error:find(i18n.t("artNothing"), 1, true) ~= nil,
+    "错误里带上了标准说明")
+  ok(r2.report ~= nil and r2.report.painted == 0, "报告里 still 有 painted=0 供模型参考")
+  ok(#logs >= 1 and logs[#logs].kind == "error", "面板按错误显示（红字）")
+end
+
 print("== 未知消息类型不炸 ==")
 do
   local r = feed{ type = "definitely_not_a_real_message", id = 10 }

@@ -282,12 +282,61 @@ do
   ok(i18n.builtinAction("打开文件") == "open_file", "「打开文件」-> open_file")
   ok(i18n.builtinAction("openfile") == "open_file", "openfile -> open_file")
   ok(i18n.builtinAction("打开") == "upload", "「打开」仍是选图进矫正队列（没被改坏）")
+
+  -- 清空对话上下文（v0.5.2）：中英都能敲，而且不能撞上"清屏"
+  ok(i18n.builtinAction("forget") == "reset_history", "forget -> reset_history")
+  ok(i18n.builtinAction("reset") == "reset_history", "reset -> reset_history")
+  ok(i18n.builtinAction("context") == "reset_history", "context -> reset_history")
+  ok(i18n.builtinAction("清空上下文") == "reset_history", "「清空上下文」-> reset_history")
+  ok(i18n.builtinAction("忘记") == "reset_history", "「忘记」-> reset_history")
+  ok(i18n.builtinAction("清空") == "clear", "「清空」还是清屏（没被抢走）")
+  ok(i18n.builtinAction("cls") == "clear", "cls 还是清屏")
+  ok(i18n.miniLabel("reset_history") ~= "" and i18n.miniLabel("reset_history") ~= "reset_history",
+    "小面板标签有本地化文案")
   local of = nil
   for _, r in ipairs(rows) do if r.id == "open_file" then of = r end end
   ok(of ~= nil, "菜单里有「打开文件…」这一行")
   local od = nil
   for _, r in ipairs(rows) do if r.id == "open_doc" then od = r end end
   ok(od ~= nil and of.keys ~= od.keys, "两条打开的键位不冲突（O vs P）")
+end
+
+print("== P4 续：modify 之后窗口尺寸要放回去（输入不再撑大窗口）==")
+do
+  -- 假的 dlg：modify 会模拟 Aseprite 的行为 —— 把窗口撑回"内容自然尺寸"
+  local function fakeDlg(naturalW, naturalH, startW, startH)
+    local d = { bounds = Rectangle(10, 20, startW, startH), modifies = 0 }
+    d.modify = function(_, _)
+      d.modifies = d.modifies + 1
+      d.bounds = Rectangle(d.bounds.x, d.bounds.y, naturalW, naturalH)   -- 这就是那个"撑回去"
+    end
+    return d
+  end
+
+  local p = panel.new{}
+  p.shown = true
+  p.dlg = fakeDlg(672, 467, 320, 220)          -- 用户把窗口缩成了 320x220
+
+  -- 模拟"敲一个字"：Entry 变化 -> 重置哨兵 -> modify
+  p.entrySyncing = false
+  p:_resetEntry(false)
+  ok(p.dlg.modifies > 0, "确实发生了一次 modify")
+  ok(p.dlg.bounds.width == 320 and p.dlg.bounds.height == 220,
+    string.format("窗口尺寸被放回去了，实际 %dx%d", p.dlg.bounds.width, p.dlg.bounds.height))
+  ok(p.dlg.bounds.x == 10 and p.dlg.bounds.y == 20, "位置也没被挪动")
+
+  -- 点画布：同样不能跳
+  p.inputFocused = false
+  p:_onCanvasMouseDown({ button = MouseButton.LEFT, x = 5, y = 5 })
+  ok(p.dlg.bounds.width == 320, "点画布后还是 320")
+  ok(p.inputFocused == true, "但焦点确实被设回了输入框（手感没牺牲）")
+
+  -- 没缩过的窗口：不该被改（放回去的值 == 原值）
+  local q = panel.new{}
+  q.shown = true
+  q.dlg = fakeDlg(672, 467, 672, 467)
+  q:_resetEntry(false)
+  ok(q.dlg.bounds.width == 672 and q.dlg.bounds.height == 467, "本来就是自然尺寸 -> 不动")
 end
 
 print("== G2 底边栏要放得下 3 行（状态 + 最后一行输出 + 输入）==")

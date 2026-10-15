@@ -165,4 +165,46 @@ do
   end
 end
 
+print("== 非 ASCII 像素字符（模型很爱用方块字符）==")
+do
+  -- 这一组是回归测试：stampGrid 原来按【字节】切行，一个 3 字节的字符被切成
+  -- 三个半字符，一个都匹配不上调色板 -> painted=0 但报成功，模型反复重画到步数耗尽。
+  local spr = Sprite(8, 8, ColorMode.RGB)
+  app.activeSprite = spr
+  local img = app.activeSprite.cels[1].image
+
+  local cases = {
+    { "方块字符", { "██..", ".██.", "..██" }, { ["."] = "", ["█"] = "#FF0000", ["▒"] = "#00FF00" }, 6 },
+    { "全角汉字", { "口口..", ".口口." }, { ["."] = "", ["口"] = "#FF0000", ["田"] = "#00FF00" }, 4 },
+    { "混排中英", { "X口.X", "口X口." }, { ["."] = "", X = "#FF0000", ["口"] = "#00FF00" }, 6 },
+  }
+  for _, c in ipairs(cases) do
+    local res = artlib.stampGrid(img, c[2], c[3], 0, 0)
+    ok(res.painted == c[4], string.format("%s：画了 %d 个（期望 %d）", c[1], res.painted, c[4]))
+    -- 宽度必须是【字符数】，不是字节数
+    ok(res.width == #(function()
+      local t = {}
+      for _, code in utf8.codes(c[2][1]) do t[#t + 1] = utf8.char(code) end
+      return t
+    end)(), string.format("%s：宽度按字符算（%d）", c[1], res.width))
+  end
+
+  -- 行宽校验也要按字符数：3 个方块字符 + 1 个点 = 4 个字符
+  ok(pcall(function() artlib.stampGrid(img, { "███.", "██." }, {}, 0, 0) end) == false,
+    "非 ASCII 行宽不一致仍然报错")
+end
+
+print("== 全透明网格：painted=0 且能说清为什么 ==")
+do
+  local spr = Sprite(4, 4, ColorMode.RGB)
+  app.activeSprite = spr
+  local img = spr.cels[1].image
+  local res = artlib.stampGrid(img, { "..", ".." }, { ["."] = "" }, 0, 0)
+  ok(res.painted == 0, "没有像素被画上")
+  ok(res.transparent == 4, "透明格子计数 = 4，实际 " .. tostring(res.transparent))
+  ok(res.transparentChars ~= nil and res.transparentChars["."] == 4,
+    "透明字符统计里有 '.' × 4")
+end
+
+
 print(string.format("%d passed, %d failed", pass, fail))

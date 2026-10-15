@@ -16,6 +16,7 @@ import { Memory } from './memory.mjs';
 import { Styles } from './styles.mjs';
 import { TOOLS, makeDispatcher } from './tools.mjs';
 import { runTurn, chatCompletion } from './llm.mjs';
+import { Conversation, clampBudget } from './history.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -53,6 +54,12 @@ const bank = new ColorBank(BANK_PATH);
 const MEMORY_PATH = join(ROOT, cfg.paths?.memory || 'data/memory.json');
 const memory = new Memory(MEMORY_PATH);
 
+// 对话历史：落盘 + 超长自动压缩（data/history.json）
+const history = new Conversation({
+  file: join(ROOT, cfg.paths?.history || 'data/history.json'),
+  budgetTokens: cfg.llm?.contextTokens,
+});
+
 // 风格库：调色板 + 图层结构 + 作画规矩的模板。切换风格时**只注入当前那一个**，
 // 不是把整库塞进 prompt —— 这是省 token 的关键。
 const styles = new Styles({
@@ -64,6 +71,13 @@ let activeStyle = cfg.activeStyle || '';
 
 // ------------------------------------------------------- 配置读写（供插件内设置面板用）
 // 只把"是否已设置 + 掩码提示"发给 Aseprite，绝不外传完整 key。
+// 数值配置统一在这里夹：面板可能发来空串 / 越界值 / NaN
+function clampNum(v, lo, hi, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(hi, Math.max(lo, n));
+}
+
 function maskKey(k) {
   if (!k) return '';
   if (k.length <= 8) return '****';
@@ -78,6 +92,10 @@ function configPayload() {
       model: cfg.llm?.model || '',
       apiKeySet: !!cfg.llm?.apiKey,
       apiKeyHint: maskKey(cfg.llm?.apiKey),
+      maxSteps: cfg.llm?.maxSteps ?? 24,
+      contextTokens: history.budgetTokens,
+      temperature: cfg.llm?.temperature ?? 0.2,
+      thinking: cfg.llm?.thinking || 'auto',
     },
     port: PORT,
     colorBank: BANK_PATH,
@@ -107,7 +125,6 @@ class Session {
     this.pending = new Map();
     this.pendingBinary = null; // 等待二进制负载的头部
     this.upload = null;        // 最近一次上传的图片
-    this.history = [];         // 对话历史
     this.busy = false;
     this.queue = [];
     this.info = {};
@@ -204,12 +221,27 @@ class Session {
       // 传的是函数：模型在同一轮里 style_use 换了风格，后面的步骤立刻按新风格来。
       const buildSystemPrompt = () => {
         const styleText = activeStyle ? styles.describe(activeStyle) : null;
-        return styleText ? `${SYSTEM_PROMPT}\n\n${styleText}` : SYSTEM_PROMPT;
+        let out = styleText ? `${SYSTEM_PROMPT}\n\n${styleText}` : SYSTEM_PROMPT;
+        // 被压缩掉的旧对话摘要常驻在这里（systemPrompt 是函数，每步重取，压缩完立刻生效）
+        const block = history.summaryBlock();
+        if (block) out += `\n\n${block}`;
+        return out;
       };
+      // 压缩：超长时先把最老的一段摘要掉，再拼消息。
+      // 放在 runTurn 之前，这样本轮一开始看到的就是压缩后的上下文。
+      if (history.needsCompaction()) {
+        const rep = await this.compactHistory();
+        if (rep.compacted) {
+          this.say('info',
+            `Context compacted: ${rep.dropped} older messages summarised (${rep.tokensBefore} -> ${history.usedTokens()} tokens).`,
+            'ctxCompacted');
+        }
+      }
+
       await runTurn({
         cfg: cfg.llm,
         systemPrompt: buildSystemPrompt,
-        history: this.history,
+        history: history.messages,          // runTurn 会就地追加（同一个数组引用）
         userText: text,
         context,
         tools: TOOLS,
@@ -217,9 +249,11 @@ class Session {
         abortSignal: ac.signal,
         onSay: (kind, t, key) => this.say(kind, t, key),
         onStatus: (t, kind) => this.status(t, kind),
+        // 这一轮新产生的消息（含被打断的半截）回写进历史
+        onHistory: (msgs) => { history.messages = msgs; },
       });
-      // 只保留最近若干轮，避免上下文无限增长
-      this.history = this.history.slice(-12);
+      // 落盘：重启桥 / 重启 Aseprite 之后还接得上
+      history.save();
     } catch (e) {
       if (e?.name === 'TurnAborted') {
         // 中断不是错误：手动和超时给不同的提示
@@ -234,6 +268,25 @@ class Session {
       this.turnAbort = null;
       this.turnProcessed = new Set();
     }
+  }
+
+  // 把最老的一段历史交给 LLM 摘要（上下文压缩）。失败不影响本轮对话。
+  async compactHistory() {
+    const rep = await history.compact(async (text) => {
+      const resp = await chatCompletion(cfg.llm, [
+        {
+          role: 'system',
+          content:
+            'You compress earlier parts of a conversation between a user and a pixel-art assistant. ' +
+            'Keep: decisions made, file/layer/colour names, sizes, what was drawn or edited, what is still ' +
+            'pending, and anything the user asked to remember. Drop tool chatter and pleasantries. ' +
+            'Write at most 120 words, in the same language the conversation used. Plain text, no headings.',
+        },
+        { role: 'user', content: text },
+      ], null);
+      return resp.choices?.[0]?.message?.content || '';
+    });
+    return rep;
   }
 
   // 面板按了「停止」/ Esc（P3）。中断是"尽力而为"：没有在跑的任务就当无事发生。
@@ -275,6 +328,12 @@ class Session {
         if (!cfg.llm?.apiKey) {
           this.say('info', 'No API key yet -- click Settings in the panel to paste one.');
         }
+        const st = history.stats();
+        if (st.messages > 0) {
+          this.say('info', `Context restored: ${st.messages} message(s), about ${st.tokens} tokens` +
+            (st.summaryChars ? `, plus a ${st.summaryChars}-char summary` : '') +
+            '.', 'ctxRestored');
+        }
         break;
       }
 
@@ -286,6 +345,16 @@ class Session {
         const llm = msg.llm || {};
         if (typeof llm.baseUrl === 'string' && llm.baseUrl.trim()) cfg.llm.baseUrl = llm.baseUrl.trim();
         if (typeof llm.model === 'string' && llm.model.trim()) cfg.llm.model = llm.model.trim();
+        // 高级项：步数 / 上下文预算 / 温度 / 思考强度（都在设置面板里调）
+        if (llm.maxSteps !== undefined) cfg.llm.maxSteps = clampNum(llm.maxSteps, 1, 200, 24);
+        if (llm.temperature !== undefined) cfg.llm.temperature = clampNum(llm.temperature, 0, 2, 0.2);
+        if (typeof llm.thinking === 'string' && ['auto', 'low', 'medium', 'high'].includes(llm.thinking)) {
+          cfg.llm.thinking = llm.thinking;
+        }
+        if (llm.contextTokens !== undefined) {
+          cfg.llm.contextTokens = clampBudget(llm.contextTokens);
+          history.budgetTokens = cfg.llm.contextTokens;   // 立刻生效，不用重启桥
+        }
         // 空 apiKey = 保持不变（面板里不回显真 key）
         if (llm.clearApiKey) cfg.llm.apiKey = '';
         else if (typeof llm.apiKey === 'string' && llm.apiKey.trim()) cfg.llm.apiKey = llm.apiKey.trim();
@@ -350,6 +419,16 @@ class Session {
         break;
       case 'request_error':
         this.resolvePending(msg.id, { error: msg.error || 'Aseprite 侧拒绝了请求' });
+        break;
+      case 'reset_history': {
+        const rep = history.reset();
+        this.historyReset = true;
+        this.say('info', 'Conversation context cleared.', 'ctxCleared');
+        this.send({ type: 'history_result', id: msg.id, reset: true, ...rep });
+        break;
+      }
+      case 'history_info':
+        this.send({ type: 'history_result', id: msg.id, ...history.stats(), summary: history.summary });
         break;
       case 'open_doc_result':
         this.resolvePending(msg.id, msg.ok

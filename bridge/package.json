@@ -1,6 +1,6 @@
 {
   "name": "ai-pixel-bridge",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "private": true,
   "type": "module",
   "description": "Aseprite AI Pixel Copilot 的本地桥：WebSocket 服务 + OpenAI 兼容 LLM 调用 + 工具注册表 + 色值/通用记忆库 + 风格库",
