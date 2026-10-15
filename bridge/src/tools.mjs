@@ -92,6 +92,76 @@ export const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'crop',
+      description:
+        'Crop the canvas down to a rectangular region. Pixels are kept EXACTLY as they are (no resampling). ' +
+        'Use it to remove empty margins or cut out part of the image. ' +
+        'Rule of thumb: if the user says "shrink to NxN" and canvas_info shows a lot of padding around the content, ' +
+        'they usually mean crop, not scale. The region must lie inside the current canvas.',
+      parameters: {
+        type: 'object',
+        properties: {
+          x: { type: 'integer', description: 'left edge, 0-based' },
+          y: { type: 'integer', description: 'top edge, 0-based' },
+          w: { type: 'integer', description: 'width in pixels' },
+          h: { type: 'integer', description: 'height in pixels' },
+          label: { type: 'string', description: 'short description; becomes the undo step name' },
+        },
+        required: ['x', 'y', 'w', 'h'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'scale',
+      description:
+        'Resize the WHOLE image — canvas and artwork together — by resampling. ' +
+        'Use it when the user wants the same picture at a different size (e.g. "make this 64x64 into 32x32"). ' +
+        'Shrinking loses fine detail, so for pixel art keep method=nearest. ' +
+        'If the goal is really to trim empty margins, use crop instead — that keeps pixels untouched.',
+      parameters: {
+        type: 'object',
+        properties: {
+          width: { type: 'integer' },
+          height: { type: 'integer' },
+          method: {
+            type: 'string',
+            enum: ['nearest', 'bilinear'],
+            description: 'default nearest (keeps pixel art crisp); bilinear smooths, rarely what pixel artists want',
+          },
+          label: { type: 'string' },
+        },
+        required: ['width', 'height'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'canvas_size',
+      description:
+        'Change the canvas size WITHOUT scaling the artwork — content keeps its original pixel size and is placed by anchor. ' +
+        'Use when the user wants more room around the art or less, e.g. "add a 4px border" or "make the canvas 32x32 but keep the sprite as is".',
+      parameters: {
+        type: 'object',
+        properties: {
+          width: { type: 'integer' },
+          height: { type: 'integer' },
+          anchor: {
+            type: 'string',
+            enum: ['center', 'top-left', 'top-right', 'bottom-left', 'bottom-right'],
+            description: 'where the existing content sits inside the new canvas; default center',
+          },
+          label: { type: 'string' },
+        },
+        required: ['width', 'height'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'perfect_pixel',
       description:
         'Run Perfect Pixel Studio\'s core algorithm: detect the pixel grid of an image that only looks like pixel art (skewed cells, blurry edges) and resample it into true pixel art. ' +
@@ -159,6 +229,62 @@ export const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'remember',
+      description:
+        'Store something worth keeping long-term: a palette the user settled on, a style rule, a project convention, a preference. ' +
+        'Call this when the user explicitly asks you to remember something, or when they state a durable preference. ' +
+        'Do NOT use it for routine edits or transient state. Keep text short — one fact per call. ' +
+        'What you store is NOT injected into every request; it is retrieved on demand with recall.',
+      parameters: {
+        type: 'object',
+        properties: {
+          kind: {
+            type: 'string',
+            enum: ['color', 'style', 'preference', 'project', 'note'],
+            description: 'category; default note',
+          },
+          text: { type: 'string', description: 'the fact itself, short and self-contained' },
+          tags: { type: 'array', items: { type: 'string' }, description: 'keywords for later retrieval' },
+          note: { type: 'string', description: 'optional extra context' },
+        },
+        required: ['text'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'recall',
+      description:
+        'Search what has been remembered before. Call this BEFORE guessing what the user preferred earlier, ' +
+        'or when they refer to something established previously. Returns only the few best matches.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'keyword to match against text / tags / note' },
+          kind: { type: 'string', enum: ['color', 'style', 'preference', 'project', 'note'], description: 'restrict to one category' },
+          tags: { type: 'array', items: { type: 'string' }, description: 'require these tags' },
+          limit: { type: 'integer', description: 'max entries to return, default 6' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'forget',
+      description: 'Delete one stored memory by its id (ids come from recall). Use when the user says something is no longer true.',
+      parameters: {
+        type: 'object',
+        properties: { id: { type: 'string' } },
+        required: ['id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'remember_color',
       description: 'Remember a colour and the context it is used in, so it can be found later with search_colors.',
       parameters: {
@@ -192,11 +318,29 @@ export const TOOLS = [
   },
 ];
 
-export function makeDispatcher({ session, bank, cfg, bundlePath }) {
+export function makeDispatcher({ session, bank, memory, cfg, bundlePath }) {
   return async function dispatch(name, args) {
     switch (name) {
       case 'canvas_info':
         return await session.request('canvas_info');
+
+      case 'crop':
+        return await session.request('crop', {
+          label: args.label || `crop to ${args.w}x${args.h}`,
+          x: args.x, y: args.y, w: args.w, h: args.h,
+        });
+
+      case 'scale':
+        return await session.request('scale', {
+          label: args.label || `scale to ${args.width}x${args.height}`,
+          width: args.width, height: args.height, method: args.method,
+        });
+
+      case 'canvas_size':
+        return await session.request('canvas_size', {
+          label: args.label || `canvas ${args.width}x${args.height}`,
+          width: args.width, height: args.height, anchor: args.anchor,
+        });
 
       case 'apply_ops': {
         if (!Array.isArray(args.ops) || args.ops.length === 0) {
@@ -262,6 +406,15 @@ export function makeDispatcher({ session, bank, cfg, bundlePath }) {
 
       case 'list_versions':
         return await session.request('list_versions');
+
+      case 'remember':
+        return memory.remember(args);
+
+      case 'recall':
+        return memory.recall(args);
+
+      case 'forget':
+        return memory.forget(args);
 
       case 'remember_color':
         return bank.remember(args);

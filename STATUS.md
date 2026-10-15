@@ -10,7 +10,30 @@
 扩展已安装到 `%APPDATA%\Aseprite\extensions\ai-pixel-copilot`。
 只差：填 API Key → 重启 Aseprite → 首次实跑。
 
-### 最近一轮（单文件安装 + 跨平台）
+### 最近一轮（尺寸能力 + 通用记忆）
+
+**新增三个文档级尺寸工具**，解决"AI 分不清裁剪和缩放"：
+- `crop` —— 切画布，**像素原样保留**（去掉留白用这个）
+- `scale` —— 整幅重采样到新尺寸（nearest / bilinear）
+- `canvas_size` —— 只改画布，内容按锚点摆位、尺寸不变
+- `canvas_info` 现在额外返回 `contentBounds` + 四边 `padding` + `contentRatio`，
+  AI 据此判断"留白多 → 该裁剪，铺满 → 该缩放"
+
+**重要实现细节（实测）**：`sprite:crop()` 和 `CanvasSize` **不重采样像素** ——
+它们只改画布尺寸 + 挪 `cel.position`（crop 后 position 变成 -8,-8，`image` 内容原封不动）。
+这就是"裁剪不重采样"的底层保证，`sizelib_test.lua` 就按这个断言。
+
+**通用记忆库**（`bridge/src/memory.mjs`）：
+- 工具 `remember` / `recall` / `forget`，分类 color / style / preference / project / note
+- **省 token 的三条硬设计**：永不注入 prompt（只按需 recall）、单条截断 400 字、
+  总量 500 条且超限时按 `usedCount` 淘汰
+- 每次 recall 命中的条目 `usedCount` +1 → **越用越留得住**（这就是"进化"）
+- 和旧色值库并存：`remember_color` / `search_colors` 保持可用
+
+**测试**：新增 sizelib 23 + memory 23 + tools 分发 46 项；
+加上原有的 menu 89 / ops 31 / versions 20 / path 5 / 桥自测 22，共 **259 项**全绿。
+
+### 上一轮（单文件安装 + 跨平台）
 
 - **能打成单文件 `.aseprite-extension` 了**（`tools/pack-extension.ps1`）。这个格式就是 zip，
   压缩包内路径 = 扩展目录的相对路径、`package.json` 必须在根

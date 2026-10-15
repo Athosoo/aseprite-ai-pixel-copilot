@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import { ColorBank } from './colorbank.mjs';
+import { Memory } from './memory.mjs';
 import { TOOLS, makeDispatcher } from './tools.mjs';
 import { runTurn, chatCompletion } from './llm.mjs';
 
@@ -45,6 +46,11 @@ const SYSTEM_PROMPT = cfg.systemPrompt || '你是一个像素画助手。';
 
 const BANK_PATH = join(ROOT, cfg.paths?.colorBank || 'data/colors.json');
 const bank = new ColorBank(BANK_PATH);
+
+// 通用记忆库（配色方案 / 风格偏好 / 项目约定…）。和色值库分开存，
+// 但同一个 data/ 目录，方便用户直接翻看、手工编辑。
+const MEMORY_PATH = join(ROOT, cfg.paths?.memory || 'data/memory.json');
+const memory = new Memory(MEMORY_PATH);
 
 // ------------------------------------------------------- 配置读写（供插件内设置面板用）
 // 只把"是否已设置 + 掩码提示"发给 Aseprite，绝不外传完整 key。
@@ -152,7 +158,7 @@ class Session {
       return;
     }
     try {
-      const dispatch = makeDispatcher({ session: this, bank, cfg, bundlePath: BUNDLE });
+      const dispatch = makeDispatcher({ session: this, bank, memory, cfg, bundlePath: BUNDLE });
       await runTurn({
         cfg: cfg.llm,
         systemPrompt: SYSTEM_PROMPT,
@@ -239,6 +245,10 @@ class Session {
         this.pendingBinary = { ...msg, kind: 'canvas_pixels' };
         break;
       case 'ops_result':
+        this.resolvePending(msg.id, msg.ok ? { ok: true, ...msg.report } : { error: msg.error });
+        break;
+      case 'size_result':
+        // 裁剪 / 整体缩放 / 改画布尺寸共用这一个结果类型
         this.resolvePending(msg.id, msg.ok ? { ok: true, ...msg.report } : { error: msg.error });
         break;
       case 'snapshot_result':

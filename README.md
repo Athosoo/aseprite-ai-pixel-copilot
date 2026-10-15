@@ -24,6 +24,10 @@ Aseprite (Lua 扩展)  <--WebSocket-->  本地 Node 桥  <--HTTPS-->  LLM（Open
 - **画布算子**（区域级、每个请求一个撤销步骤，Ctrl+Z 可退）
   `replace_color` 换色 / `erase_color` 删某个颜色 / `erase_region` 清区域 /
   `fill_region` 填区域 / `outline` 描边 / `despeckle` 清孤立杂点 / `palette_map` 批量换色+改调色板
+- **尺寸操作**：`crop` 裁剪（像素不动）/ `scale` 整体缩放（重采样）/ `canvas_size` 改画布
+  （内容不变）。AI 靠内容包围盒和留白量判断该用哪个，拿不准会先问你
+- **记忆**：把配色、风格规矩、项目约定记下来，之后按关键词检索。**不占常驻 token**，
+  越常被用到越留得住
 - **整张矫正**：面板里选一张 GPT 生成的图 → 调 Perfect Pixel Studio 核心算法检测网格并重采样
   → 结果作为**新文档**打开，直接复制到你的画布
 - **备份/回滚/临时版本**：每次 AI 改动前自动快照；面板上有 Snapshot / Rollback / Versions 按钮；
@@ -138,9 +142,35 @@ AI ❯ _                                 ← 提示符 + 输入行（中文输�
 - `删掉所有 #00FF00`
 - `给主体加一圈 #1B1B1B 描边`
 - `清理孤立杂点`
+- `把四周的空白裁掉，缩到 32x32` ← 裁剪（像素不动）
+- `整张缩到 32x32` ← 整体重采样
+- `画布扩到 64x64，图案居中别动` ← 只改画布
 - `记住 #2E86DE 是我蓝色外壳的主体色，标签：外壳、蓝`
-- `我之前用过哪些外壳色？`
+- `记住这个项目一律用 1px 深色描边`
+- `我之前用过哪些外壳色？` / `我之前定过什么风格规矩？`
 - `回滚到上一个版本`
+
+### 尺寸操作：裁剪 / 缩放 / 改画布
+
+这三个是**不同**的操作，AI 会自己判断该用哪个：
+
+| 你说的 | 实际做的 | 像素会变吗 |
+|---|---|---|
+| 「把空白裁掉」「切到中间那块」 | **裁剪**（crop） | 不变，只是画布变小 |
+| 「整张缩到 32x32」「放大两倍」 | **整体缩放**（scale） | 重采样，每个像素都重算 |
+| 「画布留 4px 边框」「画布扩到 64」 | **改画布尺寸**（canvas_size） | 内容尺寸不变，只是挪位置 |
+
+判断依据是 `canvas_info` 里的**内容包围盒和四边留白**：留白多而你又说"缩小"，AI 就知道该裁剪而不是缩放。**真的说不清时它会先问你一句**，而不是猜。
+
+### 记忆：让它越用越懂你
+
+- **你说「记住…」** → 存进记忆库
+- **你陈述长期偏好**（定下来的配色、风格规矩、项目约定）→ 它也会记
+- **日常改动、临时状态不会记**（免得把库撑爆、把 token 吃掉）
+
+记忆**不会**塞进每次请求的提示里——它只在需要时按关键词检索几条出来。所以存再多也不影响 token 开销。单条有长度上限、总量有上限，超了会淘汰**最少被用到**的那些；反过来，越常被检索到的越留得住。
+
+想看看记了什么：直接问「你都记得我什么？」。想删：说「忘掉那条 xxx」。
 
 ### 内建命令（不用发给 AI，中英都能敲）
 
@@ -321,10 +351,14 @@ python tools/bdf2ttf.py <字体.bdf> -o fusion-pixel-10px.ttf --family "Fusion P
 aseprite.exe -b --script tests/lua/menu_test.lua      # 89 项
 aseprite.exe -b --script tests/lua/ops_test.lua       # 31 项
 aseprite.exe -b --script tests/lua/versions_test.lua  # 20 项
+aseprite.exe -b --script tests/lua/sizelib_test.lua   # 23 项（裁剪/缩放/包围盒）
 aseprite.exe -b --script tests/lua/path_test.lua      # 安装路径机制
 
 # 桥的自测（mock LLM + mock Aseprite，不联网、不花 token）
-cd bridge && node test/selftest.mjs                                              # 22 项
+cd bridge
+node test/selftest.mjs                                # 22 项
+node test/memory_test.mjs                             # 23 项（记忆库）
+node test/tools_test.mjs                              # 46 项（工具分发）
 
 # GUI 可视化验证（会短暂弹 Aseprite 窗口并自动截图）
 bash tests/run_gui_visual.sh --term        # 终端面板 + 命令表 + 小面板

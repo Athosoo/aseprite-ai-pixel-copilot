@@ -23,6 +23,7 @@
 
 local util = require("lib.util")
 local ops = require("lib.ops")
+local sizelib = require("lib.sizelib")
 local versions = require("lib.versions")
 local panel = require("lib.panel")
 local settings = require("lib.settings")
@@ -212,6 +213,24 @@ function Agent:context()
     ctx.colors = colors
     ctx.totalPixels = total
     ctx.opaquePixels = opaque
+  end
+
+  -- 内容包围盒 + 四周留白：AI 据此判断"这张图有多少空白" ——
+  -- 留白多说明该【裁剪】，内容铺满才该【整体缩放】。省得模型自己从像素统计里推。
+  local b, why = sizelib.contentBounds(spr)
+  if b then
+    ctx.contentBounds = b
+    ctx.padding = {
+      left = b.x,
+      top = b.y,
+      right = spr.width - (b.x + b.w),
+      bottom = spr.height - (b.y + b.h),
+    }
+    local canvasArea = spr.width * spr.height
+    ctx.contentRatio = canvasArea > 0 and (b.w * b.h / canvasArea) or 0
+  else
+    ctx.contentBounds = nil
+    ctx.contentBoundsNote = why   -- "empty"（全透明）或 "too_large"（图太大没扫）
   end
 
   return ctx
@@ -464,6 +483,9 @@ function Agent:onMessage(msg)
   elseif t == "canvas_info" then
     self:send{ type = "canvas_info_result", id = msg.id, context = self:context() }
 
+  elseif t == "crop" or t == "scale" or t == "canvas_size" then
+    self:sizeOp(t, msg)
+
   elseif t == "get_canvas" then
     self:sendCanvas(msg.id)
 
@@ -509,9 +531,48 @@ function Agent:runOps(msg)
   end
 end
 
+-- 文档级几何操作：裁剪 / 整体缩放 / 改画布尺寸。
+-- 和 runOps 一样先自动备份；失败时画布不动，把原因回给模型。
+function Agent:sizeOp(kind, msg)
+  local spr = app.activeSprite
+  local id = msg.id
+
+  if not spr then
+    self:send{ type = "size_result", id = id, ok = false, error = "no document is open" }
+    return
+  end
+
+  local label = msg.label or kind
+  local okSnap, meta = pcall(versions.push, "before: " .. label, spr)
+  if okSnap then
+    self.panel:log(string.format(i18n.t("autoBacked"), meta.id, meta.label), "tool")
+  end
+
+  local ok, res = pcall(function()
+    if kind == "crop" then
+      return sizelib.crop(spr, msg.x, msg.y, msg.w, msg.h)
+    elseif kind == "scale" then
+      return sizelib.scale(spr, msg.width, msg.height, msg.method)
+    else
+      return sizelib.canvasSize(spr, msg.width, msg.height, msg.anchor)
+    end
+  end)
+
+  if ok then
+    if res.changed then
+      self.panel:log(string.format(i18n.t("sizeDone"), kind, res.from, res.to), "tool")
+    else
+      self.panel:log(string.format(i18n.t("sizeNoop"), kind, res.note or ""), "info")
+    end
+    self:send{ type = "size_result", id = id, ok = true, report = res }
+  else
+    self.panel:log(string.format(i18n.t("sizeFailed"), tostring(res)), "error")
+    self:send{ type = "size_result", id = id, ok = false, error = tostring(res) }
+  end
+end
+
 -- Build a new document from the pixels the bridge sent back.
-function Agent:importImage(header, data)
-  local w, h = header.width, header.height
+function Agent:importImage(header, data)  local w, h = header.width, header.height
   if not w or not h or #data ~= w * h * 4 then
     self.panel:log(string.format(i18n.t("importMismatch"),
       #data, (w or 0) * (h or 0) * 4), "error")
