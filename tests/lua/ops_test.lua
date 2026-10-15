@@ -166,5 +166,105 @@ do
   check("最多的是红 60", list[1].hex == "#FF0000" and list[1].count == 60, list[1].hex .. ":" .. list[1].count)
 end
 
+print("== ops: quantize（自动减色，用户实测提的那条）==")
+do
+  -- 造一张"配色很杂"的图：8x8 共 64 个互不相同的颜色
+  local spr, cel, img = newSprite()
+  for y = 0, 7 do
+    for x = 0, 7 do
+      img:putPixel(x, y, Color(x * 32 + 3, y * 32 + 5, (x + y) * 16 + 7))
+    end
+  end
+  check("起始用色 = 64", #ops.colorUsage(img, 99) == 64, #ops.colorUsage(img, 99))
+
+  -- 合并到 8 色以内
+  local rep = ops.run({ { op = "quantize", colors = 8 } }, "减色", cel)
+  local q = rep.ops[1].extra
+  check("报告里写了原始色数", q.colorsBefore == 64, q.colorsBefore)
+  check("报告里写了目标色数", q.colorsAfter <= 8 and q.colorsAfter > 1, q.colorsAfter)
+  check("报告里写了合并了多少", q.merged == 64 - q.colorsAfter, q.merged)
+  check("确实改了像素", rep.ops[1].changed == 64, rep.ops[1].changed)
+
+  -- 真正落地的颜色数（不是只看报告）
+  local after = #ops.colorUsage(img, 99)
+  check("画布上实际只剩 <=8 色", after <= 8 and after > 1, after)
+  check("调色板也同步了", q.paletteChanged == q.colorsAfter, q.paletteChanged)
+  check("sprite 调色板大小 = 合并后的色数", #spr.palettes[1] == q.colorsAfter, #spr.palettes[1])
+  check("调色板里真有这些颜色（不是全黑）", (function()
+    local c = spr.palettes[1]:getColor(0)
+    return c.red + c.green + c.blue > 0
+  end)())
+
+  -- 颜色数本来就少于目标 -> 什么都不做
+  local rep2 = ops.run({ { op = "quantize", colors = 200 } }, "无操作", cel)
+  check("已经够少时报 0 改动", rep2.ops[1].changed == 0, rep2.ops[1].changed)
+  check("并说明原因", tostring(rep2.ops[1].extra.note):find("already") ~= nil, rep2.ops[1].extra.note)
+
+  -- 参数校验
+  local ok, err = pcall(function() ops.run({ { op = "quantize", colors = 1 } }, "坏参数", cel) end)
+  check("colors=1 被拒绝", not ok and tostring(err):find("2 and 256") ~= nil, err)
+  local ok2, err2 = pcall(function() ops.run({ { op = "quantize", colors = 999 } }, "坏参数", cel) end)
+  check("colors=999 被拒绝", not ok2, err2)
+
+  -- 全透明图：不炸，报告说明
+  local spr3, cel3, img3 = newSprite()
+  img3:clear(Rectangle(0, 0, 8, 8), CLEAR)
+  local rep3 = ops.run({ { op = "quantize", colors = 8 } }, "空图", cel3)
+  check("全透明图不报错且 0 改动", rep3.ops[1].changed == 0, rep3.ops[1].changed)
+  check("全透明图给了说明", tostring(rep3.ops[1].extra.note):find("no opaque") ~= nil,
+    rep3.ops[1].extra.note)
+
+  -- 透明像素不参与，也不被改
+  local spr5, cel5, img5 = newSprite()
+  for y = 0, 7 do for x = 0, 7 do img5:putPixel(x, y, Color(x * 30 + 1, y * 30 + 2, 9)) end end
+  img5:putPixel(0, 0, CLEAR)
+  ops.run({ { op = "quantize", colors = 4 } }, "带透明", cel5)
+  check("透明像素保持透明", img5:getPixel(0, 0) == CLEAR.rgbaPixel,
+    string.format("%08X", img5:getPixel(0, 0)))
+
+  -- 只在指定区域内减色（区域外不动）
+  local spr4, cel4, img4 = newSprite()
+  for y = 0, 7 do for x = 0, 7 do img4:putPixel(x, y, Color(x * 30 + 1, y * 30 + 2, 9)) end end
+  local outsideBefore = img4:getPixel(7, 7)
+  ops.run({ { op = "quantize", colors = 2, region = { x = 0, y = 0, w = 4, h = 4 } } }, "局部", cel4)
+  check("区域外像素没动", img4:getPixel(7, 7) == outsideBefore,
+    string.format("%08X -> %08X", outsideBefore, img4:getPixel(7, 7)))
+  check("区域内确实合并了", #ops.colorUsage(img4, 99) < 64, #ops.colorUsage(img4, 99))
+end
+
+print("== ops: quantize 的实际效果（减色后仍看得出结构）==")
+do
+  -- "四个纯色 + 每个像素有微扰"模拟一张配色杂的像素画
+  local spr, cel, img = newSprite()
+  local base = { { 200, 30, 40 }, { 40, 180, 80 }, { 50, 80, 200 }, { 240, 220, 120 } }
+  for y = 0, 7 do
+    for x = 0, 7 do
+      local b = base[(x % 2) + (y % 2) * 2 + 1]
+      img:putPixel(x, y, Color(b[1] + x, b[2] + y, b[3] + (x * y) % 20))
+    end
+  end
+  ops.run({ { op = "quantize", colors = 4 } }, "减到四色", cel)
+  local after = #ops.colorUsage(img, 99)
+  check("合并到 4 色", after == 4, after)
+
+  -- 原来那 4 个基色附近应该各有代表色（纯色不该被并到别的色系去）
+  local list = ops.colorUsage(img, 99)
+  local function nearest(r, g, b)
+    local best, bestD = nil, 1e9
+    for _, e in ipairs(list) do
+      local er = tonumber(e.hex:sub(2, 3), 16)
+      local eg = tonumber(e.hex:sub(4, 5), 16)
+      local eb = tonumber(e.hex:sub(6, 7), 16)
+      local d = (er - r) ^ 2 + (eg - g) ^ 2 + (eb - b) ^ 2
+      if d < bestD then best, bestD = e.hex, d end
+    end
+    return best, bestD
+  end
+  local hex, dist = nearest(200, 30, 40)
+  check("红色系有对应代表色（没被并到别的色系）", dist < 40000, hex .. " d=" .. tostring(dist))
+  local hex2, dist2 = nearest(50, 80, 200)
+  check("蓝色系也有对应代表色", dist2 < 40000, hex2 .. " d=" .. tostring(dist2))
+end
+
 print(string.format("\n==== ops_test: %d 通过, %d 失败 ====", passes, fails))
 if fails > 0 then error(fails .. " 个断言失败") end

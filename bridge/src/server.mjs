@@ -143,6 +143,18 @@ class Session {
 
   status(text, kind) {
     this.send({ type: 'status', text, kind });
+    this.pushContext();
+  }
+
+  // 上下文用量 -> 面板的 20 格电量条。每步一次，消息条数很少，算得起。
+  pushContext() {
+    this.send({
+      type: 'context',
+      used: history.usedTokens(),
+      budget: history.budgetTokens,
+      messages: history.messages.length,
+      summaryChars: history.summary.length,
+    });
   }
 
   request(kind, payload = {}, timeoutMs = 60000) {
@@ -254,6 +266,7 @@ class Session {
       });
       // 落盘：重启桥 / 重启 Aseprite 之后还接得上
       history.save();
+      this.pushContext();          // 压缩过的话电量条要立刻掉下来
     } catch (e) {
       if (e?.name === 'TurnAborted') {
         // 中断不是错误：手动和超时给不同的提示
@@ -328,6 +341,7 @@ class Session {
         if (!cfg.llm?.apiKey) {
           this.say('info', 'No API key yet -- click Settings in the panel to paste one.');
         }
+        this.pushContext();
         const st = history.stats();
         if (st.messages > 0) {
           this.say('info', `Context restored: ${st.messages} message(s), about ${st.tokens} tokens` +
@@ -354,6 +368,7 @@ class Session {
         if (llm.contextTokens !== undefined) {
           cfg.llm.contextTokens = clampBudget(llm.contextTokens);
           history.budgetTokens = cfg.llm.contextTokens;   // 立刻生效，不用重启桥
+          this.pushContext();
         }
         // 空 apiKey = 保持不变（面板里不回显真 key）
         if (llm.clearApiKey) cfg.llm.apiKey = '';
@@ -371,7 +386,7 @@ class Session {
         }
         try {
           saveConfig();
-          this.say('info', 'Settings saved to bridge/config.json (effective immediately).');
+          this.say('info', 'Settings saved to bridge/config.json (effective immediately).', 'setSaved');
         } catch (e) {
           this.say('error', `Could not write config.json: ${e?.message || e}`);
         }
@@ -423,6 +438,7 @@ class Session {
       case 'reset_history': {
         const rep = history.reset();
         this.historyReset = true;
+        this.pushContext();
         this.say('info', 'Conversation context cleared.', 'ctxCleared');
         this.send({ type: 'history_result', id: msg.id, reset: true, ...rep });
         break;

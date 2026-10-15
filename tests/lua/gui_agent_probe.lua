@@ -116,6 +116,53 @@ step("停掉转圈 -> 就绪", function()
   a.panel:setStatus("ready", "ok", "probe.ase")
   assert(not a.panel.spinTimer.isRunning, "spin stopped")
 end)
+-- v0.5.3 栏内控件：真 GUI 里画一次（无头测试用的是假 GC，画不画得出来得在这儿证明）
+step("栏内控件：上下文电量条 + 思考强度滑杆 + 工作图片", function()
+  a.panel:setMode("bar_bottom")
+  a.panel:setContext(6000, 16000)
+  a.panel:setThinking("medium")
+  a.panel.dlg:repaint()
+  local kinds = {}
+  for _, h in ipairs(a.panel.barHit or {}) do kinds[h.kind] = true end
+  say("    命中区 = %s（已用 %s 格）",
+    tostring(kinds.work) .. "/" .. tostring(kinds.open) .. "/" .. tostring(kinds.ctx) .. "/" .. tostring(kinds.think),
+    tostring(a.panel:ctxFilled()))
+  assert(kinds.work and kinds.open and kinds.ctx and kinds.think, "四个控件都画出来了")
+  assert(a.panel:ctxFilled() == 8, "6000/16000 ≈ 8 格，实际 " .. a.panel:ctxFilled())
+  assert(a.panel.thinkTrack ~= nil, "滑杆轨道记下来了")
+end)
+step("栏内控件：真缩略图（走真 sprite 合成 + 真 Canvas 绘制）", function()
+  -- 探针里原来没有文档，先造一张（不然缩略图本来就该是空的）
+  if not app.activeSprite then
+    local spr = Sprite(16, 16, ColorMode.RGB)
+    local cel = spr:newCel(spr.layers[1], 1, Image(16, 16, ColorMode.RGB), Point(0, 0))
+    cel.image:clear(Rectangle(0, 0, 16, 16), Color(46, 134, 222))
+    cel.image:clear(Rectangle(4, 4, 8, 8), Color(255, 224, 189))
+    app.activeSprite = spr
+  end
+  local thumb = a.panel:thumbImage(40, 40)
+  say("    缩略图 = %s", thumb and (thumb.width .. "x" .. thumb.height) or "nil")
+  assert(thumb ~= nil, "缩略图不为空（frameImage 合成成功）")
+  assert(thumb.width > 0 and thumb.height > 0, "尺寸合理")
+  assert(thumb.bytesPerPixel == 4, "RGBA 4 字节")
+  -- 采到的得是画布上真实的颜色：中心是奶油色 #FFE0BD，角落是蓝 #2E86DE
+  -- getPixel 的打包是 0xAABBGGRR（蓝在低字节，别按 RGB 直觉写）
+  local mid = thumb:getPixel(math.floor(thumb.width / 2), math.floor(thumb.height / 2))
+  local corner = thumb:getPixel(1, 1)
+  say("    中心 = 0x%08X 角落 = 0x%08X", mid, corner)
+  assert(mid == 0xFFBDE0FF, "中心是奶油色（期望 0xFFBDE0FF），实际 " .. string.format("0x%08X", mid))
+  assert(corner == 0xFFDE862E, "角落是蓝色（期望 0xFFDE862E），实际 " .. string.format("0x%08X", corner))
+  -- 真的画一次：drawImage 打到真 Canvas 上不报错才算数
+  a.panel.dlg:repaint()
+end)
+step("栏内控件：点滑杆真的改档（真鼠标事件路径）", function()
+  local t = a.panel.thinkTrack
+  a.panel:_onCanvasMouseDown{ button = MouseButton.LEFT, x = t.x + t.w - 1, y = t.y + 4 }
+  say("    点最右后 thinking = %s", tostring(a.panel.thinking))
+  assert(a.panel.thinking == "high", "点最右 = high，实际 " .. tostring(a.panel.thinking))
+  a.panel:setThinking("auto")      -- 还原，别把探针状态留脏
+end)
+
 -- 停在底边栏给外部截图（run_gui_agent.sh 在 ~4s 截），8 秒后自己关
 step("停在底边栏等待截图", function()
   a.panel:setMode("bar_bottom")

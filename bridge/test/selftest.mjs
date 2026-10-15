@@ -180,14 +180,22 @@ class MockAseprite {
           this.failNextOps = null;
           this.send({ type: 'ops_result', id: msg.id, ok: false, error: err });
         } else {
+          // 注意：真实的 Lua 侧把结果放在 report 里（`{ok=true, report=res}`），
+          // 桥只读 msg.report —— 以前这里平铺着写，等于测试从来没有校验过回传内容。
           this.send({
             type: 'ops_result',
             id: msg.id,
             ok: true,
-            sprite: 'test.aseprite',
-            layer: 'Layer 1',
-            frame: 1,
-            ops: (msg.ops || []).map((o, i) => ({ index: i + 1, op: o.op, changed: 42 })),
+            report: {
+              sprite: 'test.aseprite',
+              layer: 'Layer 1',
+              frame: 1,
+              // quantize 会带 extra（真实 Lua 侧也会带：前后色数 / 调色板）
+              ops: (msg.ops || []).map((o, i) => (o.op === 'quantize'
+                ? { index: i + 1, op: o.op, changed: 4096,
+                    extra: { colorsBefore: 128, colorsAfter: 61, merged: 67, paletteChanged: 61 } }
+                : { index: i + 1, op: o.op, changed: 42 })),
+            },
           });
         }
         break;
@@ -307,6 +315,8 @@ async function main() {
     paths: {
       perfectPixelBundle: 'vendor/perfectPixel.mjs',
       colorBank: `test/.tmp/colors.json`,
+      // 历史也要隔离：不然场景之间会互相"记得"，而且压缩会偷偷吃掉 mock LLM 的脚本步
+      history: 'test/.tmp/history.json',
     },
   };
   const configPath = join(TMP, 'config.json');
@@ -796,6 +806,10 @@ async function main() {
     ase7.cfgMsgs.at(-1)?.llm);
   check('配置里带了上下文预算', ase7.cfgMsgs.some((m) => m.llm?.contextTokens === 16000),
     ase7.cfgMsgs.at(-1)?.llm);
+  const ctxPushes = ase7.received.filter((m) => m.type === 'context');
+  check('握手就推了一次上下文用量（底边栏电量条靠它）',
+    ctxPushes.length > 0 && ctxPushes[0].budget === 16000 && typeof ctxPushes[0].used === 'number',
+    ctxPushes[0]);
   check('对话落盘了', existsSync(HIST), HIST);
   const saved = JSON.parse(readFileSync(HIST, 'utf8'));
   // 用户那条前面带着画布上下文（buildUserMessage 拼的），所以用 includes 判断
@@ -870,6 +884,9 @@ async function main() {
   check('越界步数被夹到 200', ase7b.cfgMsgs.at(-1)?.llm?.maxSteps === 200, ase7b.cfgMsgs.at(-1)?.llm);
   check('越界上下文被夹到 200000', ase7b.cfgMsgs.at(-1)?.llm?.contextTokens === 200000,
     ase7b.cfgMsgs.at(-1)?.llm);
+  const ctxAfter = ase7b.received.filter((m) => m.type === 'context');
+  check('改完预算电量条立刻按新预算推（不用重启桥）',
+    ctxAfter.some((m) => m.budget === 200000), ctxAfter.at(-1));
 
   // thinking=high -> 请求里要带 reasoning_effort
   mockLlm.close();
@@ -908,9 +925,37 @@ async function main() {
   check('降级告诉了用户（本地化键 thinkingDropped）',
     ase7b.says.some((s) => s.i18n === 'thinkingDropped'), ase7b.says.map((s) => s.i18n));
 
+  console.log('== 场景 14：quantize 自动减色跑到 Aseprite 侧 ==');
+  mockLlm.close();
+  global.__quantOk = null;
+  mockLlm = await startMockLlm([
+    toolCall('call_14a', 'apply_ops', {
+      label: '减色到 64 以内',
+      ops: [{ op: 'quantize', colors: 64 }],
+    }),
+    (body) => {
+      const msgs = (body.messages || []).filter((m) => m.role === 'tool');
+      global.__quantOk = msgs.length ? JSON.parse(msgs[msgs.length - 1].content) : null;
+      return textReply('已经合并到 64 色以内了。');
+    },
+  ]);
+  await sleep(150);
+  ase7b.received.length = 0;
+  ase7b.chat('现在的配色太杂了，帮我合并到 64 个颜色以内');
+  await sleep(1000);
+
+  const qOps = ase7b.received.find((m) => m.type === 'run_ops_payload');
+  check('quantize 原样下发到 Aseprite', !!qOps && qOps.ops?.[0]?.op === 'quantize', qOps?.ops);
+  check('colors 参数没在路上丢', qOps?.ops?.[0]?.colors === 64, qOps?.ops?.[0]);
+  check('减色结果回到模型上下文（含前后色数）',
+    global.__quantOk?.ops?.[0]?.op === 'quantize'
+    && global.__quantOk.ops[0].extra?.colorsBefore === 128
+    && global.__quantOk.ops[0].extra?.colorsAfter === 61, global.__quantOk);
+
   bridge7.kill();
   ase7b.close();
   await sleep(200);
+
 
   console.log(`\n==== selftest: ${passes} 通过, ${fails} 失败 ====`);
   process.exit(fails > 0 ? 1 : 0);

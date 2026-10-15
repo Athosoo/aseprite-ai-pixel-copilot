@@ -55,6 +55,8 @@ function agent.new(cfg)
     onFixRun = function(paths) self:runFixQueue(paths) end,
     onAskAnswer = function(index) self:answerAsk(index) end,
     onModeChange = function(mode) self:saveUi(mode) end,
+    frameImage = function() return self:frameImage() end,
+    onThinkingChange = function(v) self:setThinking(v) end,
   }
 
   -- 工作文件夹（P10）：备份 / 副本 / 打开 / 交付都交给它。
@@ -208,6 +210,11 @@ end
 -- 工作区模式下正在编辑副本时，后缀标出来，用户一眼知道现在改的是副本（P10）。
 function Agent:docName()
   local spr = app.activeSprite
+  -- 换了文档：缩略图必须重建（用户自己切标签页也一样）
+  if (self.lastDocObj ~= spr) then
+    self.lastDocObj = spr
+    self:invalidateFrame()
+  end
   if not spr then return "" end
   if spr.filename and spr.filename ~= "" then
     local name = app.fs.fileName(spr.filename)
@@ -392,6 +399,53 @@ function Agent:open()
   self.panel:log(i18n.t("tipMenu"), "info")
 end
 
+-- 底边栏缩略图用的"整幅合成图"。
+--
+-- 坑：`sprite:flatten()` 是【破坏性的】—— 实测 2 层会真的被合成成 1 层
+-- （见 tests/lua/_quant_api2_probe.lua 的 B 段）。所以这里自己按层合成到一张
+-- 游离 Image 上，只画可见层的当前帧。近似：忽略图层混合模式与不透明度（缩略图够用）。
+function Agent:frameImage()
+  local spr = app.activeSprite
+  if not spr then return nil end
+  local frameNo = 1
+  pcall(function() frameNo = app.frame and app.frame.frameNumber or 1 end)
+  local key = table.concat({
+    tostring(spr.filename), tostring(spr.width), tostring(spr.height),
+    tostring(#spr.layers), tostring(frameNo), tostring(self.frameDirty or 0),
+  }, "|")
+  if self.frameCache and self.frameCache.key == key then return self.frameCache.img end
+
+  local img = Image(spr.width, spr.height, ColorMode.RGB)
+  for _, layer in ipairs(spr.layers) do
+    if layer.isVisible then
+      local cel
+      pcall(function() cel = layer:cel(frameNo) end)
+      if cel and cel.image then
+        pcall(function() img:drawImage(cel.image, cel.position.x, cel.position.y) end)
+      end
+    end
+  end
+  self.frameCache = { key = key, img = img }
+  return img
+end
+
+-- 画布变了就把合成图作废（下次要缩略图时重建）
+function Agent:invalidateFrame()
+  self.frameDirty = (self.frameDirty or 0) + 1
+  self.frameCache = nil
+end
+
+-- 栏里的滑杆改了思考强度：立刻写回桥的配置（空 apiKey 不算改动，见 set_config）
+function Agent:setThinking(value)
+  self.thinking = tostring(value or "auto")
+  if not (self.conn and self.conn:isOpen()) then
+    self.panel:log(i18n.t("ctxFailed"), "error")
+    return
+  end
+  self:send{ type = "set_config", llm = { thinking = self.thinking } }
+  self.panel:log(string.format(i18n.t("thinkChanged"), self.thinking), "info")
+end
+
 -- 清空对话上下文（桥侧的历史 + 摘要）。没连上就没法清：桥才是记忆的持有者。
 function Agent:resetHistory()
   if not (self.conn and self.conn:isOpen()) then
@@ -468,6 +522,12 @@ function Agent:action(name)
     self:deliver()
   elseif name == "reset_history" then
     self:resetHistory()
+  elseif name == "ctx_info" then
+    if self.conn and self.conn:isOpen() then
+      self:send{ type = "history_info", id = self:nextId() }
+    else
+      self.panel:log(i18n.t("ctxFailed"), "error")
+    end
   elseif name == "bar" then
     self.panel:cycleMode()
   elseif name == "open_file" or name == "open_doc_pick" then
@@ -671,6 +731,10 @@ function Agent:onMessage(msg)
       self.workspaceRoot = msg.workspace.root
       if self.workspace then self.workspace:setRoot(self.workspaceRoot) end
     end
+    if type(msg.llm.thinking) == "string" then
+      self.thinking = msg.llm.thinking
+      self.panel:setThinking(msg.llm.thinking)
+    end
     -- 界面形态和栏底色（G3/G5）：桥记得，重启 Aseprite 也恢复
     if msg.ui then
       if type(msg.ui.mode) == "string" and msg.ui.mode ~= "" then
@@ -720,14 +784,18 @@ function Agent:onMessage(msg)
   elseif t == "ask" then
     self:askUser(msg)
 
+  elseif t == "context" then
+    -- 上下文用量：底边栏的 20 格电量条
+    self.panel:setContext(msg.used, msg.budget)
+
   elseif t == "history_result" then
     if msg.reset then
       self.panel:log(i18n.t("ctxCleared"), "info")
     elseif (msg.messages or 0) == 0 then
       self.panel:log(i18n.t("ctxEmpty"), "info")
     else
-      self.panel:log(string.format(i18n.t("ctxStats"), msg.messages or 0,
-        msg.summaryChars or 0), "info")
+      self.panel:log(string.format(i18n.t("ctxInfo"), msg.messages or 0,
+        msg.tokens or 0, msg.budgetTokens or 0), "info")
     end
 
   elseif t == "open_doc" then
@@ -775,9 +843,11 @@ function Agent:runOps(msg)
     end
     self.panel:log(string.format(i18n.t("applied"),
       #res.ops, res.layer, table.concat(parts, ", ")), "tool")
+    self:invalidateFrame()
     self:send{ type = "ops_result", id = id, ok = true, report = res }
   else
     self.panel:log(string.format(i18n.t("opsFailed"), tostring(res)), "error")
+    self:invalidateFrame()
     self:send{ type = "ops_result", id = id, ok = false, error = tostring(res) }
   end
 end
@@ -887,6 +957,7 @@ function Agent:artOp(kind, msg)
     else
       self.panel:log(string.format(i18n.t("artDoc"), res.op, res.layer or res.size or ""), "tool")
     end
+    self:invalidateFrame()
     self:send{ type = "art_result", id = id, ok = true, report = res }
   else
     self.panel:log(string.format(i18n.t("artFailed"), tostring(res)), "error")

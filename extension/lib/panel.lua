@@ -74,6 +74,8 @@ local STATUS  = Color(130, 190, 255)
 local MENU_TX = Color(214, 220, 230)
 local MENU_HL = Color(46, 134, 222)      -- 悬浮：蓝
 local MENU_HLT= Color(255, 255, 255)
+-- 栏内控件的"空槽"底色（电量条空格子 / 缩略图外框 / 滑杆轨道）
+local FRAME   = Color(58, 64, 74)
 
 -- 状态栏配色（P2）：忙 = 黄、执行算子 = 青、闲 = 绿、出错/断联 = 红
 local STATUS_OK    = Color(126, 226, 168)
@@ -140,6 +142,21 @@ local KIND_PREFIX = {
 local ROW_FACTOR = 1.55
 
 ----------------------------------------------------------------------
+-- 栏里的小控件（v0.5.3）：上下文电量条 / 思考强度滑杆 / 工作图片缩略图
+--
+-- 为什么做在【栏】里：这三个都是"随时看一眼、顺手调一下"的东西。
+-- 上下文电量条用 20 格表示 已用 / 预算；思考强度是 4 档（auto/low/medium/high）
+-- 的分档滑杆 —— 点一下或拖着走都能改，改完立刻写回桥的配置。
+----------------------------------------------------------------------
+
+local CTX_CELLS = 20          -- 电量条格子数（用户要的 20 格）
+local CTX_CELL_W, CTX_CELL_H, CTX_CELL_GAP = 3, 6, 0
+local CTX_CELL_H_LINE = 16    -- 控件在输入行里占的高度
+local THINK_STEPS = { "auto", "low", "medium", "high" }
+local THINK_TRACK_W, THINK_KNOB_R = 44, 3
+local THUMB_BOX = 16          -- 缩略图外框：和输入行一样高，才塞得进去
+
+----------------------------------------------------------------------
 
 function panel.new(opts)
   local self = setmetatable({
@@ -186,6 +203,13 @@ function panel.new(opts)
     mode = "panel",
     -- 图片矫正队列
     fixQueue = {},
+    -- 栏内控件（v0.5.3）
+    ctx = { used = 0, budget = 0 },
+    thinking = "auto",
+    thinkCommitted = "auto",     -- 已经写回桥的那一档（松手时按它判断要不要提交）
+    barHit = {},
+    thinkDrag = false,
+    thinkTrack = nil,
   }, Panel)
 
   self.mini = miniwindow.new{
@@ -547,6 +571,7 @@ function Panel:_onWheel(ev)
 end
 
 function Panel:_onCanvasMouseMove(ev)
+  if self:isBar() and self:_onBarMouseMove(ev) then return end
   local idx = self:_menuIndexAt(ev.x or 0, ev.y or 0)
   if (idx or 0) ~= (self.menuHover or 0) then
     self.menuHover = idx or 0
@@ -595,6 +620,7 @@ end
 
 function Panel:_onCanvasMouseDown(ev, dlg)
   if ev.button ~= MouseButton.LEFT then return end
+  if self:isBar() and self:_onBarMouseDown(ev) then return end
   if self:_menuIndexAt(ev.x or 0, ev.y or 0) then return end
   if self.inputFocused then return end
   dlg = dlg or self.dlg
@@ -604,6 +630,7 @@ function Panel:_onCanvasMouseDown(ev, dlg)
 end
 
 function Panel:_onCanvasMouseUp(ev)
+  if ev.button == MouseButton.LEFT then self:_onBarMouseUp() end
   if ev.button == MouseButton.LEFT and self.menuOpen then
     local idx = self:_menuIndexAt(ev.x or 0, ev.y or 0)
     if idx then self:_runMenuIndex(idx) end
@@ -795,6 +822,240 @@ function Panel:_clipToWidth(gc, text, maxW, keepTail)
   return table.concat(out) .. "…"
 end
 
+----------------------------------------------------------------------
+----------------------------------------------------------------------
+-- 栏内控件：设置 / 绘制 / 命中
+--
+-- 尺寸是"塞进输入行"的尺寸：整条栏只有 60px 高、输入行 ~18px，
+-- 所以缩略图 16px、电量条 20 格每格 3px、滑杆 44px —— 全部和输入框同一行，
+-- 不额外占高度、不额外占一块地方。文字标签只在放得下的时候才画。
+----------------------------------------------------------------------
+
+-- 桥每步都会推一次用量（{type="context"}），面板只管显示
+function Panel:setContext(used, budget)
+  used = tonumber(used) or 0
+  budget = tonumber(budget) or 0
+  if used == self.ctx.used and budget == self.ctx.budget then return end
+  self.ctx.used, self.ctx.budget = used, budget
+  self:repaint()
+end
+
+function Panel:contextUsage() return self.ctx.used, self.ctx.budget end
+
+-- 用了几格（0..CTX_CELLS）。预算未知时按 0 格算。
+function Panel:ctxFilled()
+  local used, budget = self.ctx.used, self.ctx.budget
+  if budget <= 0 then return 0 end
+  local n = math.floor(used / budget * CTX_CELLS + 0.5)
+  if n < 0 then n = 0 end
+  if n > CTX_CELLS then n = CTX_CELLS end
+  return n
+end
+
+function Panel:ctxColor()
+  local used, budget = self.ctx.used, self.ctx.budget
+  local ratio = (budget > 0) and (used / budget) or 0
+  if ratio >= 0.85 then return STATUS_ERROR end
+  if ratio >= 0.6 then return STATUS_WARN end
+  return STATUS_OK
+end
+
+-- "8.2k/16k" 这种短标签（栏里寸土寸金）
+function Panel:ctxLabel()
+  local function short(n)
+    n = math.floor(n)
+    if n >= 1000 then
+      if n % 1000 == 0 then return string.format("%dk", n / 1000) end
+      return string.format("%.1fk", n / 1000)
+    end
+    return tostring(n)
+  end
+  if self.ctx.budget <= 0 then return "-" end
+  return short(self.ctx.used) .. "/" .. short(self.ctx.budget)
+end
+
+-- 桥发来的权威值（配置回推 / 启动恢复）：连"已提交"一起对齐
+function Panel:setThinking(value)
+  value = tostring(value or "auto"):lower()
+  local ok = false
+  for _, v in ipairs(THINK_STEPS) do if v == value then ok = true end end
+  if not ok then value = "auto" end
+  self.thinkCommitted = value
+  if value == self.thinking then return end
+  self.thinking = value
+  self:repaint()
+end
+
+function Panel:thinkIndex()
+  for i, v in ipairs(THINK_STEPS) do if v == self.thinking then return i end end
+  return 1
+end
+
+-- 按档位设置。commit=true 才回调（= 真的写回桥）。
+-- 拖拽过程中只改视觉，松手才提交 —— 否则拖一次滑杆会写 4 次配置、刷 4 条日志。
+function Panel:setThinkIndex(i, commit)
+  if i < 1 then i = 1 end
+  if i > #THINK_STEPS then i = #THINK_STEPS end
+  local v = THINK_STEPS[i]
+  local changed = (v ~= self.thinking)
+  self.thinking = v
+  -- 提交的判据是"和已写回桥的那一档不同"，不是"和当前显示的不同" ——
+  -- 拖到 low 再松手时当前值早就是 low 了，按当前值比就永远不会提交（实测踩过）。
+  if commit and v ~= self.thinkCommitted and self.opts.onThinkingChange then
+    self.thinkCommitted = v
+    local ok, err = pcall(self.opts.onThinkingChange, v)
+    if not ok then self:log(tostring(err), "error") end
+  end
+  if changed then self:repaint() end
+  return v
+end
+
+function Panel:thinkLabel()
+  return tostring(i18n.t("thinkPrefix")) .. self.thinking
+end
+
+-- 缩略图：把 agent 给的整幅合成图按最近邻缩到外框里（保持长宽比）。
+-- 一次 16x16 ≈ 256 次字节取，几乎不花时间，所以不做缓存 —— 每帧重采样，
+-- 画布一改缩略图立刻跟着变，不会出现"缩略图比画布旧"的怪现象。
+function Panel:thumbImage(boxW, boxH)
+  if not self.opts.frameImage then return nil end
+  local ok, src = pcall(self.opts.frameImage)
+  if not ok or not src then return nil end
+  local sw, sh = src.width or 0, src.height or 0
+  if sw <= 0 or sh <= 0 or src.bytesPerPixel ~= 4 then return nil end
+
+  local scale = math.min(boxW / sw, boxH / sh)
+  local tw = math.max(1, math.floor(sw * scale + 0.5))
+  local th = math.max(1, math.floor(sh * scale + 0.5))
+  local dst = Image(tw, th, ColorMode.RGB)
+  local sb = src.bytes
+  local sstride = src.rowStride
+  local rows = {}
+  for y = 0, th - 1 do
+    local sy = math.min(sh - 1, math.floor(y * sh / th))
+    local row = {}
+    for x = 0, tw - 1 do
+      local sx = math.min(sw - 1, math.floor(x * sw / tw))
+      local p = sy * sstride + sx * 4 + 1
+      row[#row + 1] = sb:sub(p, p + 3)
+    end
+    rows[#rows + 1] = table.concat(row)
+  end
+  dst.bytes = table.concat(rows)
+  return dst
+end
+
+-- 工作图片缩略图 + "＋"（打开一张新的）。返回占用的宽度。
+function Panel:_drawWork(gc, x, y, box)
+  gc.color = FRAME
+  gc:fillRect(Rectangle(x, y, box, box))
+  local img = self:thumbImage(box - 2, box - 2)
+  if img then
+    local ox = x + math.floor((box - img.width) / 2)
+    local oy = y + math.floor((box - img.height) / 2)
+    pcall(function() gc:drawImage(img, ox, oy) end)
+  end
+
+  local bw = box
+  local bx = x + box + 2
+  gc.color = FRAME
+  gc:fillRect(Rectangle(bx, y, bw, box))
+  gc.color = TEXT
+  gc:fillText("+", bx + math.max(2, math.floor(bw / 2) - 2), y + math.max(0, math.floor(box / 2) - 7))
+
+  self.barHit[#self.barHit + 1] = { kind = "work", x = x, y = y, w = box, h = box }
+  self.barHit[#self.barHit + 1] = { kind = "open", x = bx, y = y, w = bw, h = box }
+  return box + 2 + bw
+end
+
+-- 上下文电量条：20 格（单行）。withLabel 时在后面跟一个 "8.2k/16k"。
+function Panel:_drawCtx(gc, x, y, withLabel)
+  local cellW, gap = CTX_CELL_W, CTX_CELL_GAP
+  local filled = self:ctxFilled()
+  local cy = y + math.floor((CTX_CELL_H_LINE - CTX_CELL_H) / 2)
+  for i = 1, CTX_CELLS do
+    if i <= filled then gc.color = self:ctxColor() else gc.color = FRAME end
+    gc:fillRect(Rectangle(x + (i - 1) * (cellW + gap), cy, cellW, CTX_CELL_H))
+  end
+  local w = CTX_CELLS * (cellW + gap) - gap
+  if withLabel then
+    gc.color = DIM
+    local label = self:ctxLabel()
+    gc:fillText(label, x + w + 4, y)
+    local lblW = self:_textWidth(gc, label)
+    w = w + 4 + lblW
+  end
+  self.barHit[#self.barHit + 1] = { kind = "ctx", x = x, y = y, w = w, h = CTX_CELL_H_LINE }
+  return w
+end
+
+-- 思考强度滑杆：4 档，点一下或拖着走都行（单行）。
+function Panel:_drawThink(gc, x, y)
+  local ty = y + math.floor(CTX_CELL_H_LINE / 2)
+  gc.color = FRAME
+  gc:fillRect(Rectangle(x, ty - 1, THINK_TRACK_W, 3))
+
+  local idx = self:thinkIndex()
+  for i = 1, #THINK_STEPS do
+    local kx = x + math.floor((i - 1) * (THINK_TRACK_W - 1) / (#THINK_STEPS - 1))
+    gc.color = (i <= idx) and STATUS_TOOL or DIM
+    gc:fillRect(Rectangle(kx, ty - 5, 2, 11))
+  end
+  local kx = x + math.floor((idx - 1) * (THINK_TRACK_W - 1) / (#THINK_STEPS - 1))
+  gc.color = STATUS_BUSY
+  gc:fillRect(Rectangle(kx - THINK_KNOB_R, ty - THINK_KNOB_R, THINK_KNOB_R * 2 + 2, THINK_KNOB_R * 2))
+
+  self.thinkTrack = { x = x, y = ty - 8, w = THINK_TRACK_W, h = 16 }
+  self.barHit[#self.barHit + 1] = { kind = "think", x = x, y = ty - 8, w = THINK_TRACK_W, h = 16 }
+  return THINK_TRACK_W
+end
+
+-- 命中查询（只有栏模式会填 barHit）
+function Panel:_barHitAt(x, y)
+  for _, b in ipairs(self.barHit or {}) do
+    if x >= b.x and x < b.x + b.w and y >= b.y and y < b.y + b.h then return b end
+  end
+  return nil
+end
+
+-- 滑杆：把画布 x 映射成档位
+function Panel:_thinkIndexAt(x)
+  local t = self.thinkTrack
+  if not t or t.w <= 1 then return self:thinkIndex() end
+  local frac = (x - t.x) / (t.w - 1)
+  if frac < 0 then frac = 0 end
+  if frac > 1 then frac = 1 end
+  return math.floor(frac * (#THINK_STEPS - 1) + 0.5) + 1
+end
+
+function Panel:_onBarMouseDown(ev)
+  local hit = self:_barHitAt(ev.x or 0, ev.y or 0)
+  if not hit then return false end
+  if hit.kind == "think" then
+    self.thinkDrag = true
+    self:setThinkIndex(self:_thinkIndexAt(ev.x or 0), true)   -- 单击也算一次提交
+  elseif hit.kind == "open" or hit.kind == "work" then
+    if self.opts.onAction then self.opts.onAction("open_file") end
+  elseif hit.kind == "ctx" then
+    if self.opts.onAction then self.opts.onAction("ctx_info") end
+  end
+  return true          -- 命中控件 = 不要再把焦点抢给输入框
+end
+
+function Panel:_onBarMouseMove(ev)
+  if not self.thinkDrag then return false end
+  self:setThinkIndex(self:_thinkIndexAt(ev.x or 0))          -- 拖着走：只动视觉
+  return true
+end
+
+function Panel:_onBarMouseUp()
+  if self.thinkDrag then
+    self.thinkDrag = false
+    self:setThinkIndex(self:thinkIndex(), true)              -- 松手才写回桥
+  end
+end
+
+
 -- 栏形态的绘制：状态行（上）+ 最后一行输出（中，够高才画）+ 输入行（下）
 function Panel:_paintBar(gc)
   local w, h = gc.width, gc.height
@@ -805,6 +1066,21 @@ function Panel:_paintBar(gc)
 
   local rows = math.max(1, math.floor(h / rowH))
   local y = 2
+
+  self.barHit = {}
+  self.thinkTrack = nil
+
+  -- 控件都摆在【输入行】上（和输入框同一行、右对齐），不额外占高度：
+  -- 缩略图 + ＋ + 20 格电量条 + 思考滑杆，一共约 200px 宽、16px 高。
+  -- 放不下（窗口太窄）就整体不画 —— 宁可只留文字，也别把输入框挤没。
+  local clusterBase = THUMB_BOX + 2 + THUMB_BOX + 6
+    + (CTX_CELLS * (CTX_CELL_W + CTX_CELL_GAP)) + 8 + THINK_TRACK_W + 6
+  local clusterW = clusterBase + 4 + 48
+  local ctxLabel = true
+  if clusterW > w - 180 then
+    clusterW, ctxLabel = clusterBase, false   -- 窄了就先去掉 "8.2k/16k" 这个文字标签
+  end
+  if clusterW > w - 130 then clusterW = 0 end
 
   -- 1) 状态行
   gc.color = STATUS_COLORS[self.statusKind or "ok"] or STATUS
@@ -839,17 +1115,28 @@ function Panel:_paintBar(gc)
   gc.color = USER
   gc:fillText(mark, 6, inputY)
   local shown = tostring(self.input or "")
+  local inputMaxW = w - 18 - markW - clusterW
   if shown == "" then
     gc.color = DIM
-    gc:fillText(self:_clipToWidth(gc, i18n.t("inputHint"), w - 18 - markW, false), 6 + markW, inputY)
+    gc:fillText(self:_clipToWidth(gc, i18n.t("inputHint"), inputMaxW, false), 6 + markW, inputY)
   else
-    shown = self:_clipToWidth(gc, shown, w - 18 - markW, true)
+    shown = self:_clipToWidth(gc, shown, inputMaxW, true)
     gc.color = USER
     gc:fillText(shown, 6 + markW, inputY)
     gc:fillRect(Rectangle(6 + markW + self:_textWidth(gc, shown) + 1, inputY, 5, lh))
   end
 
-  self.dbg = string.format("bar mode=%s w=%d h=%d rows=%d", self:layoutMode(), w, h, rows)
+  -- 4) 控件：就和输入行同高、右对齐（"和输入框一个地方"）
+  if clusterW > 0 then
+    local cy = inputY + math.floor((rowH - THUMB_BOX) / 2)
+    local cx = w - clusterW + 2
+    cx = cx + self:_drawWork(gc, cx, cy, THUMB_BOX) + 6
+    cx = cx + self:_drawCtx(gc, cx, inputY + math.floor((rowH - CTX_CELL_H_LINE) / 2), ctxLabel) + 8
+    self:_drawThink(gc, cx, inputY + math.floor((rowH - CTX_CELL_H_LINE) / 2))
+  end
+
+  self.dbg = string.format("bar mode=%s w=%d h=%d rows=%d ctx=%d/%d think=%s",
+    self:layoutMode(), w, h, rows, self.ctx.used, self.ctx.budget, tostring(self.thinking))
   self.hitRows = {}
 end
 

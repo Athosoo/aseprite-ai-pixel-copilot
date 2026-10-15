@@ -231,6 +231,153 @@ local function op_palette_map(img, o, sprite)
   return total, palChanged
 end
 
+-- 自动减色：中位切分（median cut）把用色数压到 colors 以内，并同步调色板。
+-- 用户明确要求过这个能力（"配色太杂，合并到 64 色以内"），所以别再回答"做不到"。
+-- 透明像素不参与统计也不改；alpha 原样保留，只换 RGB。
+local function op_quantize(img, o, sprite)
+  local target = math.floor(tonumber(o.colors) or 64)
+  if target < 2 or target > 256 then
+    error("quantize: 'colors' must be between 2 and 256")
+  end
+  if img.bytesPerPixel ~= 4 then
+    error(string.format(
+      "quantize: only 32-bit RGB/RGBA layers are supported (this one is %d bytes per pixel). " ..
+      "Convert with Sprite > Color Mode > RGB first.", img.bytesPerPixel))
+  end
+  local w, h, stride = img.width, img.height, img.rowStride
+  local region = util.normRegion(o.region, w, h)
+  if region.w <= 0 or region.h <= 0 then return 0, { colorsBefore = 0, colorsAfter = 0 } end
+  if region.w * region.h > MAX_REGION_PIXELS then
+    error(string.format("quantize: region too large: %dx%d (limit 512x512). Use a smaller region.",
+      region.w, region.h))
+  end
+
+  -- 1) 直方图（只数不透明像素）
+  local src = img.bytes
+  local hist, colors, opaque = {}, {}, 0
+  for y = region.y, region.y + region.h - 1 do
+    local base = y * stride + region.x * 4 + 1
+    for i = 0, region.w - 1 do
+      local p = base + i * 4
+      local rr, gg, bb, aa = src:byte(p, p + 3)
+      if aa > 0 then
+        opaque = opaque + 1
+        local key = rr * 65536 + gg * 256 + bb
+        local e = hist[key]
+        if e then
+          e.n = e.n + 1
+        else
+          e = { r = rr, g = gg, b = bb, n = 1 }
+          hist[key] = e
+          colors[#colors + 1] = e
+        end
+      end
+    end
+  end
+  local before = #colors
+  local report = { colorsBefore = before, colorsAfter = before, opaque = opaque }
+  if before == 0 then
+    report.note = "no opaque pixels in range"
+    return 0, report
+  end
+  if before <= target then
+    report.note = "already within the target; nothing merged"
+    return 0, report
+  end
+
+  -- 2) 中位切分：反复挑"像素最多且还能切"的盒子，沿最宽通道按像素数二分
+  local function makeBox(list)
+    local box = { list = list, n = 0, rmin = 255, rmax = 0, gmin = 255, gmax = 0, bmin = 255, bmax = 0 }
+    for _, c in ipairs(list) do
+      box.n = box.n + c.n
+      if c.r < box.rmin then box.rmin = c.r end
+      if c.r > box.rmax then box.rmax = c.r end
+      if c.g < box.gmin then box.gmin = c.g end
+      if c.g > box.gmax then box.gmax = c.g end
+      if c.b < box.bmin then box.bmin = c.b end
+      if c.b > box.bmax then box.bmax = c.b end
+    end
+    return box
+  end
+
+  local boxes = { makeBox(colors) }
+  while #boxes < target do
+    local bi, best = nil, 0
+    for i, box in ipairs(boxes) do
+      local dr, dg, db = box.rmax - box.rmin, box.gmax - box.gmin, box.bmax - box.bmin
+      local ch, span
+      if dr >= dg and dr >= db then ch, span = "r", dr
+      elseif dg >= db then ch, span = "g", dg
+      else ch, span = "b", db end
+      box.ch, box.span = ch, span
+      if #box.list > 1 and span > 0 and box.n > best then bi, best = i, box.n end
+    end
+    if not bi then break end                 -- 只剩单色盒子：切不动了（用色数本来就不足 target）
+    local box = boxes[bi]
+    local ch = box.ch
+    table.sort(box.list, function(a, b) return a[ch] < b[ch] end)
+    local half, acc, cut = box.n / 2, 0, 1
+    for i = 1, #box.list - 1 do
+      acc = acc + box.list[i].n
+      if acc >= half then cut = i break end
+    end
+    if cut < 1 then cut = 1 end
+    if cut > #box.list - 1 then cut = #box.list - 1 end
+    local left, right = {}, {}
+    for i = 1, #box.list do
+      if i <= cut then left[#left + 1] = box.list[i] else right[#right + 1] = box.list[i] end
+    end
+    boxes[bi] = makeBox(left)
+    boxes[#boxes + 1] = makeBox(right)
+  end
+
+  -- 3) 用量从多到少排（调色板里前面的就是主色），每盒取加权平均
+  table.sort(boxes, function(a, b) return a.n > b.n end)
+  local palette, samples = {}, {}
+  for _, box in ipairs(boxes) do
+    local sr, sg, sb, n = 0, 0, 0, 0
+    for _, c in ipairs(box.list) do
+      sr, sg, sb, n = sr + c.r * c.n, sg + c.g * c.n, sb + c.b * c.n, n + c.n
+    end
+    local r = math.floor(sr / n + 0.5)
+    local g = math.floor(sg / n + 0.5)
+    local b = math.floor(sb / n + 0.5)
+    palette[#palette + 1] = { r = r, g = g, b = b }
+    local packed = r * 65536 + g * 256 + b
+    for _, c in ipairs(box.list) do samples[c.r * 65536 + c.g * 256 + c.b] = packed end
+  end
+
+  -- 4) 写回像素（保留 alpha）
+  local changed = transform(img, region, function(x, y, r, g, b, a)
+    if a == 0 then return nil end
+    local v = samples[r * 65536 + g * 256 + b]
+    if not v then return nil end
+    local nr = math.floor(v / 65536) % 256
+    local ng = math.floor(v / 256) % 256
+    local nb = v % 256
+    if nr == r and ng == g and nb == b then return nil end
+    return nr, ng, nb, a
+  end)
+
+  -- 5) 调色板同步。设不了不算算子失败（像素已经改好了），只记一笔让模型知道
+  if o.updatePalette ~= false and sprite then
+    local ok, err = pcall(function()
+      local pal = Palette(#palette)
+      for i, c in ipairs(palette) do pal:setColor(i - 1, Color(c.r, c.g, c.b)) end
+      sprite:setPalette(pal)
+    end)
+    if ok then
+      report.paletteChanged = #palette
+    else
+      report.paletteNote = tostring(err)
+    end
+  end
+
+  report.colorsAfter = #boxes
+  report.merged = before - #boxes
+  return changed, report
+end
+
 local OPS = {
   replace_color = { fn = op_replace_color, desc = "replace pixels of one colour with another (tolerance absorbs anti-aliased edges)" },
   erase_color   = { fn = op_erase_color,   desc = "make pixels of one colour transparent" },
@@ -239,6 +386,7 @@ local OPS = {
   outline       = { fn = op_outline,       desc = "draw a 1px outline around opaque pixels, on previously transparent pixels" },
   despeckle     = { fn = op_despeckle,     desc = "delete isolated blobs up to maxCluster pixels (1 = single stray pixel)" },
   palette_map   = { fn = op_palette_map,   desc = "remap colours by { old: new } and update the palette too" },
+  quantize      = { fn = op_quantize,      desc = "reduce the number of colours to N by median cut (merges similar colours); use it for \"too many colours / simplify the palette / merge to 64 colours\"; also rewrites the palette" },
 }
 
 ops.names = {}

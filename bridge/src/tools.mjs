@@ -53,7 +53,10 @@ export const TOOLS = [
         'fill_region(region,color) fills a rectangle; ' +
         'outline(color) draws a 1px outline around opaque pixels; ' +
         'despeckle(maxCluster) deletes isolated blobs; ' +
-        'palette_map(map) remaps colours and updates the palette.',
+        'palette_map(map) remaps colours and updates the palette; ' +
+        'quantize(colors,updatePalette) reduces the image to at most N colours by median cut — ' +
+        'use this whenever the user says the palette is too messy / too many colours / reduce to 32 or 64 colours / simplify, ' +
+        'i.e. you do NOT need an explicit map for that.',
       parameters: {
         type: 'object',
         properties: {
@@ -77,6 +80,7 @@ export const TOOLS = [
                     'outline',
                     'despeckle',
                     'palette_map',
+                    'quantize',
                   ],
                 },
                 from: { type: 'string', description: 'replace_color: source colour #RRGGBB' },
@@ -85,6 +89,10 @@ export const TOOLS = [
                 region: REGION_SCHEMA,
                 tolerance: { type: 'integer', description: 'per-channel RGB tolerance, default 0 (exact match)' },
                 maxCluster: { type: 'integer', description: 'despeckle: blob size to remove, default 1' },
+                colors: {
+                  type: 'integer',
+                  description: 'quantize: target number of colours (2-256), e.g. 64 to merge a messy palette down to 64 colours',
+                },
                 map: {
                   type: 'object',
                   description: 'palette_map: { "#old": "#new" } colour map',

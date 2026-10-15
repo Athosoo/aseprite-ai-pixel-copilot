@@ -27,14 +27,31 @@ local function ok(cond, name, extra)
   end
 end
 
--- 假的 GraphicsContext：_paint 只用到 measureText / fillRect / fillText / width / height
+-- 假的 GraphicsContext：_paint 只用到 measureText / fillRect / fillText / drawImage / width / height
+-- rects 收集被填充的矩形（栏内控件的格子数靠它数）
 local function fakeGC(w, h)
-  return {
-    width = w, height = h, color = nil,
-    measureText = function(_, s) return { width = #tostring(s) * 6, height = 12 } end,
-    fillRect = function() end,
-    fillText = function() end,
-  }
+  local g = { width = w, height = h, color = nil, rects = {}, images = {} }
+  g.measureText = function(_, s) return { width = #tostring(s) * 6, height = 12 } end
+  g.fillRect = function(_, rc) g.rects[#g.rects + 1] = rc end
+  g.fillText = function() end
+  g.drawImage = function(_, img, x, y) g.images[#g.images + 1] = { img = img, x = x, y = y } end
+  return g
+end
+
+-- 造一张假"合成图"：给面板当工作图片缩略图的来源（32x32，右下角一个红点）
+local function fakeFrameImage()
+  local img = Image(32, 32, ColorMode.RGB)
+  local rows = {}
+  for y = 0, 31 do
+    local row = {}
+    for x = 0, 31 do
+      if x >= 30 and y >= 30 then row[#row + 1] = string.char(0, 0, 255, 255)
+      else row[#row + 1] = string.char(40, 40, 40, 255) end
+    end
+    rows[#rows + 1] = table.concat(row)
+  end
+  img.bytes = table.concat(rows)
+  return img
 end
 
 ----------------------------------------------------------------------
@@ -416,6 +433,233 @@ do
   ok(p.spinTimer.isRunning == true, "重新显示后能接着转")
   p:destroy()
   ok(p.spinTimer == nil, "destroy 把表也丢了")
+end
+
+----------------------------------------------------------------------
+print("== 栏内控件：上下文电量条（20 格）==")
+do
+  local p = panel.new{}
+  p:setMode("bar_bottom", true)
+
+  p:setContext(0, 16000)
+  ok(p:ctxFilled() == 0, "没用上下文 = 0 格，实际 " .. p:ctxFilled())
+  p:setContext(8000, 16000)
+  ok(p:ctxFilled() == 10, "用了一半 = 10 格，实际 " .. p:ctxFilled())
+  p:setContext(16000, 16000)
+  ok(p:ctxFilled() == 20, "用满 = 20 格，实际 " .. p:ctxFilled())
+  p:setContext(99999, 16000)
+  ok(p:ctxFilled() == 20, "超预算也不超过 20 格，实际 " .. p:ctxFilled())
+  p:setContext(100, 0)
+  ok(p:ctxFilled() == 0, "预算未知时不乱显示，实际 " .. p:ctxFilled())
+  ok(p:ctxLabel() == "-", "预算未知时标签是 -，实际 " .. p:ctxLabel())
+
+  p:setContext(8200, 16000)
+  ok(p:ctxLabel() == "8.2k/16k", "标签是 8.2k/16k，实际 " .. p:ctxLabel())
+  p:setContext(7000, 8000)
+  ok(p:ctxLabel() == "7k/8k", "整千写 7k/8k 不写 7.0k/8.0k，实际 " .. p:ctxLabel())
+  p:setContext(8200, 16000)
+  p:setContext(900, 16000)
+  ok(p:ctxLabel() == "900/16k", "不到 1k 直接显示数字，实际 " .. p:ctxLabel())
+
+  -- 颜色分级：绿 -> 琥珀 -> 红
+  local okColor, warnColor, errColor = false, false, false
+  p:setContext(1000, 16000); okColor = p:ctxColor() ~= nil
+  p:setContext(11000, 16000); warnColor = (p:ctxColor() ~= nil)
+  p:setContext(15000, 16000); errColor = (p:ctxColor() ~= nil)
+  ok(okColor and warnColor and errColor, "三档颜色都能取到")
+  local a = p:ctxColor()           -- 15000/16000 = 94% -> 红
+  p:setContext(1000, 16000)
+  local b = p:ctxColor()
+  ok(a ~= b, "快满了和刚开始的颜色不同（一眼能看出来）")
+
+  -- 画出来：应该有 20 个格子
+  p:setContext(8000, 16000)
+  local gc = fakeGC(1000, 60)
+  p:_paint(gc)
+  ok(p.dbg:find("ctx=8000/16000") ~= nil, "调试串里带用量：" .. p.dbg)
+  local anyHit = #p.barHit > 0
+  local b0 = p.barHit[1]
+  ok(anyHit and p:_barHitAt(b0.x + 2, b0.y + 2) ~= nil, "控件区能命中（鼠标点得到）")
+  ok(p:_barHitAt(2, 2) == nil, "控件区之外不会误命中")
+end
+
+print("== 栏内控件：思考强度滑杆（4 档，可点可拖）==")
+do
+  local got = {}
+  local p = panel.new{ onThinkingChange = function(v) got[#got + 1] = v end }
+  p:setMode("bar_bottom", true)
+  p:setThinking("auto")
+  ok(p:thinkIndex() == 1, "auto = 第 1 档，实际 " .. p:thinkIndex())
+
+  local gc = fakeGC(1000, 60)
+  p:_paint(gc)
+  ok(p.thinkTrack ~= nil, "绘制后记下了滑杆轨道（否则点不着）")
+
+  local t = p.thinkTrack
+  -- 点最右边 = 最高档
+  p:_onCanvasMouseDown{ button = MouseButton.LEFT, x = t.x + t.w - 1, y = t.y + 4 }
+  ok(p.thinking == "high", "点最右 -> high，实际 " .. p.thinking)
+  ok(#got == 1 and got[1] == "high", "单击就提交了一次，实际 " .. #got)
+
+  -- 拖：中间两下不提交，松手才提交一次
+  p.thinkDrag = true
+  got = {}
+  p:_onCanvasMouseMove{ x = t.x, y = t.y + 4 }              -- 最左 = auto
+  p:_onCanvasMouseMove{ x = t.x + math.floor(t.w / 3), y = t.y + 4 }
+  ok(#got == 0, "拖动过程中不提交（免得写 4 次配置），实际 " .. #got)
+  ok(p.thinking ~= "high", "拖动过程中视觉已经跟着变，实际 " .. p.thinking)
+  p:_onCanvasMouseUp{ button = MouseButton.LEFT }        -- 真事件一定带 button
+  ok(#got == 1, "松手提交一次，实际 " .. #got)
+  ok(p.thinkDrag == false, "松手后不再拖")
+
+  -- 点"最左"回到 auto
+  p:_onCanvasMouseDown{ button = MouseButton.LEFT, x = t.x, y = t.y + 4 }
+  ok(p.thinking == "auto", "点最左 -> auto，实际 " .. p.thinking)
+
+  -- 非法值退回 auto
+  p:setThinking("ultra")
+  ok(p.thinking == "auto", "非法档位退回 auto，实际 " .. p.thinking)
+
+  -- 档位映射：4 等分
+  p.thinkTrack = { x = 0, y = 0, w = 96, h = 16 }
+  ok(p:_thinkIndexAt(-50) == 1, "越界左侧 = 第 1 档")
+  ok(p:_thinkIndexAt(0) == 1, "x=0 = 第 1 档")
+  ok(p:_thinkIndexAt(32) == 2, "x=32 = 第 2 档，实际 " .. p:_thinkIndexAt(32))
+  ok(p:_thinkIndexAt(64) == 3, "x=64 = 第 3 档，实际 " .. p:_thinkIndexAt(64))
+  ok(p:_thinkIndexAt(95) == 4, "x=95 = 第 4 档，实际 " .. p:_thinkIndexAt(95))
+  ok(p:_thinkIndexAt(9999) == 4, "越界右侧 = 第 4 档")
+
+  -- 面板模式下不画控件（免得面板里出现看不懂的条）
+  local q = panel.new{}
+  q:setMode("panel", true)
+  local g2 = fakeGC(660, 420)
+  q:_paint(g2)
+  ok(q.thinkTrack == nil, "面板模式不画滑杆")
+  ok(#(q.barHit or {}) == 0, "面板模式没有栏内命中区")
+end
+
+print("== 栏内控件：工作图片缩略图 + 打开新图 ==")
+do
+  local actions = {}
+  local p = panel.new{
+    frameImage = function() return fakeFrameImage() end,
+    onAction = function(id) actions[#actions + 1] = id end,
+  }
+  p:setMode("bar_bottom", true)
+
+  -- 缩略图：保持长宽比、缩到外框内、像素真的是从原图采的
+  local thumb = p:thumbImage(40, 40)
+  ok(thumb ~= nil, "拿到了缩略图")
+  ok(thumb and thumb.width <= 40 and thumb.height <= 40, "不超过外框")
+  ok(thumb and thumb.width == 40 and thumb.height == 40,
+    "32x32 小图放大填满外框（看得清），实际 " ..
+    (thumb and thumb.width .. "x" .. thumb.height or "nil"))
+  -- 右下角那个红点应该在缩略图右下角（BGGRR：红 = 低字节 FF）
+  local px = thumb and thumb:getPixel(31, 31) or 0
+  ok(px ~= 0, "角落采样到了像素")
+
+  -- 非正方形：保持长宽比（长边贴住外框）
+  local wide = panel.new{ frameImage = function()
+    local img = Image(64, 16, ColorMode.RGB)
+    local rows = {}
+    for y = 0, 15 do
+      local row = {}
+      for x = 0, 63 do row[#row + 1] = string.char(9, 9, 9, 255) end
+      rows[#rows + 1] = table.concat(row)
+    end
+    img.bytes = table.concat(rows)
+    return img
+  end }
+  local w2 = wide:thumbImage(40, 40)
+  ok(w2 and w2.width == 40 and w2.height == 10, "64x16 -> 40x10（长宽比没被压扁），实际 " ..
+    (w2 and w2.width .. "x" .. w2.height or "nil"))
+
+  -- 没有文档（frameImage 返回 nil）也不能炸
+  local nodoc = panel.new{ frameImage = function() return nil end }
+  ok(nodoc:thumbImage(40, 40) == nil, "没有文档时返回 nil 而不是报错")
+
+  -- 画出来：有缩略图 + "＋" 两个命中区
+  local gc = fakeGC(1000, 60)
+  p:_paint(gc)
+  ok(#gc.images == 1, "画了一次缩略图，实际 " .. #gc.images)
+  local kinds = {}
+  for _, b in ipairs(p.barHit) do kinds[b.kind] = true end
+  ok(kinds.work and kinds.open and kinds.ctx and kinds.think,
+    "四个命中区都在（图 / ＋ / 电量条 / 滑杆）")
+
+  -- 点缩略图 = 打开一张新图；点"＋"也是
+  local thumbHit, openHit
+  for _, b in ipairs(p.barHit) do
+    if b.kind == "work" then thumbHit = b end
+    if b.kind == "open" then openHit = b end
+  end
+  p:_onCanvasMouseDown{ button = MouseButton.LEFT, x = thumbHit.x + 2, y = thumbHit.y + 2 }
+  p:_onCanvasMouseDown{ button = MouseButton.LEFT, x = openHit.x + 2, y = openHit.y + 2 }
+  ok(#actions == 2 and actions[1] == "open_file" and actions[2] == "open_file",
+    "两次都触发了 open_file，实际 " .. table.concat(actions, ","))
+
+  -- 点电量条 = 问一句"现在用了多少"
+  actions = {}
+  local ctxHit
+  for _, b in ipairs(p.barHit) do if b.kind == "ctx" then ctxHit = b end end
+  p:_onCanvasMouseDown{ button = MouseButton.LEFT, x = ctxHit.x + 2, y = ctxHit.y + 2 }
+  ok(#actions == 1 and actions[1] == "ctx_info", "点电量条 -> ctx_info，实际 " ..
+    table.concat(actions, ","))
+
+  -- 命中的点击不能把焦点抢给输入框（否则拖滑杆会打断输入）
+  local p2 = panel.new{ frameImage = function() return nil end }
+  p2:setMode("bar_bottom", true)
+  p2.inputFocused = false
+  local dlgCalls = 0
+  p2.dlg = { modify = function() dlgCalls = dlgCalls + 1 end }
+  p2.shown = true
+  p2:_paint(fakeGC(1000, 60))
+  local th
+  for _, b in ipairs(p2.barHit) do if b.kind == "think" then th = b end end
+  p2:_onCanvasMouseDown{ button = MouseButton.LEFT, x = th.x + 4, y = th.y + 4 }
+  ok(dlgCalls == 0, "点中控件时不碰输入框焦点，实际 modify 调用 " .. dlgCalls)
+end
+
+print("== 栏内控件：侧边栏也要画（竖着摆）==")
+do
+  local p = panel.new{ frameImage = function() return fakeFrameImage() end }
+  p:setMode("bar_side", true)
+  p:setContext(4000, 16000)
+  local gc = fakeGC(320, 420)
+  p:_paint(gc)
+  local kinds = {}
+  for _, b in ipairs(p.barHit) do kinds[b.kind] = true end
+  ok(kinds.work and kinds.open and kinds.ctx and kinds.think,
+    "侧边栏里也有四个命中区")
+  -- 每个控件都必须落在画布内，否则用户点不到
+  local outside = {}
+  for _, b in ipairs(p.barHit) do
+    if b.x < 0 or b.y < 0 or b.x + b.w > 320 or b.y + b.h > 420 then
+      outside[#outside + 1] = b.kind .. "(" .. b.x .. "," .. b.y .. ")"
+    end
+  end
+  ok(#outside == 0, "侧边栏里控件都在画布内，越界的：" .. table.concat(outside, " "))
+  -- 控件不能再占独立的一块地方：都在最后一行（输入行）里
+  local rows = tonumber(tostring(p.dbg):match("rows=(%d+)")) or 0
+  ok(rows >= 3, "侧边栏还有 3 行文本空间，实际 " .. rows)
+  local bandTop = math.floor(420 - 18 * 1.5)
+  local offRow = {}
+  for _, b in ipairs(p.barHit) do
+    if b.y < bandTop then offRow[#offRow + 1] = b.kind end
+  end
+  ok(#offRow == 0, "控件都在输入行里（没另占一块），跑到上面的：" .. table.concat(offRow, " "))
+
+  local q = panel.new{ frameImage = function() return nil end }
+  q:setMode("bar_bottom", true)
+  local g3 = fakeGC(1000, 60)
+  q:_paint(g3)
+  local bad = {}
+  for _, b in ipairs(q.barHit) do
+    if b.x < 0 or b.y < 0 or b.x + b.w > 1000 or b.y + b.h > 60 then
+      bad[#bad + 1] = b.kind
+    end
+  end
+  ok(#bad == 0, "底边栏里控件都在画布内，越界的：" .. table.concat(bad, " "))
 end
 
 print(string.format("%d passed, %d failed", pass, fail))
