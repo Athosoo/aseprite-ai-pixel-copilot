@@ -43,9 +43,22 @@
 （`messages[0] = {...}`）。内容没变时不多花 token。selftest 场景 7 专门钉住这条：
 断言第 1 步没有风格段、`style_use` 之后的第 2 步就有。
 
-**测试**：新增 artlib 30 + styles 41，tools 分发从 46 涨到 85（覆盖 20 个工具），
+**测试**：新增 artlib 30 + artop 40 + styles 41，tools 分发从 46 涨到 85（覆盖 20 个工具），
 selftest 22 → 32（多了场景 7：style_use → new_sprite → draw_art 的端到端链路）。
-合计 Lua 198 + 桥 181 = **379 项**全绿。
+合计 Lua 238 + 桥 181 = **419 项**全绿。
+
+`artop_test.lua` 是这轮加的**协议层**测试，补的是前两轮留下的一个盲区：
+`artlib_test` 只证明"函数调对了"，但桥发的字段名（`layer` / `palette` / `rows` / `x` / `y`）
+和 `agent.lua` 读的 `msg.xxx` 一旦对不上，函数单测全绿也没用。
+做法是构造**真的 Agent**（`agent.new` 在 `-b` 无头模式下能构造，已实测），
+把 `send` / `panel` 换成假的，然后喂协议消息进去断言画布真的变了。
+40 项覆盖：new_sprite / add_layer / draw_art 的字段名、行宽写歪时画布不动、
+出界计数、crop / scale / canvas_size 的 size_result、未知消息不炸。
+
+**另一个坑（install.ps1）**：扩展启动时优先用 `<扩展目录>/bridge/dist/bridge.mjs`，
+而打包脚本正好把 bundle 生成在 `extension/bridge/`。于是"打过一次包"之后，
+源码安装的副本会**静默跑到旧 bundle 上**，改 `bridge/src` 不生效。
+install.ps1 现在复制完会删掉目标目录里的 `bridge/`，源码安装就跑源码。
 
 ### 上一轮（尺寸能力 + 通用记忆）
 

@@ -27,6 +27,12 @@ New-Item -ItemType Directory -Force -Path $dst | Out-Null
 
 Copy-Item -Recurse -Force (Join-Path $src "*") $dst
 
+# 删掉复制过来的 bundle（tools/pack-extension.ps1 的产物）。
+# 扩展启动时优先用 <扩展目录>\bridge\dist\bridge.mjs，它在的话就轮不到仓库源码 ——
+# 于是"改了 bridge/src 却没重新打包"会静默跑到旧代码上。源码安装就该跑源码。
+$staleBundle = Join-Path $dst "bridge"
+if (Test-Path $staleBundle) { Remove-Item -Recurse -Force $staleBundle }
+
 # 记录项目根（扩展据此找 bridge）。
 # 用 WriteAllText 而不是 Set-Content：PowerShell 5 的 -Encoding utf8 会写 BOM，
 # 而 Lua 读出来开头会多出 \239\187\191，路径就废了。

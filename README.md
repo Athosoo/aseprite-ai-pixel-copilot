@@ -320,6 +320,7 @@ tests/                测试与 GUI 探针（见 STATUS.md）
   lua/menu_test.lua           命令表/语言/历史 无头单测（89 项）
   lua/sizelib_test.lua        裁剪/缩放/画布尺寸（23 项）
   lua/artlib_test.lua         字符网格作画（30 项）
+  lua/artop_test.lua          协议层：桥的消息 -> 真动画布（40 项）
   lua/path_test.lua           安装路径机制验证（__project.lua -> bridge）
   lua/gui_menu_probe.lua      命令表 + 小面板的 GUI 可视化探针
   lua/gui_key_probe.lua       真键盘探针（配 run_key_test.sh，验连续退格）
@@ -399,6 +400,7 @@ aseprite.exe -b --script tests/lua/ops_test.lua       # 31 项
 aseprite.exe -b --script tests/lua/versions_test.lua  # 20 项
 aseprite.exe -b --script tests/lua/sizelib_test.lua   # 23 项（裁剪/缩放/包围盒）
 aseprite.exe -b --script tests/lua/artlib_test.lua    # 30 项（字符网格作画）
+aseprite.exe -b --script tests/lua/artop_test.lua     # 40 项（协议层：桥的消息 -> 真动画布）
 aseprite.exe -b --script tests/lua/path_test.lua      # 安装路径机制
 
 # 桥的自测（mock LLM + mock Aseprite，不联网、不花 token）
