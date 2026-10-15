@@ -182,10 +182,14 @@ class Session {
       });
 
       // 只把【当前】风格的约束拼在系统提示后面。没选风格就一个字都不加。
-      const styleText = activeStyle ? styles.describe(activeStyle) : null;
+      // 传的是函数：模型在同一轮里 style_use 换了风格，后面的步骤立刻按新风格来。
+      const buildSystemPrompt = () => {
+        const styleText = activeStyle ? styles.describe(activeStyle) : null;
+        return styleText ? `${SYSTEM_PROMPT}\n\n${styleText}` : SYSTEM_PROMPT;
+      };
       await runTurn({
         cfg: cfg.llm,
-        systemPrompt: styleText ? `${SYSTEM_PROMPT}\n\n${styleText}` : SYSTEM_PROMPT,
+        systemPrompt: buildSystemPrompt,
         history: this.history,
         userText: text,
         context,

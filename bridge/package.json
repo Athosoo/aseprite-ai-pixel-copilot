@@ -8,7 +8,7 @@
     "start": "node src/server.mjs",
     "selftest": "node test/selftest.mjs",
     "build:pp": "node scripts/build-pp.mjs",
-    "test": "node test/memory_test.mjs && node test/styles_test.mjs && node test/tools_test.mjs"
+    "test": "node test/selftest.mjs && node test/memory_test.mjs && node test/styles_test.mjs && node test/tools_test.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"

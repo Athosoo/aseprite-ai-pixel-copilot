@@ -81,7 +81,7 @@ export function buildUserMessage(userText, context) {
  *
  * @param {object} opts
  *   cfg        config.json 的 llm 段
- *   systemPrompt
+ *   systemPrompt  字符串，或 () => 字符串（每步重新取一次，见下）
  *   history    [{role,content}...] 之前的消息（会被就地追加）
  *   userText   用户这句话
  *   context    Lua 传来的画布状态
@@ -93,13 +93,19 @@ export function buildUserMessage(userText, context) {
 export async function runTurn(opts) {
   const { cfg, systemPrompt, history, userText, context, tools, dispatch, onSay, onStatus } = opts;
 
-  const messages = [{ role: 'system', content: systemPrompt }, ...history];
+  // 系统提示每步重取：模型可能在**同一轮**里 style_use 换了风格，
+  // 那后面的作画步骤就得立刻按新风格来（否则"换个风格画个图标"要两轮才生效）。
+  // 没变的话内容一样，不多花 token。
+  const sysNow = () => (typeof systemPrompt === 'function' ? systemPrompt() : systemPrompt);
+
+  const messages = [{ role: 'system', content: sysNow() }, ...history];
   messages.push({ role: 'user', content: buildUserMessage(userText, context) });
 
   const maxSteps = cfg.maxSteps ?? 8;
   let finalText = '';
 
   for (let step = 0; step < maxSteps; step++) {
+    messages[0] = { role: 'system', content: sysNow() };
     onStatus(step === 0 ? 'thinking...' : `working (step ${step + 1})...`);
     const resp = await chatCompletion(cfg, messages, tools);
     const msg = resp.choices?.[0]?.message;

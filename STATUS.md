@@ -36,8 +36,16 @@
 **提示词**：`config.example.json` 的 `systemPrompt` 加 10~13 条（风格怎么用、
 字符网格格式、分趟作画、新建文档流程）。`config.json` 同步更新了（不进版本库）。
 
-**测试**：新增 artlib 30 + styles 41，tools 分发从 46 涨到 85（覆盖 20 个工具）。
-合计 Lua 198 + 桥 149 = **347 项**全绿。
+**踩到的一个真 bug（值得记）**：`runTurn` 原本在**进循环之前**把 systemPrompt 定死，
+于是模型在同一轮里 `style_use` 换的风格要到**下一轮**才生效 ——
+"换个星露谷风格，画个 16×16 的小人"这种一句话指令，画出来的还是旧风格。
+改成传函数（`systemPrompt` 可以是 `() => string`），循环里**每步重取**一次
+（`messages[0] = {...}`）。内容没变时不多花 token。selftest 场景 7 专门钉住这条：
+断言第 1 步没有风格段、`style_use` 之后的第 2 步就有。
+
+**测试**：新增 artlib 30 + styles 41，tools 分发从 46 涨到 85（覆盖 20 个工具），
+selftest 22 → 32（多了场景 7：style_use → new_sprite → draw_art 的端到端链路）。
+合计 Lua 198 + 桥 181 = **379 项**全绿。
 
 ### 上一轮（尺寸能力 + 通用记忆）
 

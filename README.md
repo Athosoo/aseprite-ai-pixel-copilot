@@ -402,8 +402,8 @@ aseprite.exe -b --script tests/lua/artlib_test.lua    # 30 项（字符网格作
 aseprite.exe -b --script tests/lua/path_test.lua      # 安装路径机制
 
 # 桥的自测（mock LLM + mock Aseprite，不联网、不花 token）
-cd bridge && npm test                                 # 149 项，跑下面三个
-node test/selftest.mjs                                # 22 项
+cd bridge && npm test                                 # 181 项，跑下面四个
+node test/selftest.mjs                                # 32 项（端到端：桥 <-> 假 LLM <-> 假 Aseprite）
 node test/memory_test.mjs                             # 23 项（记忆库）
 node test/styles_test.mjs                             # 41 项（风格库：优先级/清洗/只注入当前）
 node test/tools_test.mjs                              # 85 项（20 个工具的分发）

@@ -191,6 +191,24 @@ class MockAseprite {
       case 'canvas_info':
         this.send({ type: 'canvas_info_result', id: msg.id, context: this.context() });
         break;
+      case 'new_sprite':
+        this.received.push({ type: 'new_sprite_payload', width: msg.width, height: msg.height, colorMode: msg.colorMode });
+        this.send({ type: 'art_result', id: msg.id, ok: true, op: 'new_sprite', changed: true, size: `${msg.width}x${msg.height}`, colorMode: 'RGB' });
+        break;
+      case 'add_layer':
+        this.received.push({ type: 'add_layer_payload', name: msg.name, opacity: msg.opacity });
+        this.send({ type: 'art_result', id: msg.id, ok: true, op: 'add_layer', changed: true, layer: msg.name || 'Layer' });
+        break;
+      case 'draw_art':
+        this.received.push({ type: 'draw_art_payload', layer: msg.layer, rows: msg.rows, palette: msg.palette, x: msg.x, y: msg.y });
+        this.send({
+          type: 'art_result', id: msg.id, ok: true, op: 'draw_art', changed: true,
+          painted: (msg.rows || []).join('').replace(/[.\s]/g, '').length,
+          skippedOutOfBounds: 0,
+          width: (msg.rows || [''])[0].length, height: (msg.rows || []).length,
+          distinctColors: Object.keys(msg.palette || {}).length, layer: msg.layer,
+        });
+        break;
       case 'get_canvas': {
         const c = this.canvas;
         this.lastHeader = { type: 'canvas_pixels', id: msg.id, width: c.size, height: c.size };
@@ -398,6 +416,62 @@ async function main() {
   ase3.close();
 
   await sleep(200);
+
+  // ---- 场景 7：风格 + 作画（约束 AI 输出参数，像素由 Lua 落）
+  console.log('== 场景 7：style_use -> new_sprite -> draw_art ==');
+  const cfg4 = { ...testConfig, port: BRIDGE_PORT + 30, systemPrompt: '你是像素画助手。' };
+  const configPath4 = join(TMP, 'config4.json');
+  writeFileSync(configPath4, JSON.stringify(cfg4, null, 2), 'utf8');
+  const bridge4 = spawn(process.execPath, [join(ROOT, 'src', 'server.mjs'), '--config', configPath4], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  await sleep(700);
+  const ase4 = new MockAseprite(BRIDGE_PORT + 30);
+  await ase4.connect();
+  await sleep(200);
+
+  mockLlm.close();
+  // 每次请求都把系统提示记下来，用来验"风格是在同一轮内立刻生效的"：
+  // 第 1 步还没切风格 -> 不该有；第 2 步（style_use 之后）就该有了。
+  const sysPrompts = [];
+  const record = (reply) => (body) => {
+    sysPrompts.push(body.messages?.find((m) => m.role === 'system')?.content || '');
+    return reply;
+  };
+  mockLlm = await startMockLlm([
+    record(toolCall('call_7a', 'style_use', { name: 'pixel-icon' })),
+    record(toolCall('call_7b', 'new_sprite', { width: 16, height: 16 })),
+    record(toolCall('call_7c', 'draw_art', {
+      layer: '主体',
+      palette: { '.': '', X: '#2E86DE', o: '#7EE2A8' },
+      rows: ['..XX..', '.XooX.', 'XooooX'],
+    })),
+    record(textReply('按像素图标风格画好了。')),
+  ]);
+  await sleep(150);
+  ase4.chat('换个像素图标风格，画一个 16x16 的小图标');
+  await sleep(2000);
+
+  const stylePromptSeen = sysPrompts[sysPrompts.length - 1] || '';
+  check('第 1 步还没选风格，系统提示里没有风格段', !/Style:/.test(sysPrompts[0] || ''), sysPrompts[0]);
+  check('style_use 之后的同一步就带上了风格（不是等下一轮）', /Style:/.test(sysPrompts[1] || ''), sysPrompts[1]);
+  check('风格切换后注入进系统提示', /Style:/.test(stylePromptSeen) && /#2E86DE/.test(stylePromptSeen), stylePromptSeen?.slice(0, 200));
+  const drawPayload = ase4.received.find((m) => m.type === 'draw_art_payload');
+  check('draw_art 下发到 Aseprite', !!drawPayload, ase4.received.map((m) => m.type));
+  check('字符网格原样转发（不是坐标数组）', drawPayload?.rows?.length === 3 && drawPayload.rows[0] === '..XX..', drawPayload?.rows);
+  check('调色板原样转发', drawPayload?.palette?.X === '#2E86DE', drawPayload?.palette);
+  check('落到指定图层', drawPayload?.layer === '主体', drawPayload?.layer);
+  check('new_sprite 下发', ase4.received.some((m) => m.type === 'new_sprite_payload' && m.width === 16), ase4.received.map((m) => m.type));
+  check('画完后 AI 有回复', ase4.says.some((s) => s.kind === 'ai' && s.text.includes('画好')), ase4.says.slice(-3));
+
+  // 风格名应该落到 config.json 里，重启桥还记得
+  const cfgOnDisk = JSON.parse(readFileSync(configPath4, 'utf8'));
+  check('当前风格持久化到 config.json', cfgOnDisk.activeStyle === 'pixel-icon', cfgOnDisk.activeStyle);
+
+  bridge4.kill();
+  ase4.close();
+  await sleep(200);
+
   console.log(`\n==== selftest: ${passes} 通过, ${fails} 失败 ====`);
   process.exit(fails > 0 ? 1 : 0);
 }
