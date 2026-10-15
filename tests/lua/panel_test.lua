@@ -277,6 +277,58 @@ do
   local found = nil
   for _, r in ipairs(rows) do if r.id == "bar" then found = r end end
   ok(found ~= nil, "菜单里有切换形态这一行")
+
+  -- G4：面板里的「打开文件…」入口
+  ok(i18n.builtinAction("打开文件") == "open_file", "「打开文件」-> open_file")
+  ok(i18n.builtinAction("openfile") == "open_file", "openfile -> open_file")
+  ok(i18n.builtinAction("打开") == "upload", "「打开」仍是选图进矫正队列（没被改坏）")
+  local of = nil
+  for _, r in ipairs(rows) do if r.id == "open_file" then of = r end end
+  ok(of ~= nil, "菜单里有「打开文件…」这一行")
+  local od = nil
+  for _, r in ipairs(rows) do if r.id == "open_doc" then od = r end end
+  ok(od ~= nil and of.keys ~= od.keys, "两条打开的键位不冲突（O vs P）")
+end
+
+print("== G2 底边栏要放得下 3 行（状态 + 最后一行输出 + 输入）==")
+do
+  -- 行高约 18：高度必须 >= 3*行高，否则"正在执行的指令"那行画不出来
+  local p = panel.new{}
+  p:setMode("bar_bottom", true)
+  p:setStatus("running draw_art...", "tool", "hero.ase")
+  p:log("已画 128 像素（16x16），图层 主体", "tool")
+  p:_paint(fakeGC(1000, 60))
+  local rows = tonumber(tostring(p.dbg):match("rows=(%d+)"))
+  ok(rows and rows >= 3, "画布能放 3 行以上，实际 rows=" .. tostring(rows))
+  p:_paint(fakeGC(1000, 44))       -- 老高度：只够两行
+  local rows2 = tonumber(tostring(p.dbg):match("rows=(%d+)"))
+  ok(rows2 == 2, "高度 44 时确实只有 2 行（所以必须加高），实际 " .. tostring(rows2))
+end
+
+print("== G5 栏底色：可配置，认不出来的回落默认 ==")
+do
+  local p = panel.new{}
+  ok(p:setBarColor("#2B2B2B") == true, "#RRGGBB 认得")
+  ok(p.barBg ~= nil and p.barBg.red == 0x2B, "解析出 R=0x2B，实际 " .. tostring(p.barBg and p.barBg.red))
+  ok(p:setBarColor("#abc") == true and p.barBg.red == 0xAA, "#RGB 简写也认（补成 AABBCC）")
+  ok(p:setBarColor("") == false and p.barBg == nil, "空串 = 恢复默认")
+  ok(p:setBarColor("not a colour") == false and p.barBg == nil, "乱填的回落默认")
+  ok(p:setBarColor("#12345") == false, "位数不对也回落")
+  -- 栏模式绘制用得上（不炸即可，颜色在 GUI 里目检）
+  p:setBarColor("#101010")
+  p:setMode("bar_bottom", true)
+  p:_paint(fakeGC(1000, 60))
+  ok(p.dbg ~= nil, "带自定义底色也能画")
+end
+
+print("== G3 形态变更会回调（持久化用）==")
+do
+  local got = {}
+  local p = panel.new{ onModeChange = function(m) got[#got + 1] = m end }
+  p:setMode("bar_side")
+  ok(#got == 1 and got[1] == "bar_side", "形态变了就回调，实际 " .. tostring(got[1]))
+  p:setMode("bar_side")                 -- 没变也要回调（调用方自己去重）
+  ok(#got == 2, "重复设置也回调，让调用方决定要不要写盘")
 end
 
 print("== P12 栏形态的绘制：不炸 + 内容裁到宽度内 ==")

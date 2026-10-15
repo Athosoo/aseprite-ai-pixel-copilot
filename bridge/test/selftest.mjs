@@ -230,6 +230,29 @@ class MockAseprite {
         // P7：把提问记下来，等测试脚本替用户回答（不自动回，模拟"人在看"）
         this.asks.push({ id: msg.id, question: msg.question, options: msg.options });
         break;
+      case 'open_doc':
+        this.received.push({ type: 'open_doc_payload', path: msg.path });
+        if (this.failNextOpen) {
+          const e = this.failNextOpen;
+          this.failNextOpen = null;
+          this.send({ type: 'open_doc_result', id: msg.id, ok: false, error: e });
+        } else {
+          this.send({
+            type: 'open_doc_result', id: msg.id, ok: true,
+            name: 'hero.ase', path: 'D:/ws/gift/hero.ase', width: 32, height: 32,
+          });
+        }
+        break;
+      case 'list_workspace':
+        this.received.push({ type: 'list_workspace_payload' });
+        this.send({
+          type: 'workspace_result', id: msg.id, root: 'D:/ws',
+          files: [
+            { name: 'a_copy.ase', path: 'D:/ws/gift/a_copy.ase', dir: 'gift', size: 1234 },
+            { name: 'up.png', path: 'D:/ws/uploads/up.png', dir: 'uploads', size: 99 },
+          ],
+        });
+        break;
       case 'import_image':
         this.lastHeader = msg;
         break;
@@ -676,6 +699,59 @@ async function main() {
   check('cannot 里明确说了不能联网', cap?.cannot?.some((x) => /network/i.test(x)), cap?.cannot);
   check('can.edit_ops 来自 Aseprite 侧的真实算子表',
     Array.isArray(cap?.can?.edit_ops) && cap.can.edit_ops.includes('replace_color'), cap?.can?.edit_ops);
+
+  // ---- 场景 12：打开文档 + 列工作区（v0.5.1 补的端到端覆盖）
+  console.log('== 场景 12：open_document / list_workspace 端到端 ==');
+  mockLlm.close();
+  global.__openResult = null;
+  global.__lsResult = null;
+  mockLlm = await startMockLlm([
+    toolCall('call_12a', 'open_document', { path: 'gift/hero.ase' }),
+    (body) => {
+      const msgs = (body.messages || []).filter((m) => m.role === 'tool');
+      global.__openResult = msgs.length ? JSON.parse(msgs[msgs.length - 1].content) : null;
+      return toolCall('call_12b', 'list_workspace', {});
+    },
+    (body) => {
+      const msgs = (body.messages || []).filter((m) => m.role === 'tool');
+      global.__lsResult = msgs.length ? JSON.parse(msgs[msgs.length - 1].content) : null;
+      return textReply('工作区里有 2 个文件。');
+    },
+  ]);
+  await sleep(150);
+  ase6.chat('打开 gift 里的 hero，再看看工作区有什么');
+  await sleep(900);
+
+  const openPayload = ase6.received.find((m) => m.type === 'open_doc_payload');
+  check('桥把 open_doc 下发到 Aseprite', !!openPayload, ase6.received.map((m) => m.type));
+  check('路径原样下发', openPayload?.path === 'gift/hero.ase', openPayload);
+  check('打开结果回到模型上下文（含尺寸）',
+    global.__openResult?.ok === true && global.__openResult?.width === 32
+    && global.__openResult?.name === 'hero.ase', global.__openResult);
+  check('桥要了工作区列表', ase6.received.some((m) => m.type === 'list_workspace_payload'),
+    ase6.received.map((m) => m.type));
+  check('工作区列表回到模型上下文（含根路径和两项文件）',
+    global.__lsResult?.root === 'D:/ws' && global.__lsResult?.files?.length === 2
+    && global.__lsResult.files[0].size === 1234, global.__lsResult);
+
+  // 打开失败时错误要回到模型，而不是静默
+  mockLlm.close();
+  global.__openResult = null;
+  mockLlm = await startMockLlm([
+    toolCall('call_12c', 'open_document', { path: 'no/such.ase' }),
+    (body) => {
+      const msgs = (body.messages || []).filter((m) => m.role === 'tool');
+      global.__openResult = msgs.length ? JSON.parse(msgs[msgs.length - 1].content) : null;
+      return textReply('那个路径打不开。');
+    },
+  ]);
+  await sleep(150);
+  ase6.failNextOpen = 'not a path we can open';
+  ase6.chat('打开一个不存在的');
+  await sleep(900);
+  check('打开失败的原因回到了模型上下文',
+    typeof global.__openResult?.error === 'string' && /not a path/.test(global.__openResult.error),
+    global.__openResult);
 
   bridge6.kill();
   ase6.close();

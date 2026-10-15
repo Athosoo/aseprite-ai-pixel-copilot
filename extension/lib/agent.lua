@@ -54,6 +54,7 @@ function agent.new(cfg)
     onMiniAction = function(id) return self:miniAction(id) end,
     onFixRun = function(paths) self:runFixQueue(paths) end,
     onAskAnswer = function(index) self:answerAsk(index) end,
+    onModeChange = function(mode) self:saveUi(mode) end,
   }
 
   -- 工作文件夹（P10）：备份 / 副本 / 打开 / 交付都交给它。
@@ -66,8 +67,16 @@ function agent.new(cfg)
   -- 插件内改 API：Save/Test 都走桥，桥负责写 config.json（改完立即生效，不用重启桥）
   self.settings = settings.new{
     port = self.cfg.port,
-    onSave = function(llm, wsRoot)
-      self:send{ type = "set_config", llm = llm, workspace = { root = wsRoot or "" } }
+    onSave = function(llm, wsRoot, barBg)
+      self.uiBarBg = barBg or ""
+      self.lastUiMode = nil                     -- 强制回写一次，把底色也带上
+      self.panel:setBarColor(self.uiBarBg)
+      self:send{
+        type = "set_config",
+        llm = llm,
+        workspace = { root = wsRoot or "" },
+        ui = { mode = self.panel:layoutMode(), barBg = self.uiBarBg },
+      }
     end,
     onTest = function()
       self.panel:log(i18n.t("testing"), "info")
@@ -183,6 +192,14 @@ end
 function Agent:nextId()
   self.seq = self.seq + 1
   return self.seq
+end
+
+-- 界面形态/栏底色回写（G3/G5）。只在形态真的变了的时候发，免得和启动恢复打架。
+function Agent:saveUi(mode)
+  mode = mode or self.panel:layoutMode()
+  if mode == self.lastUiMode then return end
+  self.lastUiMode = mode
+  self:send{ type = "set_config", ui = { mode = mode, barBg = self.uiBarBg or "" } }
 end
 
 -- 状态栏要显示"正在改哪个文件"（P5a）。未保存的新文档显示 (untitled)。
@@ -440,6 +457,8 @@ function Agent:action(name)
     self:deliver()
   elseif name == "bar" then
     self.panel:cycleMode()
+  elseif name == "open_file" or name == "open_doc_pick" then
+    self:openFilePicker()
   elseif name == "open_doc" then
     -- 没有路径参数：提示用户怎么用（真正打开是模型调 open_document 工具）
     self.panel:log(i18n.t("openDocHint"), "info")
@@ -485,6 +504,30 @@ function Agent:pickFile()
 
   self.panel:log(string.format(i18n.t("loadedFixing"), app.fs.fileName(path)), "info")
   self.panel:addFixFile(path)       -- 进队列 + 弹小确认窗（两段式：确认后才开始）
+end
+
+-- 「打开文件…」（G4）：走 Aseprite 原生选择器，**只打开**，不进矫正队列。
+-- 和 pickFile 的区别就是最后那一步：pickFile 会把文件推进矫正队列。
+function Agent:openFilePicker()
+  local before = app.activeSprite and app.activeSprite.filename or ""
+
+  local ok, err = pcall(function()
+    app.command.OpenFile{ ui = true }
+  end)
+  if not ok then
+    self.panel:log(string.format(i18n.t("fileDialogFailed"), tostring(err)), "error")
+    return
+  end
+
+  local spr = app.activeSprite
+  local path = (spr and spr.filename) or ""
+  if path == "" or path == before then
+    return                          -- 用户取消了，或者只是切了文档：不打扰
+  end
+
+  self.panel:log(string.format(i18n.t("wsOpened"), app.fs.fileName(path),
+    spr.width, spr.height), "tool")
+  self.panel:setStatus(i18n.t("readyStatus"), "ok", self:docName())
 end
 
 -- 用户在小确认窗里点了"开始矫正"：逐张跑 Perfect Pixel
@@ -614,6 +657,16 @@ function Agent:onMessage(msg)
     if msg.workspace and type(msg.workspace.root) == "string" then
       self.workspaceRoot = msg.workspace.root
       if self.workspace then self.workspace:setRoot(self.workspaceRoot) end
+    end
+    -- 界面形态和栏底色（G3/G5）：桥记得，重启 Aseprite 也恢复
+    if msg.ui then
+      if type(msg.ui.mode) == "string" and msg.ui.mode ~= "" then
+        self.panel:setMode(msg.ui.mode, true)     -- quiet：别在启动日志里刷一行
+      end
+      if type(msg.ui.barBg) == "string" then
+        self.uiBarBg = msg.ui.barBg
+        self.panel:setBarColor(msg.ui.barBg)
+      end
     end
     self.settings:_fill(self.config, self.workspaceRoot)
     self.panel:log(string.format(

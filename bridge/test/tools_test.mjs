@@ -293,6 +293,57 @@ console.log('== P14 capabilities 与注册表交叉核对（防漂移）==');
     ok(typeof r.can.tools[n] === 'string' && r.can.tools[n].length > 0, `${n} 有一句说明`);
   }
   ok(Array.isArray(r.can.edit_ops), 'edit_ops 是数组（测试替身没有 Aseprite 侧算子表，空数组也算）');
+  ok(r.can.workspace && typeof r.can.workspace.enabled === 'boolean',
+    'capabilities 说明当前有没有工作区（G6）');
+  ok(r.can.workspace.enabled === false, '测试替身没配工作区 -> enabled=false');
+  ok(typeof r.can.workspace.note === 'string' && r.can.workspace.note.length > 0,
+    '关着的时候要告诉模型怎么开');
+  ok(typeof r.can.ui_mode === 'string', 'capabilities 说明当前形态（G6），实际 ' + r.can.ui_mode);
+  ok(Array.isArray(r.can.openable_extensions) && r.can.openable_extensions.includes('ase'),
+    '明确列出能打开哪些后缀（G6）');
+  ok(!r.can.openable_extensions.includes('lua') && !r.can.openable_extensions.includes('txt'),
+    '后缀清单里不该有脚本/文本（不能被诱导）');
+}
+
+console.log('== G6 capabilities 会反映工作区状态 ==');
+{
+  const d3 = makeDispatcher({
+    session: fakeSession, bank: fakeBank, memory: fakeMemory, styles: fakeStyles,
+    cfg: { workspace: { root: 'D:/ws' }, ui: { mode: 'bar_bottom' } }, bundlePath: '',
+  });
+  const r = await d3('capabilities', {});
+  ok(r.can.workspace.enabled === true, '配了工作区 -> enabled=true');
+  ok(r.can.workspace.root === 'D:/ws', '带上工作区路径');
+  ok(/deliver|交付/.test(r.can.workspace.note || ''), '提示用户怎么"交付"');
+  ok(r.can.ui_mode === 'bar_bottom', '反映当前形态，实际 ' + r.can.ui_mode);
+}
+
+
+console.log('== G1 open_document / list_workspace 转发（v0.5.1 补的盲区）==');
+{
+  calls.length = 0;
+  const r = await dispatch('open_document', { path: 'gift/001.ase' });
+  ok(last().kind === 'open_doc', '消息类型 = open_doc，实际 ' + last().kind);
+  ok(last().payload.path === 'gift/001.ase', 'path 原样转发');
+  ok(r.ok === true, '结果来自 Lua 侧');
+
+  const r2 = await dispatch('open_document', {});
+  ok(typeof r2.error === 'string', '空 path 被挡住，实际 ' + JSON.stringify(r2));
+
+  const r3 = await dispatch('open_document', { path: '   ' });
+  ok(typeof r3.error === 'string', '全空白的 path 也被挡');
+
+  calls.length = 0;
+  const r4 = await dispatch('list_workspace', {});
+  ok(last().kind === 'list_workspace', '消息类型 = list_workspace，实际 ' + last().kind);
+  ok(r4.ok === true, '结果来自 Lua 侧');
+}
+
+console.log('== G4 打开文件… 的入口在命令表里 ==');
+{
+  // 不在桥侧，只是保证菜单行加对了（i18n 在 Lua 测，这里只查工具定义没被改坏）
+  const t = TOOLS.find((x) => x.function.name === 'open_document');
+  ok(/path/.test(t.function.description), 'open_document 的说明里提到 path');
 }
 
 

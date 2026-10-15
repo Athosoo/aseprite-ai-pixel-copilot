@@ -29,6 +29,9 @@ function Settings:_fill(current, wsRoot)
   if wsRoot ~= nil then
     pcall(function() self.dlg:modify{ id = "wsRoot", text = tostring(wsRoot) } end)
   end
+  if self.opts.barBg ~= nil then
+    pcall(function() self.dlg:modify{ id = "barBg", text = tostring(self.opts.barBg) } end)
+  end
   pcall(function()
     self.dlg:modify{
       id = "apiKey",
@@ -59,6 +62,16 @@ function Settings:show(current)
   dlg:label{ text = "Model" }
   dlg:samerow()
   dlg:entry{ id = "model", text = (current and current.model) or "", width = 430 }
+  dlg:newrow()
+
+  dlg:label{ text = "Bar colour" }
+  dlg:samerow()
+  dlg:entry{
+    id = "barBg",
+    text = (self.opts.barBg) or "",
+    width = 430,
+    placeholder = "bar-mode background, e.g. #2B2B2B  (empty = default)",
+  }
   dlg:newrow()
 
   dlg:label{ text = "API Key" }
@@ -92,6 +105,7 @@ function Settings:_values()
     model = tostring(d.model or ""),
     apiKey = tostring(d.apiKey or ""),
     wsRoot = tostring(d.wsRoot or ""),
+    barBg = tostring(d.barBg or ""),
   }
 end
 
@@ -99,7 +113,7 @@ function Settings:_save()
   local v = self:_values()
   if self.dlg then pcall(function() self.dlg:modify{ id = "apiKey", text = "" } end) end
   local llm = { baseUrl = v.baseUrl, model = v.model, apiKey = v.apiKey }
-  if self.opts.onSave then self.opts.onSave(llm, v.wsRoot) end
+  if self.opts.onSave then self.opts.onSave(llm, v.wsRoot, v.barBg) end
 end
 
 function Settings:_test()

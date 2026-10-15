@@ -353,7 +353,9 @@ function Workspace:listFiles()
       if isDir then
         walk(full, depth + 1)
       else
-        out[#out + 1] = { name = name, path = full, dir = relDir(full) }
+        local size = nil
+        pcall(function() size = app.fs.fileSize(full) end)
+        out[#out + 1] = { name = name, path = full, dir = relDir(full), size = size }
       end
     end
   end

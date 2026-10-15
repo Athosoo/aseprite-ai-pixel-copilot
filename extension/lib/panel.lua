@@ -46,9 +46,11 @@ local MIN_CANVAS_W, MIN_CANVAS_H = 240, 120
 --   侧边栏：窄而高（日志 + 输入），拖到右侧就是侧栏
 -- 窗口尺寸 = 画布尺寸 + 实测的边框余量（672x467 的窗口对应 660x420 的画布）。
 local CHROME_W, CHROME_H = 12, 47
+-- 底边栏要 3 行才够（状态 / 最后一行输出 / 输入）：行高约 18，3 行 54，取 60 留点余量。
+-- 只有 2 行的话"正在执行的指令"那行画不出来，而用户要的正是看得见它在干什么。
 local MODE_CANVAS = {
   panel      = { w = CANVAS_W, h = CANVAS_H },
-  bar_bottom = { w = 1000, h = 44 },
+  bar_bottom = { w = 1000, h = 60 },
   bar_side   = { w = 320, h = 420 },
 }
 local MODE_ORDER = { "panel", "bar_bottom", "bar_side" }
@@ -218,6 +220,16 @@ end
 -- 终端风格：把用户敲的命令回显出来
 function Panel:echo(text)
   self:log(text, "user")
+end
+
+-- 解析 "#RRGGBB" / "#RGB"（栏底色的用户配置）。认不出来返回 nil，调用方回落到默认底色。
+function panel.parseHexColor(text)
+  local s = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("^#", "")
+  if #s == 3 then
+    s = s:sub(1, 1):rep(2) .. s:sub(2, 2):rep(2) .. s:sub(3, 3):rep(2)
+  end
+  if #s ~= 6 or not s:find("^%x%x%x%x%x%x$") then return nil end
+  return Color(tonumber(s:sub(1, 2), 16), tonumber(s:sub(3, 4), 16), tonumber(s:sub(5, 6), 16))
 end
 
 -- 状态文本的"闲/忙"判定。用【原文】判（翻译后的文本不该参与逻辑），
@@ -632,6 +644,13 @@ end
 
 function Panel:layoutMode() return self.mode or "panel" end
 
+-- 栏底色（G5）。传空/"#" = 恢复默认
+function Panel:setBarColor(text)
+  self.barBg = panel.parseHexColor(text)
+  self:repaint()
+  return self.barBg ~= nil
+end
+
 function Panel:modeLabel(mode)
   mode = mode or self:layoutMode()
   if mode == "bar_bottom" then return i18n.t("modeBarBottom") end
@@ -647,14 +666,28 @@ function Panel:_barAnchor(mode)
   pcall(function() H = app.window.height or 0 end)
   if W <= 0 or H <= 0 then return nil end
 
-  local c = MODE_CANVAS[mode]
-  local bw, bh = c.w + CHROME_W, c.h + CHROME_H
+  local bw, bh = self:_modeSize(mode)
   if mode == "bar_bottom" then
     -- 底边栏：水平居中，贴底
     return math.max(0, math.floor((W - bw) / 2)), math.max(0, H - bh)
   end
   -- 侧边栏：贴右，垂直居中
   return math.max(0, W - bw), math.max(0, math.floor((H - bh) / 2))
+end
+
+-- 形态的窗口尺寸（含边框余量）。主窗口比目标还小的时候按主窗口收缩 ——
+-- 否则底边栏会宽过主窗口，看着像跑出去了。
+function Panel:_modeSize(mode)
+  local c = MODE_CANVAS[mode] or MODE_CANVAS.panel
+  local ww, wh = c.w + CHROME_W, c.h + CHROME_H
+  if mode ~= "panel" then
+    local W, H = 0, 0
+    pcall(function() W = app.window.width or 0 end)
+    pcall(function() H = app.window.height or 0 end)
+    if W > 0 then ww = math.min(ww, W - 8) end
+    if H > 0 then wh = math.min(wh, H - 8) end
+  end
+  return ww, wh
 end
 
 -- 返回实际生效的形态名
@@ -667,8 +700,7 @@ function Panel:setMode(mode, quiet)
   self.naturalFor = nil
 
   if self.dlg and self.shown then
-    local c = MODE_CANVAS[mode]
-    local ww, wh = c.w + CHROME_W, c.h + CHROME_H
+    local ww, wh = self:_modeSize(mode)
 
     -- 顺序很重要：modify 会触发一次重新布局，把窗口按内容撑回自然尺寸。
     -- 先 modify（改焦点），**最后**才设 bounds —— 反过来的话 bounds 会被那次布局冲掉
@@ -694,6 +726,10 @@ function Panel:setMode(mode, quiet)
   end
 
   if not quiet then self:log(string.format(i18n.t("modeChanged"), self:modeLabel()), "info") end
+  if self.opts.onModeChange then
+    local ok, err = pcall(self.opts.onModeChange, self.mode)
+    if not ok then self:log(tostring(err), "error") end
+  end
   self:repaint()
   return self.mode
 end
@@ -1248,7 +1284,10 @@ function Panel:_paint(gc)
     end
   end
 
-  gc.color = BG
+  -- 栏模式下底色可配置（G5）：Aseprite 读不到主题色（实测真名假名都返回 0,0,0），
+  -- 所以给用户一个填色口来贴合自己的主题；没填就用面板默认深色。
+  local bg = self:isBar() and self.barBg or BG
+  gc.color = bg or BG
   gc:fillRect(Rectangle(0, 0, w, h))
 
   -- 栏形态走另一套布局（P12）

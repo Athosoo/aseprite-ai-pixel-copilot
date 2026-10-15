@@ -524,15 +524,23 @@ const CANNOT = [
 
 // 能力清单从【真实注册表】生成，不手写 —— 手写的清单会随代码漂移，那就等于骗人。
 // 测试里会和 TOOLS 交叉核对（tools_test.mjs 的 P14 段）。
-export function buildCapabilities(session) {
+export function buildCapabilities(session, cfg = {}) {
   const toolList = {};
   for (const t of TOOLS) {
     // 描述取第一句，够用且省 token
     const desc = String(t.function.description || '').split(/(?<=[.。])\s/)[0];
     toolList[t.function.name] = desc;
   }
+  // 能打开哪些后缀（和 extension/lib/workspace.lua 的 OPENABLE 表保持一致）
+  const OPENABLE = ['ase', 'aseprite', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'pcx', 'tga'];
+  const wsRoot = cfg.workspace?.root || '';
   const can = {
     edit_ops: session?.info?.ops || [],
+    workspace: wsRoot
+      ? { enabled: true, root: wsRoot, note: 'Edits go to a copy; the panel backs up the original first. The user types deliver (交付) to finish.' }
+      : { enabled: false, note: 'No workspace configured, so edits land on the open document directly. Ask the user to set one in the panel settings if they want backups + copies.' },
+    ui_mode: cfg.ui?.mode || 'panel',
+    openable_extensions: OPENABLE,
     tools: toolList,
     drawing: 'Character-grid drawing (one character per pixel + a char->colour palette), new documents, layers with opacity and blend modes, reusable art styles.',
     images: 'Open an image/aseprite document, run Perfect Pixel grid correction, and (when a workspace is configured) list and open the files in it.',
@@ -678,7 +686,7 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
       }
 
       case 'capabilities':
-        return buildCapabilities(session);
+        return buildCapabilities(session, cfg);
 
       case 'open_document': {
         const path = String(args.path ?? '').trim();

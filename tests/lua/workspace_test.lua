@@ -327,6 +327,8 @@ do
     -- 备份在 backups/<原文件夹名>_back/ 下，所以是按前缀判断
     if f.dir:find("^backups") then hasBackup = true end
     ok(f.name ~= nil and f.path ~= nil, "每一项都有 name/path")
+    ok(type(f.size) == "number" and f.size > 0,
+      "每一项带文件大小（G7），" .. tostring(f.name) .. " -> " .. tostring(f.size))
   end
   ok(hasUpload, "列出了 uploads 里的复制件")
   ok(hasBackup, "列出了 backups 里的备份")

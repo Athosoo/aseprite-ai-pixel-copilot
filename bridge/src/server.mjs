@@ -83,6 +83,10 @@ function configPayload() {
     colorBank: BANK_PATH,
     perfectPixelReady: existsSync(BUNDLE),
     workspace: { root: cfg.workspace?.root || '' },
+    ui: {
+      mode: cfg.ui?.mode || 'panel',
+      barBg: cfg.ui?.barBg || '',
+    },
   };
 }
 
@@ -91,6 +95,7 @@ function saveConfig() {
   const raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
   raw.llm = { ...(raw.llm || {}), ...cfg.llm };
   if (cfg.workspace) raw.workspace = { ...(raw.workspace || {}), ...cfg.workspace };
+  if (cfg.ui) raw.ui = { ...(raw.ui || {}), ...cfg.ui };
   writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2), 'utf8');
 }
 
@@ -287,6 +292,13 @@ class Session {
         // 工作区根目录（P10）：空字符串 = 关闭工作区模式
         if (typeof msg.workspace?.root === 'string') {
           cfg.workspace = { ...(cfg.workspace || {}), root: msg.workspace.root.trim() };
+        }
+        // 界面形态 / 栏底色（G3 / G5）：改完落盘，重启桥和重启 Aseprite 都记得
+        if (typeof msg.ui?.mode === 'string') {
+          cfg.ui = { ...(cfg.ui || {}), mode: msg.ui.mode.trim() };
+        }
+        if (typeof msg.ui?.barBg === 'string') {
+          cfg.ui = { ...(cfg.ui || {}), barBg: msg.ui.barBg.trim() };
         }
         try {
           saveConfig();

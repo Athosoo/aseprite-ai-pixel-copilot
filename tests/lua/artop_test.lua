@@ -33,11 +33,15 @@ local a = agent.new{ port = 1 }
 local sent, logs = {}, {}
 local statuses = {}
 a.send = function(_, msg) sent[#sent + 1] = msg end
+local modeCalls = {}
 a.panel = {
   log = function(_, text, kind) logs[#logs + 1] = { text = text, kind = kind } end,
   setStatus = function(_, text, kind, doc)
     statuses[#statuses + 1] = { text = text, kind = kind, doc = doc }
   end,
+  setMode = function(_, mode, quiet) modeCalls[#modeCalls + 1] = { mode = mode, quiet = quiet } end,
+  setBarColor = function(_, c) modeCalls[#modeCalls + 1] = { barBg = c } end,
+  layoutMode = function() return "panel" end,
 }
 
 -- 喂一条消息，返回它发出的第一帧
@@ -235,6 +239,21 @@ do
   a:answerAsk(1)
   ok(#sent == 0, "没有待答问题时回答不发帧")
   a.conn = nil
+end
+
+print("== G3/G5 config 消息里的形态和底色要恢复 ==")
+do
+  modeCalls = {}
+  a:onMessage{ type = "config", llm = {}, ui = { mode = "bar_side", barBg = "#2B2B2B" },
+               workspace = { root = "" } }
+  local gotSide, gotColor = false, nil
+  for _, c in ipairs(modeCalls) do
+    if c.mode == "bar_side" then gotSide = true end
+    if c.barBg then gotColor = c.barBg end
+  end
+  ok(gotSide, "按 config 恢复成侧边栏")
+  ok(gotColor == "#2B2B2B", "按 config 恢复栏底色，实际 " .. tostring(gotColor))
+  ok(modeCalls[1].quiet == true, "启动恢复时不要刷日志（quiet）")
 end
 
 print("== 未知消息类型不炸 ==")
