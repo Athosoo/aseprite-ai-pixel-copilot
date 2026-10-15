@@ -529,13 +529,13 @@ do
   ok(p:_thinkIndexAt(95) == 4, "x=95 = 第 4 档，实际 " .. p:_thinkIndexAt(95))
   ok(p:_thinkIndexAt(9999) == 4, "越界右侧 = 第 4 档")
 
-  -- 面板模式下不画控件（免得面板里出现看不懂的条）
+  -- 面板模式下【也】要画控件（v0.5.4 修的 bug：以前切回面板就全没了）
   local q = panel.new{}
   q:setMode("panel", true)
   local g2 = fakeGC(660, 420)
   q:_paint(g2)
-  ok(q.thinkTrack == nil, "面板模式不画滑杆")
-  ok(#(q.barHit or {}) == 0, "面板模式没有栏内命中区")
+  ok(q.thinkTrack ~= nil, "面板模式也有滑杆（切形态不少东西）")
+  ok(#(q.barHit or {}) > 0, "面板模式也有控件命中区")
 end
 
 print("== 栏内控件：工作图片缩略图 + 打开新图 ==")
@@ -618,6 +618,114 @@ do
   for _, b in ipairs(p2.barHit) do if b.kind == "think" then th = b end end
   p2:_onCanvasMouseDown{ button = MouseButton.LEFT, x = th.x + 4, y = th.y + 4 }
   ok(dlgCalls == 0, "点中控件时不碰输入框焦点，实际 modify 调用 " .. dlgCalls)
+end
+
+print("== 栏内控件：面板模式也要有（切形态不能少东西）==")
+do
+  local p = panel.new{ frameImage = function() return fakeFrameImage() end }
+  p:setMode("panel", true)
+  p:setContext(4000, 16000)
+  p:setThinking("low")
+  p.input = "把背景改成蓝色"
+  local gc = fakeGC(660, 420)
+  p:_paint(gc)
+  local kinds = {}
+  for _, b in ipairs(p.barHit) do kinds[b.kind] = true end
+  ok(kinds.work and kinds.open and kinds.ctx and kinds.think and kinds.dock,
+    "面板模式里五个控件都在（图/＋/电量条/滑杆/贴边），实际 " ..
+    table.concat((function() local t = {} for k in pairs(kinds) do t[#t + 1] = k end table.sort(t) return t end)(), ","))
+  ok(p.thinkTrack ~= nil, "面板模式里滑杆也能点（thinkTrack 记下了）")
+  -- 控件在输入行那一行（不是别的地方）
+  local caretY = tonumber(tostring(p.dbg):match("caret=%(%d+,(%d+)%)")) or 0
+  local off = {}
+  for _, b in ipairs(p.barHit) do
+    if math.abs(b.y - caretY) > 12 then off[#off + 1] = b.kind end
+  end
+  ok(#off == 0, "控件都在输入行上（caretY=" .. caretY .. "），跑偏的：" .. table.concat(off, " "))
+  ok(tostring(p.dbg):find("cls=0") == nil, "输入区为控件让了宽度：" .. tostring(p.dbg))
+
+  -- 面板模式下点控件也要生效（以前只在栏模式命中）
+  local actions = {}
+  p.opts.onAction = function(id) actions[#actions + 1] = id end
+  local openHit
+  for _, b in ipairs(p.barHit) do if b.kind == "open" then openHit = b end end
+  p:_onCanvasMouseDown{ button = MouseButton.LEFT, x = openHit.x + 1, y = openHit.y + 1 }
+  ok(#actions == 1 and actions[1] == "open_file", "面板模式点 ＋ 也能开图，实际 " ..
+    table.concat(actions, ","))
+end
+
+print("== 贴边切换按钮：点一下在 贴底 / 贴侧边 之间切 ==")
+do
+  local p = panel.new{ frameImage = function() return nil end, onModeChange = function() end }
+  p:setMode("panel", true)
+
+  -- 面板模式点一下 -> 去贴底
+  p:toggleDock()
+  ok(p:layoutMode() == "bar_bottom", "面板 -> 贴底，实际 " .. p:layoutMode())
+  -- 贴底再点 -> 贴侧边
+  p:toggleDock()
+  ok(p:layoutMode() == "bar_side", "贴底 -> 贴侧边，实际 " .. p:layoutMode())
+  -- 贴侧边再点 -> 回贴底（两态切换，不会绕回面板）
+  p:toggleDock()
+  ok(p:layoutMode() == "bar_bottom", "贴侧边 -> 贴底，实际 " .. p:layoutMode())
+
+  -- 真的点那个按钮（走鼠标路径）
+  p:setMode("bar_bottom", true)
+  local g = fakeGC(1000, 60)
+  p:_paint(g)
+  local dock
+  for _, b in ipairs(p.barHit) do if b.kind == "dock" then dock = b end end
+  ok(dock ~= nil, "贴边按钮画出来了")
+  p:_onCanvasMouseDown{ button = MouseButton.LEFT, x = dock.x + 2, y = dock.y + 2 }
+  ok(p:layoutMode() == "bar_side", "点按钮 -> 贴侧边，实际 " .. p:layoutMode())
+
+  -- 三种形态都要有这个按钮
+  local all = true
+  for _, m in ipairs({ "panel", "bar_bottom", "bar_side" }) do
+    p:setMode(m, true)
+    if m == "panel" then p:_paint(fakeGC(660, 420)) else
+      p:_paint(fakeGC(m == "bar_bottom" and 1000 or 320, m == "bar_bottom" and 60 or 420))
+    end
+    local found = false
+    for _, b in ipairs(p.barHit) do if b.kind == "dock" then found = true end end
+    if not found then all = false end
+  end
+  ok(all, "面板 / 贴底 / 贴侧边 三种形态都有贴边按钮")
+end
+
+print("== 小窗口：控件不许被画到画布外 ==")
+do
+  -- 栏比需要的行数还矮（用户截图里那条黑条就很矮）
+  for _, hh in ipairs({ 60, 40, 28, 20 }) do
+    local p = panel.new{ frameImage = function() return nil end }
+    p:setMode("bar_bottom", true)
+    p:setContext(3000, 16000)
+    local g = fakeGC(1000, hh)
+    p:_paint(g)
+    local bad, found = {}, 0
+    for _, b in ipairs(p.barHit) do
+      found = found + 1
+      if b.y < 0 or b.y + b.h > hh then bad[#bad + 1] = b.kind .. "@y=" .. b.y end
+    end
+    ok(found > 0 and #bad == 0, "栏高 " .. hh .. " 时控件都在画布内（找到 " .. found ..
+      " 个），越界的：" .. table.concat(bad, " "))
+  end
+
+  -- 面板被拖到很矮
+  for _, hh in ipairs({ 420, 120, 60 }) do
+    local p = panel.new{ frameImage = function() return nil end }
+    p:setMode("panel", true)
+    p:setContext(3000, 16000)
+    local g = fakeGC(660, hh)
+    p:_paint(g)
+    local bad, found = {}, 0
+    for _, b in ipairs(p.barHit) do
+      found = found + 1
+      if b.y < 0 or b.y + b.h > hh then bad[#bad + 1] = b.kind .. "@y=" .. b.y end
+    end
+    ok(#bad == 0, "面板高 " .. hh .. " 时控件都在画布内（找到 " .. found .. " 个），越界的：" ..
+      table.concat(bad, " "))
+  end
 end
 
 print("== 栏内控件：侧边栏也要画（竖着摆）==")

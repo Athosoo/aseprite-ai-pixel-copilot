@@ -155,6 +155,7 @@ local CTX_CELL_H_LINE = 16    -- 控件在输入行里占的高度
 local THINK_STEPS = { "auto", "low", "medium", "high" }
 local THINK_TRACK_W, THINK_KNOB_R = 44, 3
 local THUMB_BOX = 16          -- 缩略图外框：和输入行一样高，才塞得进去
+local DOCK_BOX_W, DOCK_BOX_H = 14, 12   -- 贴边切换按钮（贴底 / 贴侧边）
 
 ----------------------------------------------------------------------
 
@@ -571,7 +572,7 @@ function Panel:_onWheel(ev)
 end
 
 function Panel:_onCanvasMouseMove(ev)
-  if self:isBar() and self:_onBarMouseMove(ev) then return end
+  if self:_onBarMouseMove(ev) then return end
   local idx = self:_menuIndexAt(ev.x or 0, ev.y or 0)
   if (idx or 0) ~= (self.menuHover or 0) then
     self.menuHover = idx or 0
@@ -620,7 +621,7 @@ end
 
 function Panel:_onCanvasMouseDown(ev, dlg)
   if ev.button ~= MouseButton.LEFT then return end
-  if self:isBar() and self:_onBarMouseDown(ev) then return end
+  if self:_onBarMouseDown(ev) then return end
   if self:_menuIndexAt(ev.x or 0, ev.y or 0) then return end
   if self.inputFocused then return end
   dlg = dlg or self.dlg
@@ -702,6 +703,7 @@ function Panel:setBarColor(text)
   return self.barBg ~= nil
 end
 
+-- 形态名（状态栏用）
 function Panel:modeLabel(mode)
   mode = mode or self:layoutMode()
   if mode == "bar_bottom" then return i18n.t("modeBarBottom") end
@@ -945,6 +947,52 @@ function Panel:thumbImage(boxW, boxH)
   return dst
 end
 
+-- 控件区宽度预算（面板模式与栏模式共用同一套算法，保证切形态不会"少东西"）。
+-- 放不下就先丢文字标签，再放不下就整体不画 —— 绝不挤掉输入框。
+function Panel:_clusterPlan(w, minTextW)
+  minTextW = minTextW or 130
+  local base = THUMB_BOX + 2 + THUMB_BOX + 6
+    + (CTX_CELLS * (CTX_CELL_W + CTX_CELL_GAP)) + 8 + THINK_TRACK_W + 6 + DOCK_BOX_W + 6
+  local withLabel = (base + 4 + 48) <= (w - minTextW)
+  local cw = withLabel and (base + 4 + 48) or base
+  if cw > w - minTextW then return 0, false end
+  return cw, withLabel
+end
+
+-- 贴边切换按钮：图标画成"一个小窗口 + 贴住底边/右边的高亮"，不依赖字体字形。
+function Panel:_drawDock(gc, x, y)
+  local w, h = DOCK_BOX_W, DOCK_BOX_H
+  local mode = self:layoutMode()
+  gc.color = FRAME
+  gc:fillRect(Rectangle(x, y, w, h))
+  gc.color = DIM
+  gc:fillRect(Rectangle(x + 1, y + 1, w - 2, h - 2))
+  gc.color = (mode == "panel") and TEXT or STATUS_TOOL
+  if mode == "bar_side" then
+    gc:fillRect(Rectangle(x + w - 4, y + 1, 3, h - 2))       -- 贴右边
+  else
+    gc:fillRect(Rectangle(x + 1, y + h - 4, w - 2, 3))       -- 贴底边（面板模式也画这个＝点一下去贴底）
+  end
+  self.barHit[#self.barHit + 1] = { kind = "dock", x = x, y = y, w = w, h = h }
+  return w
+end
+
+-- 整串控件：工作图片 / 电量条 / 思考滑杆 / 贴边切换。在 x..x+clusterW 内右对齐摆好。
+function Panel:_drawCluster(gc, x, y, clusterW, ctxLabel)
+  local cy = y + math.floor((CTX_CELL_H_LINE - THUMB_BOX) / 2)
+  x = x + self:_drawWork(gc, x, cy, THUMB_BOX) + 6
+  x = x + self:_drawCtx(gc, x, y, ctxLabel) + 8
+  x = x + self:_drawThink(gc, x, y) + 6
+  self:_drawDock(gc, x, y + math.floor((CTX_CELL_H_LINE - DOCK_BOX_H) / 2))
+end
+
+-- 贴底 / 贴侧边 两态切换（"面板"模式下点一下 = 去贴底）。
+function Panel:toggleDock()
+  local cur = self:layoutMode()
+  local next_ = (cur == "bar_side") and "bar_bottom" or (cur == "bar_bottom" and "bar_side" or "bar_bottom")
+  return self:setMode(next_)
+end
+
 -- 工作图片缩略图 + "＋"（打开一张新的）。返回占用的宽度。
 function Panel:_drawWork(gc, x, y, box)
   gc.color = FRAME
@@ -1038,6 +1086,8 @@ function Panel:_onBarMouseDown(ev)
     if self.opts.onAction then self.opts.onAction("open_file") end
   elseif hit.kind == "ctx" then
     if self.opts.onAction then self.opts.onAction("ctx_info") end
+  elseif hit.kind == "dock" then
+    self:toggleDock()
   end
   return true          -- 命中控件 = 不要再把焦点抢给输入框
 end
@@ -1067,20 +1117,9 @@ function Panel:_paintBar(gc)
   local rows = math.max(1, math.floor(h / rowH))
   local y = 2
 
-  self.barHit = {}
-  self.thinkTrack = nil
-
-  -- 控件都摆在【输入行】上（和输入框同一行、右对齐），不额外占高度：
-  -- 缩略图 + ＋ + 20 格电量条 + 思考滑杆，一共约 200px 宽、16px 高。
-  -- 放不下（窗口太窄）就整体不画 —— 宁可只留文字，也别把输入框挤没。
-  local clusterBase = THUMB_BOX + 2 + THUMB_BOX + 6
-    + (CTX_CELLS * (CTX_CELL_W + CTX_CELL_GAP)) + 8 + THINK_TRACK_W + 6
-  local clusterW = clusterBase + 4 + 48
-  local ctxLabel = true
-  if clusterW > w - 180 then
-    clusterW, ctxLabel = clusterBase, false   -- 窄了就先去掉 "8.2k/16k" 这个文字标签
-  end
-  if clusterW > w - 130 then clusterW = 0 end
+  -- 控件都摆在【输入行】上（和输入框同一行、右对齐），不额外占高度。
+  -- 预算算法和面板模式共用（_clusterPlan），保证切形态不会"少东西"。
+  local clusterW, ctxLabel = self:_clusterPlan(w, 130)
 
   -- 1) 状态行
   gc.color = STATUS_COLORS[self.statusKind or "ok"] or STATUS
@@ -1112,6 +1151,9 @@ function Panel:_paintBar(gc)
   local mark = i18n.promptMark()
   local markW = self:_textWidth(gc, mark)
   local inputY = math.max(y, h - rowH)
+  -- 窗口矮到放不下状态行+输入行时，宁可让它们重叠，也不能把输入行（和它上面的控件）
+  -- 画到画布外 —— 用户看到的会是"控件不见了"。
+  if inputY + rowH > h then inputY = math.max(0, h - rowH) end
   gc.color = USER
   gc:fillText(mark, 6, inputY)
   local shown = tostring(self.input or "")
@@ -1128,11 +1170,8 @@ function Panel:_paintBar(gc)
 
   -- 4) 控件：就和输入行同高、右对齐（"和输入框一个地方"）
   if clusterW > 0 then
-    local cy = inputY + math.floor((rowH - THUMB_BOX) / 2)
-    local cx = w - clusterW + 2
-    cx = cx + self:_drawWork(gc, cx, cy, THUMB_BOX) + 6
-    cx = cx + self:_drawCtx(gc, cx, inputY + math.floor((rowH - CTX_CELL_H_LINE) / 2), ctxLabel) + 8
-    self:_drawThink(gc, cx, inputY + math.floor((rowH - CTX_CELL_H_LINE) / 2))
+    self:_drawCluster(gc, w - clusterW + 2,
+      inputY + math.floor((rowH - CTX_CELL_H_LINE) / 2), clusterW, ctxLabel)
   end
 
   self.dbg = string.format("bar mode=%s w=%d h=%d rows=%d ctx=%d/%d think=%s",
@@ -1578,6 +1617,8 @@ end
 function Panel:_paint(gc)
   local w, h = gc.width, gc.height
   self.canvasW, self.canvasH = w, h
+  self.barHit = {}
+  self.thinkTrack = nil
 
   -- 栏模式下底色可配置（G5）：Aseprite 读不到主题色（实测真名假名都返回 0,0,0），
   -- 所以给用户一个填色口来贴合自己的主题；没填就用面板默认深色。
@@ -1620,7 +1661,10 @@ function Panel:_paint(gc)
   ----------------------------------------------------------------------
   local mark = i18n.promptMark()
   local markW = self:_textWidth(gc, mark)
-  local availW = w - 18 - markW
+  -- 输入行右侧要留出控件区（工作图片 / 电量条 / 思考滑杆 / 贴边切换）——
+  -- 这三种形态（面板、底边栏、侧边栏）都得有，否则"切形态就少东西"。
+  local clusterW, ctxLabel = self:_clusterPlan(w, 150)
+  local availW = w - 18 - markW - clusterW
 
   local inputRows
   if tostring(self.input or "") == "" then
@@ -1631,7 +1675,7 @@ function Panel:_paint(gc)
   while #inputRows > INPUT_MAX_ROWS do table.remove(inputRows, 1) end   -- 太长只留尾部
 
   local inputH = #inputRows * rowH
-  local inputTop = h - 6 - inputH
+  local inputTop = math.max(2, h - 6 - inputH)
   local caretX, caretY = nil, nil
 
   for i, r in ipairs(inputRows) do
@@ -1651,9 +1695,16 @@ function Panel:_paint(gc)
     gc.color = USER
     gc:fillRect(Rectangle(caretX + 1, caretY, 5, lh))
   end
-  self.dbg = string.format("w=%d h=%d lh=%d rowH=%d rows=%d markW=%d availW=%d inputTop=%d caret=(%s,%s) textLen=%d textW=%d",
+
+  -- 控件就摆在输入行这一行（和光标同一行，右对齐）
+  if clusterW > 0 and caretY then
+    local lineY = caretY - math.floor((CTX_CELL_H_LINE - lh) / 2)
+    self:_drawCluster(gc, w - clusterW + 2, lineY, clusterW, ctxLabel)
+  end
+
+  self.dbg = string.format("w=%d h=%d lh=%d rowH=%d rows=%d markW=%d availW=%d inputTop=%d caret=(%s,%s) textLen=%d textW=%d cls=%d",
     w, h, lh, rowH, #inputRows, markW, availW, inputTop, tostring(caretX), tostring(caretY),
-    #(self.input or ""), caretX and (caretX - 6 - markW) or -1)
+    #(self.input or ""), caretX and (caretX - 6 - markW) or -1, clusterW)
 
   ----------------------------------------------------------------------
   -- 2) 状态行（最上面）：转圈 + 状态文本 + 当前文件 + 小面板/滚动标记

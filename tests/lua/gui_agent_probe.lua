@@ -163,6 +163,42 @@ step("栏内控件：点滑杆真的改档（真鼠标事件路径）", function
   a.panel:setThinking("auto")      -- 还原，别把探针状态留脏
 end)
 
+step("三种形态都要有控件（用户报的 bug：切形态就少东西）", function()
+  local missing = {}
+  for _, m in ipairs({ "panel", "bar_bottom", "bar_side" }) do
+    a.panel:setMode(m, true)
+    if m == "panel" then
+      a.panel:setContext(5000, 16000)
+      a.panel:setThinking("medium")
+    end
+    a.panel.dlg:repaint()
+    local kinds = {}
+    for _, h in ipairs(a.panel.barHit or {}) do kinds[h.kind] = true end
+    say("    %s -> %s", m, (kinds.work and "图" or "-") .. (kinds.open and "＋" or "-")
+      .. (kinds.ctx and "电量" or "-") .. (kinds.think and "滑杆" or "-") .. (kinds.dock and "贴边" or "-"))
+    if not (kinds.work and kinds.open and kinds.ctx and kinds.think and kinds.dock) then
+      missing[#missing + 1] = m
+    end
+  end
+  assert(#missing == 0, "这些形态缺控件：" .. table.concat(missing, ","))
+end)
+step("贴边按钮：点一下真的切形态", function()
+  a.panel:setMode("bar_bottom", true)
+  a.panel.dlg:repaint()
+  local dock
+  for _, h in ipairs(a.panel.barHit or {}) do if h.kind == "dock" then dock = h end end
+  assert(dock, "找得到贴边按钮")
+  a.panel:_onCanvasMouseDown{ button = MouseButton.LEFT, x = dock.x + 2, y = dock.y + 2 }
+  local b = a.panel.dlg.bounds
+  say("    点后形态 = %s bounds=%dx%d", a.panel:layoutMode(), b.width, b.height)
+  assert(a.panel:layoutMode() == "bar_side", "贴底 -> 贴侧边，实际 " .. a.panel:layoutMode())
+  a.panel.dlg:repaint()
+  local dock2
+  for _, h in ipairs(a.panel.barHit or {}) do if h.kind == "dock" then dock2 = h end end
+  a.panel:_onCanvasMouseDown{ button = MouseButton.LEFT, x = dock2.x + 2, y = dock2.y + 2 }
+  assert(a.panel:layoutMode() == "bar_bottom", "贴侧边 -> 贴底，实际 " .. a.panel:layoutMode())
+end)
+
 -- 停在底边栏给外部截图（run_gui_agent.sh 在 ~4s 截），8 秒后自己关
 step("停在底边栏等待截图", function()
   a.panel:setMode("bar_bottom")
