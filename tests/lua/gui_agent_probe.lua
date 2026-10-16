@@ -246,6 +246,23 @@ step("最小化：真窗口真的变小，还原后回原形态", function()
   say("    小窗里的控件：%s%s%s%s%s", kinds.work and "图" or "-", kinds.ctx and "电量" or "-",
     kinds.think and "滑杆" or "-", kinds.dock and "贴边" or "-", kinds.small and "还原" or "-")
   assert(kinds.work and kinds.ctx and kinds.think and kinds.small, "小窗里控件齐全")
+
+  -- 小窗必须留出输入行（gaps.md #2）：原生 Entry 只当输入点，正文由画布画，
+  -- 所以画布不留输入行 = 最小化后打字看不见。真字体下也要有地方放。
+  local rowH = tonumber(tostring(a.panel.dbg):match("h=(%d+)")) or 0
+  local lh = a.panel.lineH or 12
+  say("    小窗画布 %dx%d lineH=%s", a.panel.canvasW or 0, rowH, tostring(lh))
+  assert(rowH >= lh * 2 + 4, "小窗画布够高（状态行 + 输入行）：h=" .. rowH)
+
+  -- 还原带不能压住控件：_barHitAt 取第一个命中，压住了控件就点不动
+  local band, leftmost
+  for _, h in ipairs(a.panel.barHit or {}) do
+    if h.kind == "restore" then band = h
+    elseif not leftmost or h.x < leftmost.x then leftmost = h end
+  end
+  assert(band and leftmost and band.x + band.w <= leftmost.x,
+    "还原带在控件左边不重叠")
+
   -- 点还原按钮
   local s
   for _, h in ipairs(a.panel.barHit or {}) do if h.kind == "small" then s = h end end

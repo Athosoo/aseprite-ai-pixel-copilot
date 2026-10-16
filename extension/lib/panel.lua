@@ -52,7 +52,10 @@ local MODE_CANVAS = {
   panel      = { w = CANVAS_W, h = CANVAS_H },
   bar_bottom = { w = 1000, h = 60 },
   bar_side   = { w = 320, h = 420 },
-  small      = { w = 320, h = 44 },   -- 最小化小窗：状态一行 + 控件一行
+  -- 最小化小窗：状态 + 控件一行，**输入行一行**。
+  -- 输入行不能省：原生 Entry 只是"输入点"（IME 靠它），正文一律由画布画（中文在
+  -- ui::Entry 里上下会被切掉一半），所以画布不画输入行 = 最小化后打字看不见。
+  small      = { w = 360, h = 56 },
 }
 local MODE_ORDER = { "panel", "bar_bottom", "bar_side", "small" }
 
@@ -1214,34 +1217,56 @@ function Panel:_onBarMouseUp()
 end
 
 
--- 最小化小窗：上面一行状态，下面一行控件（和别处同一套格子）。
--- 点状态那行 = 还原；控件行末尾那颗就是还原按钮 —— 任何时候都能回去，不会变成死胡同。
+-- 最小化小窗：上面一行状态 + 控件，下面一行输入（**输入行必须画**，见 MODE_CANVAS 的注释）。
+-- 点状态行左侧 = 还原；控件行末尾那颗也是还原 —— 任何时候都能回去，不会变成死胡同。
 function Panel:_paintSmall(gc)
   local w, h = gc.width, gc.height
   local szC = gc:measureText("中")
   local szL = gc:measureText("Ag")
   local lh = math.max(10, (szL and szL.height or 12), (szC and szC.height or 12))
+  self.lineH = lh
   local rowH = math.max(lh, math.floor(lh * ROW_FACTOR + 0.5))
 
-  -- 1) 状态行（点它也能还原）
-  local statusY = 2
+  -- 1) 控件先画、命中区先登记：它们占状态行右端。
+  --    顺序很重要 —— _barHitAt 取**第一个**命中，先登记的"整行还原带"会把控件点击吞掉。
+  local plan = self:_clusterPlan(gc, w, 100)
+  local midY = 2 + math.floor(rowH / 2)
+  if plan then
+    self:_drawCluster(gc, w - plan.w - 4, midY, plan)
+  else
+    self:_drawSmallOnly(gc, w, midY)      -- 再挤也要给一个"还原"
+  end
+  local clusterX = plan and (w - plan.w - 4) or (w - CELL - 2)
+
+  -- 2) 状态行：文本只占控件左边剩下的宽度（放不下就裁，不往控件上压）
   gc.color = STATUS_COLORS[self.statusKind or "ok"] or STATUS
   local spin = ""
   if self.busy then spin = SPIN_FRAMES[self.spinIdx or 1] .. " " end
   local docSuffix = ""
   if self.docName and self.docName ~= "" then docSuffix = " ｜ " .. tostring(self.docName) end
   local text = spin .. string.format(i18n.t("statusBar"), self.status) .. docSuffix
-  gc:fillText(self:_clipToWidth(gc, text, w - 12, false), 6, statusY)
-  self.barHit[#self.barHit + 1] = { kind = "restore", x = 0, y = 0, w = w, h = rowH + 2 }
+  gc:fillText(self:_clipToWidth(gc, text, math.max(20, clusterX - 8), false), 6, 2)
+  self.barHit[#self.barHit + 1] = { kind = "restore", x = 0, y = 0,
+    w = math.max(1, clusterX - 2), h = rowH + 2 }
 
-  -- 2) 控件行
-  local midY = math.max(statusY + rowH + 10, h - 12 - math.floor(CELL / 2))
-  if midY + math.floor(CELL / 2) > h then midY = h - math.floor(CELL / 2) end
-  local plan = self:_clusterPlan(gc, w, 40)
-  if plan then
-    self:_drawCluster(gc, w - plan.w - 4, midY, plan)
+  -- 3) 输入行（贴底，整幅宽）：最小化后照样能打字，而且看得见自己打了什么
+  local mark = i18n.promptMark()
+  local markW = self:_textWidth(gc, mark)
+  local inputY = math.max(2 + rowH, h - lh - 4)
+  -- 窗口矮到放不下两行时，宁可让输入行压住状态行，也不能画到画布外（= 什么都看不见）
+  if inputY + lh > h - 2 then inputY = math.max(0, h - lh - 2) end
+  gc.color = USER
+  gc:fillText(mark, 6, inputY)
+  local shown = tostring(self.input or "")
+  local inputMaxW = math.max(20, w - 18 - markW)
+  if shown == "" then
+    gc.color = DIM
+    gc:fillText(self:_clipToWidth(gc, i18n.t("smallHint"), inputMaxW, false), 6 + markW, inputY)
   else
-    self:_drawSmallOnly(gc, w, midY)      -- 再挤也要给一个"还原"
+    shown = self:_clipToWidth(gc, shown, inputMaxW, true)
+    gc.color = USER
+    gc:fillText(shown, 6 + markW, inputY)
+    gc:fillRect(Rectangle(6 + markW + self:_textWidth(gc, shown) + 1, inputY, 5, lh))
   end
 
   self.dbg = string.format("small w=%d h=%d rows=2 ctx=%d/%d think=%s",
@@ -1266,6 +1291,7 @@ function Panel:_paintBar(gc)
   local minTextW = (self:layoutMode() == "bar_side") and 60 or 130
   local plan = self:_clusterPlan(gc, w, minTextW)
   local clusterW = plan and plan.w or 0
+  self.lineH = lh
 
   -- 1) 状态行
   gc.color = STATUS_COLORS[self.statusKind or "ok"] or STATUS

@@ -30,12 +30,18 @@ end
 -- 假的 GraphicsContext：_paint 只用到 measureText / fillRect / fillText / drawImage / width / height
 -- rects 收集被填充的矩形（栏内控件的格子数靠它数）
 local function fakeGC(w, h)
-  local g = { width = w, height = h, color = nil, rects = {}, images = {} }
+  local g = { width = w, height = h, color = nil, rects = {}, images = {}, texts = {} }
   g.measureText = function(_, s) return { width = #tostring(s) * 6, height = 12 } end
   g.fillRect = function(_, rc) g.rects[#g.rects + 1] = rc end
-  g.fillText = function() end
+  g.fillText = function(_, s, x, y) g.texts[#g.texts + 1] = { text = tostring(s), x = x, y = y } end
   g.drawImage = function(_, img, x, y) g.images[#g.images + 1] = { img = img, x = x, y = y } end
   return g
+end
+
+-- 画布上有没有出现过这段文字（只看文本，不看位置）
+local function drewText(gc, s)
+  for _, t in ipairs(gc.texts or {}) do if t.text == s then return true end end
+  return false
 end
 
 -- 造一张假"合成图"：给面板当工作图片缩略图的来源（32x32，右下角一个红点）
@@ -754,7 +760,7 @@ do
   ok(p.lastMode == "panel", "记住了从面板来的，实际 " .. tostring(p.lastMode))
 
   -- 小窗里要画出控件 + 还原入口
-  local gc = fakeGC(320, 44)
+  local gc = fakeGC(360, 56)
   p:_paint(gc)
   local kinds = {}
   for _, b in ipairs(p.barHit) do kinds[b.kind] = true end
@@ -763,9 +769,53 @@ do
   ok(kinds.restore ~= nil, "点状态行也能还原（大目标）")
   local bad = {}
   for _, b in ipairs(p.barHit) do
-    if b.x < 0 or b.y < 0 or b.x + b.w > 320 or b.y + b.h > 44 then bad[#bad + 1] = b.kind end
+    if b.x < 0 or b.y < 0 or b.x + b.w > 360 or b.y + b.h > 56 then bad[#bad + 1] = b.kind end
   end
   ok(#bad == 0, "小窗里控件都在画布内，越界的：" .. table.concat(bad, " "))
+
+  -- 还原带不能盖住控件：_barHitAt 取第一个命中，盖住了就等于控件点不动
+  local restoreBand, firstCell
+  for _, b in ipairs(p.barHit) do
+    if b.kind == "restore" then restoreBand = b end
+    if b.kind == "work" then firstCell = b end
+  end
+  ok(restoreBand.x + restoreBand.w <= firstCell.x,
+    string.format("还原带在控件左边，不重叠（带右端 %d，控件左端 %d）",
+      restoreBand.x + restoreBand.w, firstCell.x))
+  local hitWork = p:_barHitAt(firstCell.x + 2, firstCell.y + 2)
+  ok(hitWork and hitWork.kind == "work", "点第一颗控件命中的是它自己，不是还原带")
+
+  -- 输入行：小窗也要把正文画出来（原生 Entry 只当输入点，正文全靠画布）
+  p.input = ""
+  local gHint = fakeGC(360, 56)
+  p:_paint(gHint)
+  ok(drewText(gHint, i18n.t("smallHint")), "空输入时小窗画提示语：" .. tostring(i18n.t("smallHint")))
+
+  p.input = "画个红苹果"
+  local gType = fakeGC(360, 56)
+  p:_paint(gType)
+  ok(drewText(gType, "画个红苹果"), "最小化后打进去的字看得见（这是 gaps.md #2）")
+  local caret = nil
+  for _, rc in ipairs(gType.rects) do if rc.width == 5 then caret = rc end end
+  ok(caret ~= nil, "小窗里有光标")
+  if caret then
+    local inputY = caret.y
+    local statusY = 2
+    ok(inputY > statusY, "光标在状态行下面（不在同一行）：" .. inputY)
+    ok(inputY + caret.height <= 56, "光标没画到画布外")
+  end
+
+  -- 点输入行 = 把焦点给输入框（不是触发还原）
+  local hitsBefore = #p.barHit
+  p.dlg = { modify = function() end, repaint = function() end }
+  p.shown = true
+  p.inputFocused = false
+  local focused = false
+  p.dlg.modify = function(_, t) if t and t.focus then focused = true end end
+  p:_onCanvasMouseDown{ button = MouseButton.LEFT, x = 200, y = 50 }
+  ok(focused, "点小窗的输入行 -> 焦点回到输入框（可以接着打字）")
+  ok(p:layoutMode() == "small", "点输入行不会把窗口还原掉，实际 " .. p:layoutMode())
+  ok(hitsBefore > 0, "（前置：上一帧确实登记过命中区）")
 
   -- 点还原按钮（控件行末尾那颗）-> 回到面板
   local smallHit
@@ -784,7 +834,7 @@ do
   p:toggleSmall()
   p.dlg = { modify = function() end, repaint = function() end }
   p.shown = true
-  local g2 = fakeGC(320, 44)
+  local g2 = fakeGC(360, 56)
   p:_paint(g2)
   local restore
   for _, b in ipairs(p.barHit) do if b.kind == "restore" then restore = b end end
@@ -801,6 +851,11 @@ do
     if b.kind == "small" or b.kind == "restore" then hasRestore = true end
   end
   ok(hasRestore, "窗口窄到 120 也还能点回还原（不是死胡同）")
+  -- 窄到没有控件位置时，输入行也还得画（否则最小化 = 打字看不见）
+  q.input = "hi"
+  local g4 = fakeGC(120, 30)
+  q:_paint(g4)
+  ok(drewText(g4, "hi"), "再窄的小窗也画出输入正文")
 end
 
 print("== 控件几何：方块等高、不超出自己的框和画布 ==")

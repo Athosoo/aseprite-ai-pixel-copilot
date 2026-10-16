@@ -452,9 +452,15 @@ STATUS.md             当前进度、踩坑记录、下一步
 
 - **贴边切换按钮**：图标是「小窗口 + 贴住底边/右边的高亮」，点一下在 **贴底 ⇄ 贴侧边** 之间切
   （面板模式下点它 = 去贴底）。
-- **最小化按钮**：收成一个 **320x44 的小窗**（上面一行状态、下面一行控件）。小窗里点**状态行**
-  或那颗**还原**方块都能回去，回到最小化之前的形态。`B` 键 / `栏` 命令的循环现在是四态：
+- **最小化按钮**：收成一个 **360x56 的小窗**（上面一行状态 + 控件、下面一行输入）。
+  小窗里**照样能直接打字下指令**，点输入行就把焦点给输入框；点**状态行左侧**或那颗**还原**方块
+  都能回去，回到最小化之前的形态。`B` 键 / `栏` 命令的循环现在是四态：
   面板 → 贴底 → 贴侧边 → 小窗。
+
+> 小窗为什么必须自己画一行输入：原生 `Entry` 只是"输入点"（中文输入法只有它会开），
+> **正文一律由画布画** —— 中文在 `ui::Entry` 里上下会被切掉一半（实测截图
+> `tests/lua/entry_cjk_zoom.png`）。所以画布不留输入行 = 最小化以后打字看不见，
+> 这是 v0.5.6 记进 `bridge/data/gaps.md` 的一条，v0.5.7 补上。
 
 所有方块统一 16x16、间距 6px、同一条中线对齐；宽度是**实测**出来的（中文标签、字体高度都量），
 所以不会出现"文字顶出框外"或"控件超出画布"——无头和真 GUI 两种字体下都有断言守着。
@@ -539,11 +545,12 @@ python tools/bdf2ttf.py <字体.bdf> -o fusion-pixel-10px.ttf --family "Fusion P
   "插入了什么 / 是否退格"，所以把光标 ←/→ 移到中间改字是无效的。
   退格能连续删（这条修过：`Entry::onSetText` 不会把光标挪到末尾，
   详见 STATUS.md）。要真正的中间编辑，得等 Aseprite 把 Entry 的光标 API 暴露给 Lua。
-- **为什么输入行没画进画布**：Aseprite 里唯一会开输入法（IME）的控件是 `ui::Entry` /
-  `ui::TextEdit`，而"开 IME"的开关没有暴露给 Lua（只有 C++ 能调 `setTextInput`），
-  自绘的输入行收不到中文合成字符 —— 等于中文打不了字。所以这里是"Entry 当提示行 +
-  canvas 当屏幕"：回显、彩色输出、命令表、悬浮高亮、小面板全部自绘，输入行保留原生 Entry
-  （素边框 + 同底色），中文能打，观感与终端一致。要"光标直接画进画布 + 中文输入"
+- **输入行为什么要"原生 Entry + 画布"两处**：Aseprite 里唯一会开输入法（IME）的控件是
+  `ui::Entry` / `ui::TextEdit`，而"开 IME"的开关没有暴露给 Lua（只有 C++ 能调 `setTextInput`），
+  自绘的输入行收不到中文合成字符 —— 等于中文打不了字。所以分工是**原生 Entry 当输入点**
+  （中文能打、素边框 + 同底色），**正文由画布画**（中文在 `ui::Entry` 里上下会被切掉一半，
+  见 `tests/lua/entry_cjk_zoom.png`）。**每个形态的画布都必须画出输入行** —— 漏了就等于
+  "打字看不见"（v0.5.6 小窗就是这么漏的）。要"光标直接画进画布 + 中文输入"
   得改 Aseprite 源码（给 canvas 开 IME 或加控件）。
 - 命令表悬浮高亮用的是 canvas 的鼠标事件（`onmousemove`）；键盘 ↑/↓ 只在
   输入框/控制台拿到焦点时才翻历史。
@@ -567,27 +574,31 @@ python tools/bdf2ttf.py <字体.bdf> -o fusion-pixel-10px.ttf --family "Fusion P
 ```bash
 # 无头单测（命令表排版 / 输入模型 / 历史 / 矫正队列）
 aseprite.exe -b --script tests/lua/menu_test.lua      # 89 项
-aseprite.exe -b --script tests/lua/ops_test.lua       # 31 项
+aseprite.exe -b --script tests/lua/ops_test.lua       # 52 项
 aseprite.exe -b --script tests/lua/versions_test.lua  # 20 项
 aseprite.exe -b --script tests/lua/sizelib_test.lua   # 23 项（裁剪/缩放/包围盒）
-aseprite.exe -b --script tests/lua/artlib_test.lua    # 30 项（字符网格作画）
-aseprite.exe -b --script tests/lua/artop_test.lua     # 63 项（协议层：桥的消息 -> 真动画布）
-aseprite.exe -b --script tests/lua/panel_test.lua     # 75 项（滚轮/状态转圈/Esc 中断/选项输入/三种形态）
+aseprite.exe -b --script tests/lua/artlib_test.lua    # 40 项（字符网格作画）
+aseprite.exe -b --script tests/lua/artop_test.lua     # 72 项（协议层：桥的消息 -> 真动画布）
+aseprite.exe -b --script tests/lua/panel_test.lua     # 204 项（滚轮/状态转圈/Esc 中断/选项输入/四种形态/控件几何）
+aseprite.exe -b --script tests/lua/settings_test.lua  # 36 项（设置窗：步数/上下文/温度/思考强度）
 aseprite.exe -b --script tests/lua/path_test.lua      # 安装路径机制
-aseprite.exe -b --script tests/lua/workspace_test.lua # 80 项（工作区：备份/副本/交付/打开/上传，用真文件）
+aseprite.exe -b --script tests/lua/workspace_test.lua # 177 项（工作区：备份/副本/交付/打开/上传，用真文件）
 
 # 桥的自测（mock LLM + mock Aseprite，不联网、不花 token）
-cd bridge && npm test                                 # 266 项，跑下面四个
-node test/selftest.mjs                                # 58 项（端到端：桥 <-> 假 LLM <-> 假 Aseprite）
+cd bridge && npm test                                 # 382 项，跑下面六个
+node test/selftest.mjs                                # 100 项（端到端：桥 <-> 假 LLM <-> 假 Aseprite）
 node test/memory_test.mjs                             # 23 项（记忆库）
-node test/styles_test.mjs                             # 41 项（风格库：优先级/清洗/只注入当前）
-node test/tools_test.mjs                              # 144 项（24 个工具的分发 + 幂等 + 能力清单交叉核对）
+node test/styles_test.mjs                             # 47 项（风格库：优先级/清洗/只注入当前）
+node test/tools_test.mjs                              # 180 项（25 个工具的分发 + 幂等 + 能力清单交叉核对）
+node test/history_test.mjs                            # 19 项（上下文：预算/压缩/摘要失败不丢原文）
+node test/gaps_test.mjs                               # 13 项（做不到清单：去重计数/淘汰/已处理段保留/CLI）
 
 # GUI 可视化验证（会短暂弹 Aseprite 窗口并自动截图）
 bash tests/run_gui_visual.sh --term        # 终端面板 + 命令表 + 小面板
 bash tests/run_key_test.sh                 # 真键盘：预填 abc 再发 3 次退格，看是否删空
 bash tests/run_gui_resize.sh               # 窗口尺寸行为（点一下跳不跳、能缩多小）
 bash tests/run_gui_bar.sh                  # 三种形态的窗口尺寸 + 底边栏截图
+bash tests/run_gui_agent.sh                # 四种形态的控件几何 + 小窗两行高（真字体）
 ```
 
 四个探针脚本（`tests/lua/*_probe.lua`）是"只能靠真 Aseprite 才能问出答案"的那些问题的

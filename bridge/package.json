@@ -1,6 +1,6 @@
 {
   "name": "ai-pixel-bridge",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "private": true,
   "type": "module",
   "description": "Aseprite AI Pixel Copilot 的本地桥：WebSocket 服务 + OpenAI 兼容 LLM 调用 + 工具注册表 + 色值/通用记忆库 + 风格库",
@@ -8,7 +8,7 @@
     "start": "node src/server.mjs",
     "selftest": "node test/selftest.mjs",
     "build:pp": "node scripts/build-pp.mjs",
-    "test": "node test/selftest.mjs && node test/memory_test.mjs && node test/styles_test.mjs && node test/tools_test.mjs"
+    "test": "node test/selftest.mjs && node test/memory_test.mjs && node test/styles_test.mjs && node test/tools_test.mjs && node test/history_test.mjs && node test/gaps_test.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
