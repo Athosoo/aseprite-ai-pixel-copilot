@@ -89,6 +89,13 @@ local function alphaAt(src, stride, x, y, w, h)
   return src:byte(y * stride + x * 4 + 4)
 end
 
+-- 四舍五入并夹到 0..255（逐通道算子都要用）
+local function clamp255(v)
+  if v <= 0 then return 0 end
+  if v >= 255 then return 255 end
+  return math.floor(v + 0.5)
+end
+
 ----------------------------------------------------------------------
 -- 算子
 ----------------------------------------------------------------------
@@ -378,6 +385,75 @@ local function op_quantize(img, o, sprite)
   return changed, report
 end
 
+-- 锐化边缘：3x3 非锐化掩模（unsharp mask）。
+-- 新值 = 原值 + amount * (原值 - 3x3 均值)。均值只统计【不透明】邻居：
+-- 把透明邻居算进去的话，剪影边缘会被拉出一条灰边（这是修图工具上常见的老毛病）。
+-- alpha 一律不动 —— 像素画的"锐"是 RGB 的对比，不是透明度。
+-- threshold 是"忽略带"：局部差异小于它的像素不动，用来保护本来就平的地方，
+-- 免得把噪点（或抖动网点的颗粒）一起放大。
+local function op_sharpen(img, o)
+  local amount = tonumber(o.amount) or 1.0
+  if amount < 0 then error("sharpen: 'amount' must be >= 0 (1 = standard)") end
+  local threshold = tonumber(o.threshold) or 0
+  if threshold < 0 then threshold = 0 end
+  local w, h, stride = img.width, img.height, img.rowStride
+  local region = util.normRegion(o.region, w, h)
+  if region.w <= 0 or region.h <= 0 then return 0 end
+  if region.w * region.h > MAX_REGION_PIXELS then
+    error(string.format("sharpen: region too large: %dx%d (limit 512x512). Narrow it down first.",
+      region.w, region.h))
+  end
+  local src = img.bytes
+  return transform(img, region, function(x, y, r, g, b, a)
+    if a == 0 then return nil end
+    local sr, sg, sb, n = 0, 0, 0, 0
+    for dy = -1, 1 do
+      local ny = y + dy
+      if ny >= 0 and ny < h then
+        for dx = -1, 1 do
+          local nx = x + dx
+          if nx >= 0 and nx < w then
+            local p = ny * stride + nx * 4 + 1
+            local nr, ng, nb, na = src:byte(p, p + 3)
+            if na > 0 then
+              sr, sg, sb, n = sr + nr, sg + ng, sb + nb, n + 1
+            end
+          end
+        end
+      end
+    end
+    if n == 0 then return nil end
+    local dr, dg, db = r - sr / n, g - sg / n, b - sb / n
+    if math.abs(dr) <= threshold and math.abs(dg) <= threshold and math.abs(db) <= threshold then
+      return nil
+    end
+    local nr = clamp255(r + amount * dr)
+    local ng = clamp255(g + amount * dg)
+    local nb = clamp255(b + amount * db)
+    if nr == r and ng == g and nb == b then return nil end
+    return nr, ng, nb, a
+  end)
+end
+
+-- 加强（或减弱）明暗对比：以 pivot（默认 128，中灰）为轴把每个通道乘开。
+-- amount > 1 拉开、< 1 压平；只动 RGB，alpha 原样 —— 所以透明区域和剪影形状不受影响。
+-- 逐通道而不是只算亮度：像素画的"立体感"多半来自同一色相的明暗档，逐通道更贴近
+-- 手绘时"把暗部再压暗一档"的做法，也不会把色相整体拽偏。
+local function op_contrast(img, o)
+  local amount = tonumber(o.amount)
+  if amount == nil then amount = 1.3 end
+  if amount <= 0 then error("contrast: 'amount' must be > 0 (1 = unchanged, 1.3 = +30%)") end
+  local pivot = tonumber(o.pivot) or 128
+  return transform(img, o.region, function(x, y, r, g, b, a)
+    if a == 0 then return nil end
+    local nr = clamp255(pivot + (r - pivot) * amount)
+    local ng = clamp255(pivot + (g - pivot) * amount)
+    local nb = clamp255(pivot + (b - pivot) * amount)
+    if nr == r and ng == g and nb == b then return nil end
+    return nr, ng, nb, a
+  end)
+end
+
 local OPS = {
   replace_color = { fn = op_replace_color, desc = "replace pixels of one colour with another (tolerance absorbs anti-aliased edges)" },
   erase_color   = { fn = op_erase_color,   desc = "make pixels of one colour transparent" },
@@ -387,6 +463,8 @@ local OPS = {
   despeckle     = { fn = op_despeckle,     desc = "delete isolated blobs up to maxCluster pixels (1 = single stray pixel)" },
   palette_map   = { fn = op_palette_map,   desc = "remap colours by { old: new } and update the palette too" },
   quantize      = { fn = op_quantize,      desc = "reduce the number of colours to N by median cut (merges similar colours); use it for \"too many colours / simplify the palette / merge to 64 colours\"; also rewrites the palette" },
+  sharpen       = { fn = op_sharpen,       desc = "sharpen edges: 3x3 unsharp mask on RGB, alpha untouched; use it for \"sharpen / crisp up the edges / make it less blurry\" (amount 1 = standard, 2+ = aggressive; threshold 0-255 leaves flat areas alone)" },
+  contrast      = { fn = op_contrast,      desc = "raise or lower light/dark contrast: pushes every channel away from pivot (default 128) by amount (1.3 = +30%, 1 = unchanged, 0.5 = flatter); alpha untouched; use it for \"more contrast / darker shadows, brighter highlights / flat looking\"" },
 }
 
 ops.names = {}

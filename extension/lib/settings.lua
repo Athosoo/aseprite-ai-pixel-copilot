@@ -36,12 +36,17 @@ function Settings:_fill(current, wsRoot, barBg)
     contextTokens = tostring(current.contextTokens or 16000),
     temperature = tostring(current.temperature or 0.2),
     thinking = current.thinking or "auto",
+    -- 超时桥那边按毫秒存，界面上按秒填（用户想的是"多少秒"，不是"多少毫秒"）
+    timeoutSec = tostring(math.floor((tonumber(current.timeoutMs) or 180000) / 1000)),
+    maxTurnSec = tostring(math.floor((tonumber(current.maxTurnMs) or 600000) / 1000)),
   }
   pcall(function() self.dlg:modify{ id = "baseUrl", text = data.baseUrl } end)
   pcall(function() self.dlg:modify{ id = "model", text = data.model } end)
   pcall(function() self.dlg:modify{ id = "maxSteps", text = data.maxSteps } end)
   pcall(function() self.dlg:modify{ id = "contextTokens", text = data.contextTokens } end)
   pcall(function() self.dlg:modify{ id = "temperature", text = data.temperature } end)
+  pcall(function() self.dlg:modify{ id = "timeoutSec", text = data.timeoutSec } end)
+  pcall(function() self.dlg:modify{ id = "maxTurnSec", text = data.maxTurnSec } end)
   pcall(function() self.dlg:modify{ id = "thinking", option = data.thinking } end)
   pcall(function() self.dlg:modify{ id = "wsRoot", text = tostring(self.opts.wsRoot or "") } end)
   pcall(function() self.dlg:modify{ id = "barBg", text = tostring(self.opts.barBg or "") } end)
@@ -133,6 +138,15 @@ function Settings:show(current, wsRoot, barBg)
                 options = { "auto", "low", "medium", "high" }, width = 120 }
   dlg:newrow()
 
+  dlg:label{ text = i18n.t("advTimeout") }
+  dlg:samerow()
+  dlg:entry{ id = "timeoutSec", text = "180", width = 70 }
+  dlg:samerow()
+  dlg:label{ text = i18n.t("advTurn") }
+  dlg:samerow()
+  dlg:entry{ id = "maxTurnSec", text = "600", width = 70 }
+  dlg:newrow()
+
   dlg:label{ text = i18n.t("advHint") }
   dlg:newrow()
 
@@ -163,6 +177,11 @@ function Settings:_values()
   if steps then out.maxSteps = steps end
   if ctx then out.contextTokens = ctx end
   if temp then out.temperature = temp end
+  -- 秒 -> 毫秒。桥那边还会再夹一次范围（10-1800s / 30-3600s），
+  -- 这里不夹是故意的：手填了 0.5 也该让桥去决定怎么处理，而不是悄悄改成别的数。
+  local tmo, tturn = num(d.timeoutSec), num(d.maxTurnSec)
+  if tmo then out.timeoutMs = math.floor(tmo * 1000) end
+  if tturn then out.maxTurnMs = math.floor(tturn * 1000) end
   local think = tostring(d.thinking or "")
   if think ~= "" then out.thinking = think end
   return out, tostring(d.wsRoot or ""), tostring(d.barBg or "")

@@ -76,6 +76,39 @@ do
   check("baseUrl 照旧传", llm.baseUrl == "u")
 end
 
+-- ---------------------------------------------------------------- 超时（界面填秒，桥收毫秒）
+do
+  local s = newSettings()
+  s.dlg = fakeDlg{ baseUrl = "u", model = "m", apiKey = "", timeoutSec = "300", maxTurnSec = "900" }
+  local llm = s:_values()
+  check("单次超时按毫秒传给桥（界面填秒）", llm.timeoutMs == 300000, llm.timeoutMs)
+  check("整轮超时按毫秒传给桥", llm.maxTurnMs == 900000, llm.maxTurnMs)
+
+  local s2 = newSettings()
+  s2.dlg = fakeDlg{ baseUrl = "u", model = "m", apiKey = "", timeoutSec = "2.5" }
+  check("允许小数秒（2.5s -> 2500ms）", s2:_values().timeoutMs == 2500, s2:_values().timeoutMs)
+
+  local s3 = newSettings()
+  s3.dlg = fakeDlg{ baseUrl = "u", model = "m", apiKey = "", timeoutSec = "", maxTurnSec = "abc" }
+  local llm3 = s3:_values()
+  check("超时留空/乱填 -> 不传（桥保持原值，别把超时清成 0）",
+    llm3.timeoutMs == nil and llm3.maxTurnMs == nil, llm3.timeoutMs)
+
+  local s4 = newSettings()
+  s4.dlg = fakeDlg{}
+  s4.shown = true
+  s4:_fill({ baseUrl = "u", model = "m", timeoutMs = 300000, maxTurnMs = 900000 })
+  check("_fill 把毫秒换算回秒显示", s4.dlg.data.timeoutSec == "300", s4.dlg.data.timeoutSec)
+  check("_fill 填了整轮超时", s4.dlg.data.maxTurnSec == "900", s4.dlg.data.maxTurnSec)
+
+  local s5 = newSettings()
+  s5.dlg = fakeDlg{}
+  s5.shown = true
+  s5:_fill(nil)
+  check("没配置时单次超时给默认 180 秒", s5.dlg.data.timeoutSec == "180", s5.dlg.data.timeoutSec)
+  check("没配置时整轮超时给默认 600 秒", s5.dlg.data.maxTurnSec == "600", s5.dlg.data.maxTurnSec)
+end
+
 -- 没有对话框也不炸（桥没连上时用户点设置）
 do
   local s = newSettings()
@@ -140,8 +173,9 @@ end
 do
   i18n._resetLang()
   local keys = { "settingsTitle", "advTitle", "advSteps", "advContext", "advTemp",
-                 "advThinking", "advHint", "stepLimit", "thinkingDropped",
+                 "advThinking", "advHint", "advTimeout", "advTurn", "stepLimit", "thinkingDropped",
                  "ctxCleared", "ctxRestored", "ctxCompacted", "ctxEmpty", "ctxStats",
+                 "llmTimeout", "abortTimeout",
                  "wsTitle", "wsHint", "barBgHint", "btnSave", "btnTest", "btnClose" }
   local missing = {}
   for _, k in ipairs(keys) do

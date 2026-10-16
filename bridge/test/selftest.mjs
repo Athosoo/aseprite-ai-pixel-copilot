@@ -138,7 +138,7 @@ class MockAseprite {
           type: 'hello',
           aseprite: '1.3.18.6-dev',
           apiVersion: 41,
-          ops: ['replace_color', 'erase_color', 'erase_region', 'fill_region', 'outline', 'despeckle', 'palette_map'],
+          ops: ['replace_color', 'erase_color', 'erase_region', 'fill_region', 'outline', 'despeckle', 'palette_map', 'quantize', 'sharpen', 'contrast'],
         });
         resolve();
       });
@@ -232,9 +232,11 @@ class MockAseprite {
         break;
       case 'get_canvas': {
         const c = this.canvas;
-        this.lastHeader = { type: 'canvas_pixels', id: msg.id, width: c.size, height: c.size };
+        // 真客户端（extension/lib/ws.lua 的 sendBinary）就是发这个形状：
+        // 语义 type 保留 + binary=true 标出后面跟着负载。桥必须认这一份。
+        this.lastHeader = { type: 'canvas_pixels', id: msg.id, width: c.size, height: c.size, binary: true };
         this.sendBinary(
-          { type: 'canvas_pixels', id: msg.id, width: c.size, height: c.size },
+          { type: 'canvas_pixels', id: msg.id, width: c.size, height: c.size, binary: true },
           c.data,
         );
         break;
@@ -528,8 +530,8 @@ async function main() {
 
   // ---- 场景 8：紧急中断 + 轮级超时（P3）
   console.log('== 场景 8：abort 帧中断卡住的这一轮 / maxTurnMs 自动中断 ==');
-  // maxTurnMs 压到 1200ms：8b 不用等 3 分钟
-  const cfg5 = { ...testConfig, port: BRIDGE_PORT + 40, llm: { ...testConfig.llm, maxTurnMs: 1200 } };
+  // maxTurnMs 压到 1500ms：8b 不用等 10 分钟
+  const cfg5 = { ...testConfig, port: BRIDGE_PORT + 40, llm: { ...testConfig.llm, maxTurnMs: 1500 } };
   const configPath5 = join(TMP, 'config5.json');
   writeFileSync(configPath5, JSON.stringify(cfg5, null, 2), 'utf8');
   const bridge5 = spawn(process.execPath, [join(ROOT, 'src', 'server.mjs'), '--config', configPath5], {
@@ -559,7 +561,7 @@ async function main() {
   check('中断是立刻生效的（< 500ms 就有回复）', Date.now() - beforeAbort < 1500,
     `${Date.now() - beforeAbort}ms`);
 
-  // 8b：不按停止 -> 轮级超时自动中断（maxTurnMs = 1200）
+  // 8b：不按停止 -> 轮级超时自动中断（maxTurnMs = 1500）
   ase5.statuses.length = 0;
   ase5.says.length = 0;
   ase5.chat('再来一件很久的事');
@@ -570,6 +572,11 @@ async function main() {
     ase5.statuses[ase5.statuses.length - 1] === 'ready', ase5.statuses.slice(-3));
   check('超时中断和手动中断给的是不同提示',
     !ase5.says.some((s) => s.i18n === 'aborted'), ase5.says.slice(-3));
+  // 文案里必须带"多少秒"：面板靠 i18nArgs 格式化，只有键没有数字等于没说清
+  const turnTimeoutSay = ase5.says.find((s) => s.i18n === 'abortTimeout');
+  check('轮级超时文案带上了秒数（i18nArgs）',
+    Array.isArray(turnTimeoutSay?.i18nArgs) && turnTimeoutSay.i18nArgs[0] === 2,
+    turnTimeoutSay && turnTimeoutSay.i18nArgs);
 
   // 8c：没有任务在跑时按停止，不能挂死
   ase5.says.length = 0;
@@ -577,6 +584,66 @@ async function main() {
   await sleep(300);
   check('空闲时按停止 -> 明确说没有任务在跑',
     ase5.says.some((s) => s.i18n === 'abortNothing'), ase5.says.slice(-2));
+
+  // ---- 场景 8d：单次 HTTP 请求自己超时（和轮级超时是两条不同的路）
+  console.log('== 场景 8d：单次请求超时 -> 友好文案 + 设置里能改 ==');
+  // 这条要用很小的 timeoutMs（700ms）才测得快，而 set_config 会把小于 10s 的值夹上去，
+  // 所以直接写进配置文件（配置文件是可信来源，不做夹取）。
+  const cfg5b = {
+    ...testConfig, port: BRIDGE_PORT + 45,
+    llm: { ...testConfig.llm, timeoutMs: 700, maxTurnMs: 60000 },
+  };
+  const configPath5b = join(TMP, 'config5b.json');
+  writeFileSync(configPath5b, JSON.stringify(cfg5b, null, 2), 'utf8');
+  const bridge5b = spawn(process.execPath, [join(ROOT, 'src', 'server.mjs'), '--config', configPath5b], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  await sleep(700);
+  const ase5b = new MockAseprite(BRIDGE_PORT + 45);
+  await ase5b.connect();
+  await sleep(200);
+
+  check('configPayload 里带上了单次请求超时（面板设置要用）',
+    ase5b.cfgMsgs[0]?.llm?.timeoutMs === 700, ase5b.cfgMsgs[0]?.llm);
+  check('configPayload 里带上了整轮超时',
+    ase5b.cfgMsgs[0]?.llm?.maxTurnMs === 60000, ase5b.cfgMsgs[0]?.llm);
+
+  mockLlm.close();
+  mockLlm = await startMockLlm([HANG]);
+  await sleep(150);
+  ase5b.says.length = 0;
+  ase5b.chat('问一个上游永远不回的问题');
+  await sleep(1600);
+  const reqTimeoutSay = ase5b.says.find((s) => s.i18n === 'llmTimeout');
+  check('单次请求超时给了专属文案（不是原始 AbortError）',
+    !!reqTimeoutSay, ase5b.says.slice(-3));
+  check('文案里带上了秒数', Array.isArray(reqTimeoutSay?.i18nArgs), reqTimeoutSay?.i18nArgs);
+  check('给的是 warn 级（不是 error：这不是坏掉了）',
+    reqTimeoutSay?.kind === 'warn', reqTimeoutSay?.kind);
+  check('没有把 fetch 那句 aborted 甩给用户',
+    !ase5b.says.some((s) => /aborted|AbortError|operation was/i.test(String(s.text || ''))),
+    ase5b.says.map((s) => s.text));
+  check('超时后状态回到 ready',
+    ase5b.statuses[ase5b.statuses.length - 1] === 'ready', ase5b.statuses.slice(-3));
+
+  // 设置面板能改这两个值：set_config 收毫秒、越界要夹
+  ase5b.send({ type: 'set_config', llm: { timeoutMs: 5000, maxTurnMs: 1200000 } });
+  await sleep(400);
+  const onDisk5b = JSON.parse(readFileSync(configPath5b, 'utf8'));
+  check('单次超时被夹到下限 10s（比这更短跑不完一轮）',
+    onDisk5b.llm.timeoutMs === 10000, onDisk5b.llm.timeoutMs);
+  check('整轮超时按填的值落盘', onDisk5b.llm.maxTurnMs === 1200000, onDisk5b.llm.maxTurnMs);
+  check('落盘后回执里的值也更新了',
+    ase5b.cfgMsgs[ase5b.cfgMsgs.length - 1]?.llm?.timeoutMs === 10000,
+    ase5b.cfgMsgs[ase5b.cfgMsgs.length - 1]?.llm);
+  ase5b.send({ type: 'set_config', llm: { maxTurnMs: 99999999 } });
+  await sleep(400);
+  const onDisk5b2 = JSON.parse(readFileSync(configPath5b, 'utf8'));
+  check('整轮超时被夹到上限 60 分钟', onDisk5b2.llm.maxTurnMs === 3600000, onDisk5b2.llm.maxTurnMs);
+
+  bridge5b.kill();
+  ase5b.close();
+  await sleep(200);
 
   // ---- 场景 9：已经矫正过的图不再被处理（P8）
   console.log('== 场景 9：已是真像素画 -> 不导入、不重试 ==');

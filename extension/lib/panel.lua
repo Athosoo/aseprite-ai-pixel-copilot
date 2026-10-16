@@ -283,12 +283,8 @@ function Panel:replayLines(lines, more, title)
   if more and more > 0 then tail = string.format(i18n.t("replayMore"), more) end
   self:log(string.format(i18n.t("replayHead"), n, tail), "info", { fromBridge = true })
   for _, l in ipairs(lines) do
-    local text = l.text
-    local key = l.i18n
-    if key then
-      local loc = i18n.t(key)
-      if loc then text = loc end
-    end
+    -- i18n 键 + 实参一起还原（"超时 180 秒"里的 180 存在 i18nArgs 里）
+    local text = i18n.render(l.i18n, l.i18nArgs, l.text)
     self:log(text, l.kind or "info", { fromBridge = true })
   end
 end
@@ -773,6 +769,23 @@ function Panel:modeLabel(mode)
   return i18n.t("modePanel")
 end
 
+-- 形态该贴哪儿 —— 纯函数，好单测（真窗口只能在 GUI 里验，见 gui_bar_probe.lua）。
+-- 坐标原点是主窗口内容区左上角（dlg.bounds 就是这么算的，见 src/app/script/dialog_class.cpp）。
+--   底边栏：水平居中贴底
+--   侧边栏：贴右、垂直居中
+--   小窗  ：贴【右下角】—— 最小化之后不该占着屏幕正中，缩到角上最不挡事
+-- W/H 是主窗口尺寸，bw/bh 是窗口尺寸；拿不到主窗口尺寸时调用方别调这个函数。
+function panel.anchorFor(mode, W, H, bw, bh)
+  if W <= 0 or H <= 0 then return nil end
+  if mode == "bar_bottom" then
+    return math.max(0, math.floor((W - bw) / 2)), math.max(0, H - bh)
+  end
+  if mode == "small" then
+    return math.max(0, W - bw), math.max(0, H - bh)
+  end
+  return math.max(0, W - bw), math.max(0, math.floor((H - bh) / 2))
+end
+
 -- 栏形态贴哪儿：app.window.width/height 和 dlg.bounds 同一坐标系（miniwindow 也是这么用的）。
 -- 拿不到就返回 nil，调用方沿用它原来的位置。
 function Panel:_barAnchor(mode)
@@ -782,12 +795,7 @@ function Panel:_barAnchor(mode)
   if W <= 0 or H <= 0 then return nil end
 
   local bw, bh = self:_modeSize(mode)
-  if mode == "bar_bottom" then
-    -- 底边栏：水平居中，贴底
-    return math.max(0, math.floor((W - bw) / 2)), math.max(0, H - bh)
-  end
-  -- 侧边栏：贴右，垂直居中
-  return math.max(0, W - bw), math.max(0, math.floor((H - bh) / 2))
+  return panel.anchorFor(mode, W, H, bw, bh)
 end
 
 -- 形态的窗口尺寸（含边框余量）。主窗口比目标还小的时候按主窗口收缩 ——
@@ -827,7 +835,9 @@ function Panel:setMode(mode, quiet)
     self.inputFocused = true
 
     local x, y = nil, nil
-    if mode ~= "panel" then
+    -- 只在【真的换形态】时才贴位：同一个形态重复 setMode（重连、保存设置都会触发）
+    -- 不该把用户拖到别处的窗口拽回来。
+    if mode ~= "panel" and mode ~= prev then
       x, y = self:_barAnchor(mode)
     end
     if not x then

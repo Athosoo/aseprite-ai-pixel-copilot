@@ -297,6 +297,19 @@ do
 
   ok(i18n.builtinAction("栏") == "bar", "「栏」-> bar")
   ok(i18n.builtinAction("bar") == "bar", "bar -> bar")
+
+  -- 贴位算式（纯函数，不用真窗口）：主窗口 960x564，窗口 372x79
+  local W, H, bw, bh = 960, 564, 372, 79
+  local x, y = panel.anchorFor("bar_bottom", W, H, bw, bh)
+  ok(x == math.floor((W - bw) / 2) and y == H - bh, "底边栏：水平居中贴底", x .. "," .. y)
+  x, y = panel.anchorFor("bar_side", W, H, 332, 467)
+  ok(x == W - 332 and y == math.floor((H - 467) / 2), "侧边栏：贴右垂直居中", x .. "," .. y)
+  x, y = panel.anchorFor("small", W, H, bw, bh)
+  ok(x == W - bw and y == H - bh, "小窗：贴右下角（v0.5.9 起，以前是右侧居中）", x .. "," .. y)
+  ok(panel.anchorFor("small", 0, 0, bw, bh) == nil, "拿不到主窗口尺寸 -> nil（调用方沿用原位置）")
+  -- 主窗口比窗口还小：不能算出负数坐标（窗口会跑到屏幕外）
+  x, y = panel.anchorFor("small", 100, 50, bw, bh)
+  ok(x == 0 and y == 0, "主窗口比小窗还小 -> 夹到 0", x .. "," .. y)
   local rows = i18n.menuCommands()
   local found = nil
   for _, r in ipairs(rows) do if r.id == "bar" then found = r end end
@@ -1062,6 +1075,38 @@ do
     if l.text == i18n.t("ctxRestored") then localized = true end
   end
   ok(localized, "带 i18n 键的行按本地化文案渲染")
+
+  -- 带 %d 的文案（"超时 180 秒"）：回放时数字要填回去，不能留着 %d
+  local p3b = panel.new{ frameImage = function() return nil end }
+  p3b:replayLines({
+    { kind = "warn", text = "raw", i18n = "llmTimeout", i18nArgs = { 180 } },
+    { kind = "info", text = "raw2", i18n = "abortTimeout", i18nArgs = { 600 } },
+  }, 0)
+  local saw180, saw600, sawRaw = false, false, false
+  for _, l in ipairs(p3b.lines) do
+    local s = tostring(l.text)
+    if s:find("180", 1, true) then saw180 = true end
+    if s:find("600", 1, true) then saw600 = true end
+    if s == "raw" or s == "raw2" then sawRaw = true end
+  end
+  ok(saw180 and saw600, "回放把 i18nArgs 填进了文案（180 / 600 秒）")
+  ok(not sawRaw, "带 i18n 键时不用桥发来的英文原文")
+
+  -- 参数缺失也不能把整行弄没（宁可少个数字，也不要留下 %d）
+  local p3c = panel.new{ frameImage = function() return nil end }
+  p3c:replayLines({ { kind = "info", text = "fallback", i18n = "llmTimeout" } }, 0)
+  local noPlaceholder = true
+  for _, l in ipairs(p3c.lines) do
+    if tostring(l.text):find("%%d", 1, false) then noPlaceholder = false end
+  end
+  ok(#p3c.lines == 2 and noPlaceholder, "缺 i18nArgs 时不留 %d 占位符")
+
+  -- i18n.render 的退化路径（面板和 agent 都靠它）
+  ok(i18n.render("llmTimeout", { 30 }, "fb"):find("30", 1, true) ~= nil, "render 填参数")
+  ok(i18n.render("no_such_key_xyz", { 1 }, "fb") == "fb", "render 认不出键 -> 退回 fallback")
+  ok(i18n.render("aborted", nil, "fb") == i18n.t("aborted"), "render 没有参数（文案也没占位符）-> 直接用文案")
+  ok(i18n.render("llmTimeout", nil, "fb") == "fb",
+    "render 有占位符却没实参 -> 退回桥的原文，不留 %d")
 
   -- 空记录也要说一句，不能是一片空白
   local p4 = panel.new{ frameImage = function() return nil end }

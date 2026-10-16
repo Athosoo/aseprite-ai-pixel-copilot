@@ -761,13 +761,9 @@ function Agent:onMessage(msg)
     self.panel:setStatus(msg.text or "", msg.kind, self:docName())
 
   elseif t == "say" then
-    -- 桥可以带 i18n 键，让面板用本地化文案显示（中断提示这类固定文案）
-    local text = msg.text or ""
-    if msg.i18n and msg.i18n ~= "" then
-      local local_ = i18n.t(msg.i18n)
-      if local_ ~= nil then text = local_ end
-    end
-    self.panel:log(text, msg.kind or "ai")
+    -- 桥可以带 i18n 键，让面板用本地化文案显示（中断/超时这类固定文案）；
+    -- 带 %d 的还配一份 i18nArgs，格式化成中文也一样把数字填回去
+    self.panel:log(i18n.render(msg.i18n, msg.i18nArgs, msg.text or ""), msg.kind or "ai")
 
   elseif t == "clear" then
     self.panel:clear()
@@ -880,8 +876,8 @@ function Agent:onMessage(msg)
   elseif t == "get_canvas" then
     self:sendCanvas(msg.id)
 
-  elseif t == "import_image" then
-    self.pendingImport = msg   -- binary frame follows
+  -- import_image 不在这里处理：它带 binary=true，会被 ws.lua 当成"头帧"存起来，
+  -- 等二进制帧到达后由 Agent:onBinary 配对调用 importImage（v0.5.9 统一了这条路）。
 
   else
     self.panel:log(string.format(i18n.t("unknownMessage"), tostring(t)), "error")

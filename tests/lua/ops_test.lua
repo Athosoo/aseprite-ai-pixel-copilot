@@ -266,5 +266,156 @@ do
   check("蓝色系也有对应代表色", dist2 < 40000, hex2 .. " d=" .. tostring(dist2))
 end
 
+print("== ops: sharpen（锐化边缘）==")
+do
+  -- 一条竖直边界：左半 100、右半 160。边界两侧的 9 格均值分别是 120 / 140，
+  -- 所以"暗的更暗、亮的更亮"能算出确切数字，不用靠肉眼看截图。
+  local spr, cel, img = newSprite()
+  img:clear(Rectangle(0, 0, 8, 8), Color(100, 100, 100))
+  img:clear(Rectangle(4, 0, 4, 8), Color(160, 160, 160))
+  local rep = ops.run({ { op = "sharpen" } }, "锐化", cel)
+  check("只有边界那两列被改（16 像素）", rep.ops[1].changed == 16, rep.ops[1].changed)
+  check("暗侧更暗 100 -> 80", px(img, 3, 4) == Color(80, 80, 80).rgbaPixel,
+    string.format("%08X", px(img, 3, 4)))
+  check("亮侧更亮 160 -> 180", px(img, 4, 4) == Color(180, 180, 180).rgbaPixel,
+    string.format("%08X", px(img, 4, 4)))
+  check("画布边界处同样算得出来（没越界崩）", px(img, 3, 0) == Color(80, 80, 80).rgbaPixel,
+    string.format("%08X", px(img, 3, 0)))
+  check("离边界远的地方一点没动", px(img, 0, 0) == Color(100, 100, 100).rgbaPixel)
+  app.undo()
+  check("undo 一步还原（整批一个撤销步）", px(img, 3, 4) == Color(100, 100, 100).rgbaPixel)
+end
+
+print("== ops: sharpen 平色不动 / amount=0 ==")
+do
+  local spr, cel, img = newSprite()
+  img:clear(Rectangle(0, 0, 8, 8), RED)
+  local rep = ops.run({ { op = "sharpen", amount = 3 } }, "平色", cel)
+  check("纯色图 0 改动", rep.ops[1].changed == 0, rep.ops[1].changed)
+
+  local spr2, cel2, img2 = newSprite()
+  img2:clear(Rectangle(0, 0, 8, 8), Color(100, 100, 100))
+  img2:clear(Rectangle(4, 0, 4, 8), Color(160, 160, 160))
+  local rep2 = ops.run({ { op = "sharpen", amount = 0 } }, "零强度", cel2)
+  check("amount=0 等于不动", rep2.ops[1].changed == 0, rep2.ops[1].changed)
+end
+
+print("== ops: sharpen threshold 保护平缓处 ==")
+do
+  local spr, cel, img = newSprite()
+  img:clear(Rectangle(0, 0, 8, 8), Color(100, 100, 100))
+  img:clear(Rectangle(4, 0, 4, 8), Color(160, 160, 160))
+  local rep = ops.run({ { op = "sharpen", threshold = 25 } }, "忽略带", cel)
+  check("差异 20 <= threshold 25：一个像素都不动", rep.ops[1].changed == 0, rep.ops[1].changed)
+end
+
+print("== ops: sharpen 不把剪影边缘拉成灰边 ==")
+do
+  -- 透明邻居【不参与】均值。算进去的话贴边那一列会被当成"和黑色相邻"而整体提亮，
+  -- 在透明背景上就是一圈脏边 —— 像素画里这是最显眼的毛病。
+  local spr, cel, img = newSprite()
+  img:clear(Rectangle(0, 0, 8, 8), CLEAR)
+  img:clear(Rectangle(0, 0, 4, 8), Color(90, 90, 90))
+  ops.run({ { op = "sharpen", amount = 3 } }, "剪影", cel)
+  check("贴边的内侧像素保持原色", px(img, 3, 4) == Color(90, 90, 90).rgbaPixel,
+    string.format("%08X", px(img, 3, 4)))
+  check("透明区还是透明", px(img, 7, 7) == CLEAR.rgbaPixel, string.format("%08X", px(img, 7, 7)))
+end
+
+print("== ops: contrast（加强明暗对比）==")
+do
+  local spr, cel, img = newSprite()
+  img:clear(Rectangle(0, 0, 8, 8), Color(100, 100, 100))
+  img:clear(Rectangle(4, 0, 4, 8), Color(160, 160, 160))
+  local rep = ops.run({ { op = "contrast" } }, "对比", cel)
+  check("默认 1.3 把 64 个像素全改了", rep.ops[1].changed == 64, rep.ops[1].changed)
+  check("暗部 100 -> 92", px(img, 0, 0) == Color(92, 92, 92).rgbaPixel,
+    string.format("%08X", px(img, 0, 0)))
+  check("亮部 160 -> 170", px(img, 7, 7) == Color(170, 170, 170).rgbaPixel,
+    string.format("%08X", px(img, 7, 7)))
+end
+
+print("== ops: contrast 轴心 / 夹值 / 减弱 ==")
+do
+  local spr, cel, img = newSprite()
+  img:clear(Rectangle(0, 0, 8, 8), Color(128, 128, 128))
+  local rep = ops.run({ { op = "contrast", amount = 2 } }, "中灰", cel)
+  check("128 是轴心，乘多少都不动", rep.ops[1].changed == 0, rep.ops[1].changed)
+
+  local spr2, cel2, img2 = newSprite()
+  img2:clear(Rectangle(0, 0, 8, 8), Color(250, 5, 128))
+  ops.run({ { op = "contrast", amount = 3 } }, "夹值", cel2)
+  check("超上限夹 255、低于下限夹 0、轴心不动",
+    px(img2, 0, 0) == Color(255, 0, 128).rgbaPixel, string.format("%08X", px(img2, 0, 0)))
+
+  local spr3, cel3, img3 = newSprite()
+  img3:clear(Rectangle(0, 0, 8, 8), Color(100, 100, 100))
+  ops.run({ { op = "contrast", amount = 0.5 } }, "压平", cel3)
+  check("amount<1 是压平：100 -> 114", px(img3, 0, 0) == Color(114, 114, 114).rgbaPixel,
+    string.format("%08X", px(img3, 0, 0)))
+
+  local spr4, cel4, img4 = newSprite()
+  img4:clear(Rectangle(0, 0, 8, 8), Color(100, 100, 100))
+  ops.run({ { op = "contrast", amount = 2, pivot = 0 } }, "换轴心", cel4)
+  check("pivot=0 时按 0 拉开：100 -> 200", px(img4, 0, 0) == Color(200, 200, 200).rgbaPixel,
+    string.format("%08X", px(img4, 0, 0)))
+end
+
+print("== ops: sharpen / contrast 不动 alpha、不碰透明像素 ==")
+do
+  local spr, cel, img = newSprite()
+  img:clear(Rectangle(0, 0, 8, 8), CLEAR)
+  img:clear(Rectangle(0, 0, 4, 8), Color(90, 90, 90, 128))
+  local before = px(img, 2, 2)
+  ops.run({ { op = "sharpen", amount = 2 }, { op = "contrast", amount = 2 } }, "半透明", cel)
+  local after = px(img, 2, 2)
+  check("RGB 被改了", after ~= before, string.format("%08X -> %08X", before, after))
+  check("alpha 原样保留", (after >> 24) & 0xFF == (before >> 24) & 0xFF,
+    string.format("a %d -> %d", (before >> 24) & 0xFF, (after >> 24) & 0xFF))
+  check("透明像素仍是全透明", px(img, 7, 7) == CLEAR.rgbaPixel,
+    string.format("%08X", px(img, 7, 7)))
+end
+
+print("== ops: sharpen / contrast 限定区域 ==")
+do
+  local spr, cel, img = newSprite()
+  img:clear(Rectangle(0, 0, 8, 8), Color(100, 100, 100))
+  ops.run({ { op = "contrast", amount = 2, region = { x = 0, y = 0, w = 4, h = 4 } } }, "局部", cel)
+  check("区域内被改 100 -> 72", px(img, 0, 0) == Color(72, 72, 72).rgbaPixel,
+    string.format("%08X", px(img, 0, 0)))
+  check("区域外没动", px(img, 5, 5) == Color(100, 100, 100).rgbaPixel,
+    string.format("%08X", px(img, 5, 5)))
+end
+
+print("== ops: 新算子的参数校验与注册 ==")
+do
+  local spr, cel, img = newSprite()
+  img:clear(Rectangle(0, 0, 8, 8), Color(100, 100, 100))
+  local ok1, err1 = pcall(function() ops.run({ { op = "contrast", amount = 0 } }, "零", cel) end)
+  check("contrast amount=0 报错", not ok1, err1)
+  local ok2, err2 = pcall(function() ops.run({ { op = "sharpen", amount = -1 } }, "负", cel) end)
+  check("sharpen 负 amount 报错", not ok2, err2)
+
+  local set = {}
+  for _, n in ipairs(ops.names) do set[n] = true end
+  check("sharpen 在注册表里", set.sharpen == true)
+  check("contrast 在注册表里", set.contrast == true)
+  -- 这份名单是【契约】，和 bridge/test/tools_test.mjs 的 P15 段、tools.mjs 里的
+  -- apply_ops enum 必须一致：多一个（模型调了会 unknown op）、少一个（模型看不到）
+  -- 都是 bug。改算子时三个地方一起改。
+  local EXPECTED = {
+    "contrast", "despeckle", "erase_color", "erase_region", "fill_region",
+    "outline", "palette_map", "quantize", "replace_color", "sharpen",
+  }
+  local sorted = {}
+  for _, n in ipairs(ops.names) do sorted[#sorted + 1] = n end
+  table.sort(sorted)
+  check("算子名单 == 契约（和 tools.mjs 的 enum 逐字相同）",
+    table.concat(sorted, ",") == table.concat(EXPECTED, ","), table.concat(sorted, ","))
+  local d = ops.describe()
+  check("describe 里列了 sharpen", d:find("sharpen", 1, true) ~= nil)
+  check("describe 里列了 contrast", d:find("contrast", 1, true) ~= nil)
+end
+
 print(string.format("\n==== ops_test: %d 通过, %d 失败 ====", passes, fails))
 if fails > 0 then error(fails .. " 个断言失败") end

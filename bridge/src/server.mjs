@@ -122,6 +122,9 @@ function configPayload() {
       contextTokens: history.budgetTokens,
       temperature: cfg.llm?.temperature ?? 0.2,
       thinking: cfg.llm?.thinking || 'auto',
+      // 超时（毫秒）：单次 HTTP 请求 / 整轮对话。面板设置里按秒显示、改完立刻生效。
+      timeoutMs: cfg.llm?.timeoutMs ?? 180000,
+      maxTurnMs: cfg.llm?.maxTurnMs ?? 600000,
     },
     port: PORT,
     colorBank: BANK_PATH,
@@ -167,11 +170,14 @@ class Session {
     if (this.ws.readyState === 1) this.ws.send(JSON.stringify(obj));
   }
 
-  // i18nKey 有值时，面板会用本地化文案覆盖 text（P3 的中断提示等）
+  // i18nKey 有值时，面板会用本地化文案覆盖 text（P3 的中断提示等）；
+  // i18nArgs 是 %d/%s 的实参（"超时 180 秒"里的 180）。
   // record=false 的行不进对话回放（握手提示这种连接噪声不该污染记录）
-  say(kind, text, i18nKey, record = true) {
-    if (record) history.pushLog(kind, text, i18nKey);
-    this.send({ type: 'say', kind, text, i18n: i18nKey });
+  say(kind, text, i18nKey, record = true, i18nArgs = null) {
+    if (record) history.pushLog(kind, text, i18nKey, i18nArgs);
+    const msg = { type: 'say', kind, text, i18n: i18nKey };
+    if (i18nArgs) msg.i18nArgs = i18nArgs;
+    this.send(msg);
   }
 
   // 把当前对话的记录推给面板（面板收到就清屏重画）——关掉面板 / 重启 Aseprite 之后
@@ -235,7 +241,9 @@ class Session {
   }
 
   sendImport(data, width, height, note) {
-    this.send({ type: 'import_image', id: ++this.seq, width, height, note });
+    // binary=true 告诉 Lua 侧"后面还跟着一个二进制帧"，它据此把头帧存起来等配对。
+    // 别去掉这个标记：去掉的话 Lua 会把它当普通消息，二进制帧配不上头就丢了。
+    this.send({ type: 'import_image', id: ++this.seq, width, height, note, binary: true });
     this.ws.send(Buffer.from(data.buffer, data.byteOffset, data.byteLength), { binary: true });
   }
 
@@ -270,7 +278,9 @@ class Session {
     const ac = new AbortController();
     this.turnAbort = ac;
     this.turnProcessed = new Set();
-    const maxTurnMs = cfg.llm?.maxTurnMs ?? 180000;
+    // 整轮上限默认 10 分钟：一轮里最多 24 步、每步一次 HTTP，180s 那种量级
+    // 连"多步慢慢画"的正常活都跑不完（用户反馈"超时太严格"多半是这条）。
+    const maxTurnMs = Number(cfg.llm?.maxTurnMs) > 0 ? Number(cfg.llm.maxTurnMs) : 600000;
     const turnTimer = setTimeout(() => ac.abort('timeout'), maxTurnMs);
 
     try {
@@ -328,8 +338,19 @@ class Session {
     } catch (e) {
       if (e?.name === 'TurnAborted') {
         // 中断不是错误：手动和超时给不同的提示
-        if (e.reason === 'timeout') this.say('info', 'Task timed out and was interrupted automatically.', 'abortTimeout');
-        else this.say('info', 'Task interrupted.', 'aborted');
+        if (e.reason === 'timeout') {
+          this.say('info',
+            `The whole turn took longer than ${Math.round(maxTurnMs / 1000)}s, so it was interrupted.`,
+            'abortTimeout', true, [Math.round(maxTurnMs / 1000)]);
+        } else {
+          this.say('info', 'Task interrupted.', 'aborted');
+        }
+      } else if (e?.timedOut) {
+        // 单次请求超时：说清是多少秒、去哪儿调大 —— 别把 AbortError 甩给用户
+        const secs = Math.round((e.timeoutMs || 0) / 1000);
+        this.say('warn',
+          `The model did not answer within ${secs}s, so the request was dropped.`,
+          'llmTimeout', true, [secs]);
       } else {
         this.say('error', `Error: ${e?.message || e}`);
       }
@@ -431,6 +452,10 @@ class Session {
         // 高级项：步数 / 上下文预算 / 温度 / 思考强度（都在设置面板里调）
         if (llm.maxSteps !== undefined) cfg.llm.maxSteps = clampNum(llm.maxSteps, 1, 200, 24);
         if (llm.temperature !== undefined) cfg.llm.temperature = clampNum(llm.temperature, 0, 2, 0.2);
+        // 超时（毫秒）。下限 10s：比这更短的话正常一轮都跑不完，纯属自找麻烦；
+        // 上限 30min/60min：够慢的推理模型用，再长就该去查网络了。
+        if (llm.timeoutMs !== undefined) cfg.llm.timeoutMs = clampNum(llm.timeoutMs, 10000, 1800000, 180000);
+        if (llm.maxTurnMs !== undefined) cfg.llm.maxTurnMs = clampNum(llm.maxTurnMs, 30000, 3600000, 600000);
         if (typeof llm.thinking === 'string' && ['auto', 'low', 'medium', 'high'].includes(llm.thinking)) {
           cfg.llm.thinking = llm.thinking;
         }

@@ -80,6 +80,21 @@ local function run()
   say("B7 cycleMode -> %s", p:cycleMode())
   say("B8 bounds = %s", bounds())
 
+  -- 小窗（最小化）必须贴右下角：v0.5.9 起从"右侧居中"改成"右下角"。
+  -- 这里打的是真窗口的 bounds，跟 panel.anchorFor 的算式对得上才算过。
+  say("B8b 切小窗 -> %s", p:setMode("small"))
+  local sb = bounds()
+  say("B8c 小窗 bounds = %s   (期望贴右下角)", sb)
+  local sw, sh = nil, nil
+  pcall(function() sw = app.window.width; sh = app.window.height end)
+  local bw2, bh2, bx, by = sb:match("^(%d+)x(%d+) @ %((%-?%d+),(%-?%d+)%)$")
+  if sw and bx then
+    say("B8d 主窗口 %sx%s；小窗右边距 %d 底边距 %d（都该是 0 附近）",
+      tostring(sw), tostring(sh),
+      sw - (tonumber(bx) + tonumber(bw2)), sh - (tonumber(by) + tonumber(bh2)))
+  end
+  say("B8e 切回面板 -> %s", p:setMode("panel"))
+
   p:fillInput("测试输入")
   say("B9 栏模式下 fillInput 没炸，input=%s", tostring(p.input))
 

@@ -204,11 +204,13 @@ export class Conversation {
   }
 
   /** 面板回放行：屏幕上滚过去的每一行。i18nKey 有值时面板会本地化重渲染。 */
-  pushLog(kind, text, i18nKey) {
+  pushLog(kind, text, i18nKey, i18nArgs) {
     const t = String(text == null ? '' : text);
     if (!t) return this;
     const row = { kind: String(kind || 'info'), text: t };
     if (i18nKey) row.i18n = String(i18nKey);
+    // 文案里带数字的（超时多少秒…）也要一起存：回放时重新本地化还能把数字填回去
+    if (Array.isArray(i18nArgs) && i18nArgs.length) row.i18nArgs = i18nArgs;
     this.log.push(row);
     if (this.log.length > this.logCap) this.log = this.log.slice(-this.logCap);
     return this;

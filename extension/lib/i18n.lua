@@ -96,7 +96,7 @@ local LOCALES = {
     advContext  = "Context limit (tokens)",
     advTemp     = "Temperature",
     advThinking = "Thinking",
-    advHint     = "Steps: max tool calls per request (1-200). Context: older chat gets summarised past this size (1000-200000). Thinking: only sent if the endpoint supports it.",
+    advHint     = "Steps: max tool calls per request (1-200). Context: older chat gets summarised past this size (1000-200000). Timeouts in seconds: per single request (10-1800) and for the whole turn (30-3600) -- raise them if the model is slow. Thinking: only sent if the endpoint supports it.",
     stepLimit   = "Reached this turn's step limit. Say continue and I will carry on from where I stopped.",
     thinkingDropped = "This endpoint refused the thinking setting, so it was ignored (everything else still works).",
     ctxRestored  = "Context restored: the assistant still remembers the previous conversation. Type forget to start over.",
@@ -175,7 +175,10 @@ local LOCALES = {
     wsListNone  = "(no files in uploads/ or backups/ yet)",
     openDocHint = "To open a file, just tell the assistant which one (e.g. \"open 001.ase\") -- it resolves paths inside the workspace.",
     aborted    = "Task interrupted.",
-    abortTimeout = "Task timed out and was interrupted automatically.",
+    abortTimeout = "The whole turn took longer than %d s, so it was stopped automatically. Raise it in menu > Settings > Turn timeout.",
+    llmTimeout = "The model did not answer within %d s, so that request was dropped. If that is too tight, raise menu > Settings > Request timeout.",
+    advTimeout  = "Request timeout (s)",
+    advTurn     = "Turn timeout (s)",
     abortSent  = "Interrupt requested...",
     abortNothing = "Nothing is running right now.",
     bridged    = "Connected to local bridge %s",
@@ -323,7 +326,7 @@ local LOCALES = {
     advContext  = "上下文上限（token）",
     advTemp     = "温度",
     advThinking = "思考强度",
-    advHint     = "步数：一次请求最多调几次工具（1-200）。上下文：超过这个大小就把更早的对话摘要压缩（1000-200000）。思考强度：只有端点支持时才会发出去。",
+    advHint     = "步数：一次请求最多调几次工具（1-200）。上下文：超过这个大小就把更早的对话摘要压缩（1000-200000）。超时按秒填：单次请求 10-1800，整轮 30-3600 —— 模型慢就调大。思考强度：只有端点支持时才会发出去。",
     stepLimit   = "已达到本轮步数上限。跟我说「继续」，我就从停下的地方接着做。",
     thinkingDropped = "这个端点不认「思考强度」设置，已自动忽略（其它功能照常）。",
     ctxRestored  = "已恢复上次会话的上下文：助手还记得之前聊过的内容。输入「忘记」可以重新开始。",
@@ -402,7 +405,10 @@ local LOCALES = {
     wsListNone  = "（uploads/ 和 backups/ 里还没有文件）",
     openDocHint = "要打开文件，直接跟助手说文件名（例如「打开 001.ase」），它会在工作区里找。",
     aborted    = "已中断当前任务。",
-    abortTimeout = "任务超时，已自动中断。",
+    abortTimeout = "整轮超过 %d 秒，已自动中断。想放宽：菜单 → 设置 → 整轮超时（秒）。",
+    llmTimeout = "模型 %d 秒内没回应，这次请求已放弃。觉得太紧的话：菜单 → 设置 → 单次请求超时（秒）。",
+    advTimeout  = "单次请求超时（秒）",
+    advTurn     = "整轮超时（秒）",
     abortSent  = "已发出中断请求…",
     abortNothing = "当前没有正在执行的任务。",
     bridged    = "已连上本地桥 %s",
@@ -669,6 +675,27 @@ function i18n.t(key)
   local v = loc[key]
   if v == nil then v = LOCALES.zh_hans[key] end
   return v
+end
+
+-- Lua 5.1/5.2 里叫 unpack，5.3+ 是 table.unpack —— 两个都认
+local unpackFn = table.unpack or unpack
+
+-- 带占位符的文案：i18n.render("llmTimeout", { 180 }, "fallback text")
+-- key 认不出来、或参数个数不对，就退回 fallback（宁可少个数字，也不能整行消失，
+-- 更不能把 "%d 秒" 原样显示给用户）。
+function i18n.render(key, args, fallback)
+  local loc = nil
+  if type(key) == "string" and key ~= "" then loc = i18n.t(key) end
+  if type(loc) ~= "string" then return fallback end
+  local hasSpec = loc:find("%%[dsfgq]") ~= nil
+  local function orFallback()
+    if hasSpec and type(fallback) == "string" and fallback ~= "" then return fallback end
+    return loc
+  end
+  if type(args) ~= "table" or #args == 0 then return orFallback() end
+  local ok, out = pcall(string.format, loc, unpackFn(args))
+  if ok and type(out) == "string" then return out end
+  return orFallback()
 end
 
 -- 面板按钮文字（Send / 发送 ...）

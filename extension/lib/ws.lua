@@ -95,7 +95,9 @@ function Conn:_receive(msgType, data, errText)
       end
       return
     end
-    if msg.type == "binary_header" then
+    -- 带 binary=true 的头帧 = "后面还跟着一个二进制帧"，先存着等 BINARY 帧来配对。
+    -- （type == "binary_header" 是 v0.5.9 之前的老写法，留着兼容，别再往那头改。）
+    if msg.binary == true or msg.type == "binary_header" then
       self.pendingBinaryHeader = msg
     elseif self.handlers.onText then
       self.handlers.onText(msg)
@@ -131,12 +133,23 @@ function Conn:send(tbl)
   return true
 end
 
--- 先发 JSON 头帧，再发二进制负载
+-- 先发 JSON 头帧，再发二进制负载。
+--
+-- 头帧里的 **type 必须原样保留**：桥靠它分派（upload / canvas_pixels …）。
+-- 只用 binary=true 标出"后面还跟着一个二进制帧"。
+--
+-- 【v0.5.9 修】这里以前写的是 `header.type = "binary_header"` —— 把语义 type 覆盖掉了，
+-- 而桥根本没有 binary_header 这个分支（它会走 default 打出 "unhandled message binary_header"，
+-- 随后那个二进制帧因为找不到头被丢掉）。后果是**上传和 get_canvas 两条路全死**：
+-- perfect_pixel(source=active_canvas) 每次都挂到 60 秒超时，上传的图永远不落地
+-- （用户就是这么撞上的，见 bridge/data/gaps.md #1）。别再改回覆盖 type。
 function Conn:sendBinary(header, data)
   if not self.socket then return false end
-  header.type = "binary_header"
+  local hdr = {}
+  for k, v in pairs(header or {}) do hdr[k] = v end
+  hdr.binary = true                      -- 不改调用方那张表，免得外面复用出怪事
   local ok, err = pcall(function()
-    self.socket:sendText(json.encode(header))
+    self.socket:sendText(json.encode(hdr))
     self.socket:sendBinary(data)
   end)
   if not ok then

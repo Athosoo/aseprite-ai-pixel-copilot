@@ -57,7 +57,12 @@ export const TOOLS = [
         'palette_map(map) remaps colours and updates the palette; ' +
         'quantize(colors,updatePalette) reduces the image to at most N colours by median cut — ' +
         'use this whenever the user says the palette is too messy / too many colours / reduce to 32 or 64 colours / simplify, ' +
-        'i.e. you do NOT need an explicit map for that.',
+        'i.e. you do NOT need an explicit map for that; ' +
+        'sharpen(amount,threshold) crisps up edges with a 3x3 unsharp mask (amount 1 = standard, 2+ = aggressive); ' +
+        'contrast(amount,pivot) pushes every channel away from the mid tone, so darks get darker and lights lighter ' +
+        '(amount 1.3 = +30%, 1 = unchanged). ' +
+        'sharpen and contrast are the right answer for "sharpen the edges / make it crisper / more contrast / ' +
+        'darker shadows and brighter highlights / it looks flat" — they are per-pixel, alpha is never touched.',
       parameters: {
         type: 'object',
         properties: {
@@ -82,6 +87,8 @@ export const TOOLS = [
                     'despeckle',
                     'palette_map',
                     'quantize',
+                    'sharpen',
+                    'contrast',
                   ],
                 },
                 from: { type: 'string', description: 'replace_color: source colour #RRGGBB' },
@@ -102,6 +109,22 @@ export const TOOLS = [
                 updatePalette: {
                   type: 'boolean',
                   description: 'palette_map: also update palette entries, default true',
+                },
+                amount: {
+                  type: 'number',
+                  description:
+                    'sharpen: edge strength, default 1 (2-3 is aggressive, use it only if the user asks for "much sharper"); ' +
+                    'contrast: contrast multiplier, default 1.3 (1 = unchanged, 0.5 = flatter, 2 = very strong)',
+                },
+                threshold: {
+                  type: 'integer',
+                  description:
+                    'sharpen: leave pixels alone when their local difference is within this (0-255), default 0. ' +
+                    'Raise to 8-24 to keep flat areas and dither noise untouched.',
+                },
+                pivot: {
+                  type: 'integer',
+                  description: 'contrast: the mid tone to expand around, default 128 (0-255). Lower it to keep highlights, raise it to keep shadows.',
                 },
               },
               required: ['op'],

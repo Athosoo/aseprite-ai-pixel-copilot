@@ -335,6 +335,31 @@ console.log('== P14 capabilities 与注册表交叉核对（防漂移）==');
     '后缀清单里不该有脚本/文本（不能被诱导）');
 }
 
+console.log('== P15 apply_ops 的算子清单与 Lua 侧对齐（防漂移）==');
+{
+  // 这份名单是【契约】：schema 里的 enum 和 extension/lib/ops.lua 的 OPS 表必须一致。
+  // 只列 enum 而 Lua 没实现 -> 模型一调就报 unknown op；
+  // 只实现不列 enum -> 模型永远看不到这个能力（这正是"它说做不到"的根源之一）。
+  // 另一头由 tests/lua/ops_test.lua 的"新算子的参数校验与注册"那段钉住。
+  const EXPECTED_OPS = [
+    'contrast', 'despeckle', 'erase_color', 'erase_region', 'fill_region',
+    'outline', 'palette_map', 'quantize', 'replace_color', 'sharpen',
+  ];
+  const applyOps = TOOLS.find((t) => t.function.name === 'apply_ops');
+  const enumOps = applyOps.function.parameters.properties.ops.items.properties.op.enum;
+  ok(JSON.stringify([...enumOps].sort()) === JSON.stringify(EXPECTED_OPS),
+    'enum 里的算子 == 契约名单', enumOps.join(','));
+  ok(enumOps.includes('sharpen'), 'sharpen 在 enum 里（锐化边缘）');
+  ok(enumOps.includes('contrast'), 'contrast 在 enum 里（加强明暗对比）');
+  const props = applyOps.function.parameters.properties.ops.items.properties;
+  ok(props.amount && props.amount.type === 'number', 'sharpen/contrast 的 amount 是数字属性');
+  ok(props.threshold && props.threshold.type === 'integer', 'sharpen 的 threshold 是整数属性');
+  ok(props.pivot && props.pivot.type === 'integer', 'contrast 的 pivot 是整数属性');
+  const desc = applyOps.function.description;
+  ok(/sharpen\(amount,threshold\)/.test(desc), '工具说明里写了 sharpen 的参数');
+  ok(/contrast\(amount,pivot\)/.test(desc), '工具说明里写了 contrast 的参数');
+}
+
 console.log('== G6 capabilities 会反映工作区状态 ==');
 {
   const d3 = makeDispatcher({

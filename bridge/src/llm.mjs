@@ -15,6 +15,20 @@ export class TurnAborted extends Error {
 }
 
 /**
+ * 单次 HTTP 请求自己超时（不是用户按了停止，也不是整轮超时）。
+ * 单独一个类型是为了让 server 能给友好文案 + 告诉用户去哪儿调大，
+ * 而不是把 fetch 那句 "This operation was aborted" 原样甩给用户。
+ */
+export class RequestTimeout extends Error {
+  constructor(ms) {
+    super(`LLM request timed out after ${Math.round(ms / 1000)}s`);
+    this.name = 'RequestTimeout';
+    this.timedOut = true;
+    this.timeoutMs = ms;
+  }
+}
+
+/**
  * @param extraSignal 外部的中断信号（面板上的「停止」/ Esc / 轮级超时）。
  *   它触发时我们 abort 掉内部的 ctrl，从而中断这次 fetch。
  */
@@ -38,7 +52,11 @@ export async function chatCompletion(cfg, messages, tools, extraSignal) {
   }
 
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 120000);
+  // 单次请求超时：默认 180s。推理模型 + 大提示词偶尔会超过 2 分钟，
+  // 卡在这里的代价是"整轮白跑"，所以宁可放宽；面板设置里也能改（llm.timeoutMs）。
+  const timeoutMs = Number(cfg.timeoutMs) > 0 ? Number(cfg.timeoutMs) : 180000;
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
 
   // 外部信号 -> 内部 ctrl。已经 aborted 的要立刻生效（不能只等事件）。
   const onAbort = () => ctrl.abort();
@@ -48,22 +66,29 @@ export async function chatCompletion(cfg, messages, tools, extraSignal) {
   }
 
   const post = async (payload) => {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${cfg.apiKey || ''}`,
-      },
-      body: JSON.stringify(payload),
-      signal: ctrl.signal,
-    });
-    const text = await res.text();
-    if (!res.ok) {
-      const err = new Error(`LLM endpoint returned HTTP ${res.status}: ${text.slice(0, 600)}`);
-      err.status = res.status;
-      throw err;
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${cfg.apiKey || ''}`,
+        },
+        body: JSON.stringify(payload),
+        signal: ctrl.signal,
+      });
+      const text = await res.text();
+      if (!res.ok) {
+        const err = new Error(`LLM endpoint returned HTTP ${res.status}: ${text.slice(0, 600)}`);
+        err.status = res.status;
+        throw err;
+      }
+      return text;
+    } catch (e) {
+      // 只把"自己计时器踢的那一脚"翻译成超时；用户/整轮中断照旧往上抛
+      // （runTurn 会把它转成 TurnAborted，那条路有自己的文案）。
+      if (timedOut && !extraSignal?.aborted) throw new RequestTimeout(timeoutMs);
+      throw e;
     }
-    return text;
   };
 
   let droppedThinking = false;
