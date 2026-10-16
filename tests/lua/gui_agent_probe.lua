@@ -232,6 +232,36 @@ step("控件几何：真字体下也不越框（等高 / 等间距 / 不出画�
     assert(uniform, m .. " 方块间距不一致：" .. table.concat(gaps, ","))
   end
 end)
+step("回放：喂一条 replay，真面板真的把记录画出来", function()
+  -- 关掉面板 / 重启 Aseprite 之后"它还记得"就靠这条：桥把记录推回来，面板重画。
+  -- 这里喂一条合成的 replay，验证真 GUI 下渲染不炸、行数与颜色都对。
+  local before = #a.panel.lines
+  a:onMessage{ type = "replay", id = "c-probe", title = "探针对话", count = 1, more = 2,
+    lines = {
+      { kind = "user", text = "把外壳换成蓝色" },
+      { kind = "tool", text = "已画 128 像素（16x16）" },
+      { kind = "ai", text = "换好了。" },
+    } }
+  a.panel.dlg:repaint()
+  local n = #a.panel.lines
+  say("    回放前 %d 行 -> 回放后 %d 行", before, n)
+  assert(n == 4, "表头 + 三行 = 4 行，实际 " .. n)
+  assert(a.panel.lines[1].kind == "info" and a.panel.lines[2].kind == "user", "kind 传到了绘制层")
+  assert(a.panel.lines[3].kind == "tool" and a.panel.lines[4].kind == "ai", "工具行和 AI 行都在")
+
+  -- 对话表：真 GUI 下开一次，确认表格行渲染出来
+  a:onMessage{ type = "conversations_result", id = 1, active = "c-1",
+    items = {
+      { id = "c-1", title = "探针对话", messages = 12, tokens = 3400, active = true },
+      { id = "c-2", title = "另一个", messages = 4, tokens = 900, active = false },
+    } }
+  a.panel.dlg:repaint()
+  assert(a.panel:menuIsOpen(), "对话表开着")
+  assert(#a.panel.menuRows == 5, "两行对话 + 三行操作，实际 " .. #a.panel.menuRows)
+  say("    对话表 %d 行，首行 id=%s", #a.panel.menuRows, tostring(a.panel.menuRows[1].id))
+  -- 收尾：关掉表，别把状态留给后面的步骤
+  a.panel.menuOpen = false
+end)
 step("最小化：真窗口真的变小，还原后回原形态", function()
   a.panel:setMode("bar_bottom", true)
   a.panel.dlg:repaint()

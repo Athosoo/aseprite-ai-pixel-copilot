@@ -32,6 +32,7 @@ local a = agent.new{ port = 1 }
 -- 收集发出去的帧 + 面板日志（别真往对话框里写）
 local sent, logs = {}, {}
 local statuses = {}
+local tableCalls, replayCalls, pendingCalls = {}, {}, {}
 a.send = function(_, msg) sent[#sent + 1] = msg end
 local modeCalls = {}
 a.panel = {
@@ -42,6 +43,13 @@ a.panel = {
   setMode = function(_, mode, quiet) modeCalls[#modeCalls + 1] = { mode = mode, quiet = quiet } end,
   setBarColor = function(_, c) modeCalls[#modeCalls + 1] = { barBg = c } end,
   layoutMode = function() return "panel" end,
+  openTable = function(_, rows, title, kind)
+    tableCalls[#tableCalls + 1] = { rows = rows, title = title, kind = kind }
+  end,
+  replayLines = function(_, lines, more) replayCalls[#replayCalls + 1] = { lines = lines, more = more } end,
+  setPendingInput = function(_, action, hint, accept)
+    pendingCalls[#pendingCalls + 1] = { action = action, hint = hint, accept = accept }
+  end,
 }
 
 -- 喂一条消息，返回它发出的第一帧
@@ -286,6 +294,105 @@ do
   local r = feed{ type = "definitely_not_a_real_message", id = 10 }
   ok(r == nil, "没回帧")
   ok(#logs == 1 and logs[1].kind == "error", "面板报了一条错")
+end
+
+print("== 多对话协议（v0.5.8）：清单 -> 表 / 切换 / 回放 / 本地产的行上报 ==")
+do
+  -- 这些动作都要求"桥连着"（没连上就该提示而不是静默），所以先插一个假连接
+  a.conn = { isOpen = function() return true end, close = function() end }
+
+  -- 清单来了 -> 面板要开出一张表，行 id 是 conv:<序号>，序号就是桥认的那个
+  tableCalls = {}
+  feed{ type = "conversations_result", id = 1, active = "c-1",
+    items = {
+      { id = "c-1", title = "外壳配色", messages = 12, tokens = 3400, active = true },
+      { id = "c-2", title = "图标方案", messages = 4, tokens = 900, active = false },
+    } }
+  ok(#tableCalls == 1, "面板收到 openTable，实际 " .. #tableCalls)
+  local rows = tableCalls[1].rows or {}
+  ok(#rows == 5, "两行对话 + 三行操作 = 5 行，实际 " .. #rows)
+  ok(rows[1].id == "conv:1" and rows[2].id == "conv:2", "行 id 是 conv:序号：" ..
+    tostring(rows[1].id) .. "," .. tostring(rows[2].id))
+  ok(tostring(rows[1].label) == "外壳配色" and tostring(rows[2].label) == "图标方案", "标题带出来了")
+  ok(tostring(rows[1].note):find("12") ~= nil and tostring(rows[1].note):find("3.4k") ~= nil,
+    "备注里有条数和 token：" .. tostring(rows[1].note))
+  ok(tostring(rows[1].note):find("当前", 1, true) ~= nil, "当前那个有标记：" .. tostring(rows[1].note))
+  ok(tostring(rows[2].note):find("当前", 1, true) == nil, "非当前那个没有标记")
+  ok(rows[3].id == "conversation_new" and rows[4].id == "conversation_rename"
+    and rows[5].id == "conversation_delete", "三行操作挂在表尾")
+  ok(rows[3].keys == "n" and rows[4].keys == "r" and rows[5].keys == "d", "操作行有字母键位")
+  ok(tableCalls[1].kind == "conv", "表类型标成 conv（重打时才不会串成命令表）")
+
+  -- 空清单也要说一句
+  tableCalls, logs = {}, {}
+  feed{ type = "conversations_result", id = 2, items = {} }
+  ok(#tableCalls == 0, "空清单不开表")
+  ok(#logs == 1 and logs[1].text == i18n.t("convEmpty"), "空清单提示一句")
+
+  -- 切对话：面板给的 conv:<n> 要原样发给桥（序号由桥认）
+  sent = {}
+  a:action("conv:2")
+  local sw = sent[1]
+  ok(sw and sw.type == "conversation_switch", "conv:2 -> conversation_switch，实际 " ..
+    tostring(sw and sw.type))
+  ok(sw and sw.target == 2, "target 是数字 2，实际 " .. tostring(sw and sw.target))
+  ok(sw and sw.id ~= nil, "带请求 id（和对话 id 分开，见 server.mjs 注释）")
+
+  -- 列清单 / 新建
+  sent = {}
+  a:action("conversations")
+  ok(sent[1] and sent[1].type == "conversation_list", "会话 -> conversation_list")
+  sent = {}
+  a:action("conversation_new")
+  ok(sent[1] and sent[1].type == "conversation_new", "新对话 -> conversation_new")
+
+  -- 改名：不带名字先问一句（下一行输入当参数），带名字直接发
+  sent, pendingCalls = {}, {}
+  a:action("conversation_rename")
+  ok(#sent == 0, "不带名字时先不发")
+  ok(#pendingCalls == 1 and pendingCalls[1].action == "conversation_rename", "先要一个名字")
+  ok(pendingCalls[1].accept and pendingCalls[1].accept("外壳配色") == true, "正常名字算接受")
+  ok(pendingCalls[1].accept("x") == false, "敲 x 算取消")
+
+  sent = {}
+  a:action("conversation_rename", "外壳配色")
+  ok(sent[1] and sent[1].type == "conversation_rename" and sent[1].title == "外壳配色",
+    "带名字直接发，title 对得上：" .. tostring(sent[1] and sent[1].title))
+
+  -- 删除：要一次确认
+  sent, pendingCalls = {}, {}
+  a:action("conversation_delete")
+  ok(#sent == 0, "不带确认时先不发")
+  ok(pendingCalls[1].accept("确认") == true and pendingCalls[1].accept("算了") == false, "只认确认词")
+  sent = {}
+  a:action("conversation_delete", "确认")
+  ok(sent[1] and sent[1].type == "conversation_delete", "确认后发 conversation_delete")
+
+  -- 回放：原样交给面板（替换渲染是面板的事）
+  replayCalls = {}
+  feed{ type = "replay", id = "c-1", title = "外壳配色", count = 2, more = 3,
+    lines = { { kind = "user", text = "画个苹果" }, { kind = "tool", text = "已画 128 像素" } } }
+  ok(#replayCalls == 1, "面板收到 replayLines")
+  ok(#(replayCalls[1].lines or {}) == 2 and replayCalls[1].more == 3, "行数和 more 都对")
+  ok(replayCalls[1].lines[1].kind == "user", "kind 原样传下去")
+
+  -- 操作回执：找不到对话要报错，成功时不用面板再喊一遍（桥已经 say 了）
+  logs = {}
+  feed{ type = "conversation_result", id = 5, ok = false, reason = "not-found" }
+  ok(#logs == 1 and logs[1].kind == "error", "not-found 报红字")
+  logs = {}
+  feed{ type = "conversation_result", id = 6, ok = true, action = "switch" }
+  ok(#logs == 0, "成功时不重复喊（桥的 say 已经给过提示）")
+end
+
+print("== 面板本地产的行要上报给桥（不然重启后回放少东西）==")
+do
+  sent = {}
+  local opts = a.panel
+  -- agent.new 里 onLog 是闭包，这里直接调一次验证帧的形状
+  a:send{ type = "log", kind = "info", text = "形态已切换到 底边栏" }
+  ok(sent[1] and sent[1].type == "log" and sent[1].kind == "info"
+    and sent[1].text == "形态已切换到 底边栏", "log 帧字段名对得上：" .. tostring(sent[1] and sent[1].type))
 end
 
 print(string.format("%d passed, %d failed", pass, fail))

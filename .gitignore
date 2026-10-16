@@ -8,6 +8,7 @@ bridge/data/
 bridge/test/.tmp/
 
 # 系统 / 编辑器
+.zcode/
 Thumbs.db
 .DS_Store
 *.log

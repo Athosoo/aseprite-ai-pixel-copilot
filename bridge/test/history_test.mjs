@@ -308,3 +308,93 @@ test('H15 落盘内容可读且不含函数/循环引用', () => {
   assert.equal(raw.messages[1].tool_calls[0].function.name, 'canvas_info');
   cleanup(d);
 });
+
+// ---------------------------------------------------------------- v0.5.8 多对话用到的字段
+
+test('H16 元数据往返：id / 标题 / 时间戳 / 留档 / 回放行都落盘', () => {
+  const d = tmp();
+  const file = join(d, 'c-20261016-ab12.json');
+  const now = () => new Date('2026-10-16T01:02:03.000Z');
+  const a = new Conversation({ file, id: 'c-20261016-ab12', title: '画个苹果', now });
+  a.push(user('画个苹果'));
+  a.pushLog('user', '画个苹果');
+  a.pushLog('tool', '已画 128 像素');
+  a.archive.push(user('很老的一句'));
+  a.save();
+
+  const b = new Conversation({ file, now });
+  assert.equal(b.id, 'c-20261016-ab12');
+  assert.equal(b.title, '画个苹果');
+  assert.equal(b.createdAt, '2026-10-16T01:02:03.000Z');
+  assert.equal(b.updatedAt, '2026-10-16T01:02:03.000Z');
+  assert.equal(b.archive.length, 1, '留档跨重启还在');
+  assert.equal(b.log.length, 2);
+  assert.equal(b.stats().logLines, 2);
+  assert.equal(b.stats().archived, 1);
+  cleanup(d);
+});
+
+test('H17 老文件（没有新字段）照样能读，id 退回文件名', () => {
+  const d = tmp();
+  const file = join(d, 'c-20260101-old1.json');
+  writeFileSync(file, JSON.stringify({ summary: 's', messages: [user('老消息')] }), 'utf8');
+  const c = new Conversation({ file });
+  assert.equal(c.id, 'c-20260101-old1', '从文件名推出来');
+  assert.equal(c.title, '');
+  assert.equal(c.archive.length, 0);
+  assert.equal(c.log.length, 0);
+  assert.equal(c.messages.length, 1);
+  cleanup(d);
+});
+
+test('H18 没标题时落盘会自动从第一条用户话派生', () => {
+  const d = tmp();
+  const file = join(d, 'history.json');
+  const c = new Conversation({ file });
+  c.push(user('[Current canvas state]\n(pixels)\n\n[User request]\n把外壳换成蓝色'));
+  c.save();
+  assert.equal(c.title, '把外壳换成蓝色');
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).title, '把外壳换成蓝色');
+  cleanup(d);
+});
+
+test('H19 压缩后老消息进 archive（摘要 != 删除）', async () => {
+  const d = tmp();
+  const file = join(d, 'history.json');
+  const c = new Conversation({ file, budgetTokens: 1000, minKeep: 1, keepRatio: 0.1 });
+  c.push(user('关键决定：主色 #2E86DE'));
+  c.push(ai('记下了'));
+  c.push(user('继续' + '长'.repeat(4000)));
+
+  const rep = await c.compact(async () => '摘要一句话');
+  assert.equal(rep.compacted, true);
+  assert.equal(rep.dropped, 2, '丢掉的两条');
+  assert.equal(c.archive.length, 2, '两条都留档了');
+  assert.match(c.archive[0].content, /关键决定/, '原文一字不差地留着');
+
+  const back = new Conversation({ file });
+  assert.equal(back.archive.length, 2, '重启后留档还在');
+  assert.equal(back.summary, '摘要一句话');
+  assert.ok(back.messages.length < 3, '发给模型的只剩近期原文');
+  cleanup(d);
+});
+
+test('H20 reset 清内容但保留 id / 标题 / 创建时间', () => {
+  const d = tmp();
+  const file = join(d, 'c-20261016-zz99.json');
+  const c = new Conversation({ file, id: 'c-20261016-zz99', title: '别丢标题', now: () => new Date('2026-10-16T00:00:00.000Z') });
+  c.push(user('x'));
+  c.pushLog('user', 'x');
+  c.archive.push(user('老'));
+  c.save();
+
+  const rep = c.reset();
+  assert.equal(rep.ok, true);
+  assert.equal(c.messages.length, 0);
+  assert.equal(c.log.length, 0);
+  assert.equal(c.archive.length, 0);
+  assert.equal(c.id, 'c-20261016-zz99');
+  assert.equal(c.title, '别丢标题');
+  assert.equal(c.createdAt, '2026-10-16T00:00:00.000Z');
+  cleanup(d);
+});

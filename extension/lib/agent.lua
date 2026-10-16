@@ -49,7 +49,8 @@ function agent.new(cfg)
 
   self.panel = panel.new{
     onSend = function(text) self:sendChat(text) end,
-    onAction = function(name) self:action(name) end,
+    onAction = function(name, arg) self:action(name, arg) end,
+    onLog = function(kind, text) self:send{ type = "log", kind = kind, text = text } end,
     onUpload = function(path) self:upload(path) end,
     onMiniAction = function(id) return self:miniAction(id) end,
     onFixRun = function(paths) self:runFixQueue(paths) end,
@@ -484,7 +485,17 @@ function Agent:flushPendingChats()
   end
 end
 
-function Agent:action(name)
+function Agent:action(name, arg)
+  -- 对话表里挑了一行（id 形如 conv:3）—— 序号由桥去认，面板只管转发
+  if type(name) == "string" and name:sub(1, 5) == "conv:" then
+    local idx = tonumber(name:sub(6)) or 0
+    if self.conn and self.conn:isOpen() then
+      self:send{ type = "conversation_switch", id = self:nextId(), target = idx }
+    else
+      self.panel:log(i18n.t("convFailed"), "error")
+    end
+    return
+  end
   if name == "snapshot" then
     local ok, meta = pcall(versions.push, "manual snapshot", app.activeSprite)
     if ok then
@@ -533,6 +544,36 @@ function Agent:action(name)
       self:send{ type = "history_info", id = self:nextId() }
     else
       self.panel:log(i18n.t("ctxFailed"), "error")
+    end
+  elseif name == "conversations" then
+    if self.conn and self.conn:isOpen() then
+      self:send{ type = "conversation_list", id = self:nextId() }
+    else
+      self.panel:log(i18n.t("convFailed"), "error")
+    end
+  elseif name == "conversation_new" then
+    if self.conn and self.conn:isOpen() then
+      self:send{ type = "conversation_new", id = self:nextId() }
+    else
+      self.panel:log(i18n.t("convFailed"), "error")
+    end
+  elseif name == "conversation_rename" then
+    if arg then
+      self:send{ type = "conversation_rename", id = self:nextId(), title = tostring(arg) }
+    else
+      -- 没带名字 = 先问一句，下一行输入就是名字（不做前缀匹配，见 panel.lua 的注释）
+      self.panel:setPendingInput("conversation_rename", i18n.t("convRenameAsk"),
+        function(t) return t ~= "" and t ~= "x" and t ~= "X" and t ~= "取消" end)
+    end
+  elseif name == "conversation_delete" then
+    if arg then
+      self:send{ type = "conversation_delete", id = self:nextId() }
+    else
+      self.panel:setPendingInput("conversation_delete", i18n.t("convDeleteAsk"),
+        function(t)
+          local s = tostring(t):lower()
+          return s == "确认" or s == "确定" or s == "删除" or s == "是" or s == "yes" or s == "y"
+        end)
     end
   elseif name == "bar" then
     self.panel:cycleMode()
@@ -816,6 +857,19 @@ function Agent:onMessage(msg)
         msg.tokens or 0, msg.budgetTokens or 0), "info")
     end
 
+  elseif t == "conversations_result" then
+    self:showConversationTable(msg)
+
+  elseif t == "conversation_result" then
+    -- 结果行由桥的 say 给（已本地化）；这里只兜一句"没连上"之类
+    if msg.ok == false and msg.reason == "not-found" then
+      self.panel:log(i18n.t("convNotFound"), "error")
+    end
+
+  elseif t == "replay" then
+    -- 关掉面板 / 重启 Aseprite 之后把上次的记录补回屏幕（替换，不是追加）
+    self.panel:replayLines(msg.lines, msg.more, msg.title)
+
   elseif t == "open_doc" then
     self:openDocument(msg)
 
@@ -832,6 +886,36 @@ function Agent:onMessage(msg)
   else
     self.panel:log(string.format(i18n.t("unknownMessage"), tostring(t)), "error")
   end
+end
+
+-- 对话表：把桥发来的清单渲染成一张可选的表（复用命令表那套交互：敲编号/字母、点行、悬浮）
+function Agent:showConversationTable(msg)
+  local items = msg.items or {}
+  local rows = {}
+  for i, it in ipairs(items) do
+    local note = string.format(i18n.t("convMeta"), tonumber(it.messages) or 0,
+      panel.shortTokens(it.tokens))
+    if it.active then note = note .. i18n.t("convCurrent") end
+    rows[#rows + 1] = {
+      id = "conv:" .. i,
+      keys = "",                                  -- 对话行只认编号，不占字母键
+      label = tostring(it.title or ""),
+      note = note,
+    }
+  end
+  if #items == 0 then
+    self.panel:log(i18n.t("convEmpty"), "info")
+    return
+  end
+  rows[#rows + 1] = { id = "conversation_new", keys = "n",
+    label = i18n.t("convRowNew"), note = i18n.t("convRowNewNote") }
+  rows[#rows + 1] = { id = "conversation_rename", keys = "r",
+    label = i18n.t("convRowRename"), note = i18n.t("convRowRenameNote") }
+  rows[#rows + 1] = { id = "conversation_delete", keys = "d",
+    label = i18n.t("convRowDelete"), note = i18n.t("convRowDeleteNote") }
+
+  local title = i18n.t("convTitle") .. "   --   " .. i18n.t("convFooter")
+  self.panel:openTable(rows, title, "conv")
 end
 
 function Agent:onBinary(header, data)

@@ -941,4 +941,148 @@ do
   ok(#bad == 0, "底边栏里控件都在画布内，越界的：" .. table.concat(bad, " "))
 end
 
+print("== 多对话（v0.5.8）：内建词 / 对话表 / 待输入参数 / 回放 ==")
+do
+  -- 中英都能敲，而且不能撞上别的命令
+  ok(i18n.builtinAction("chats") == "conversations", "chats -> conversations")
+  ok(i18n.builtinAction("conversations") == "conversations", "conversations -> conversations")
+  ok(i18n.builtinAction("会话") == "conversations", "「会话」-> conversations")
+  ok(i18n.builtinAction("对话表") == "conversations", "「对话表」-> conversations")
+  ok(i18n.builtinAction("新对话") == "conversation_new", "「新对话」-> conversation_new")
+  ok(i18n.builtinAction("newchat") == "conversation_new", "newchat -> conversation_new")
+  ok(i18n.builtinAction("改名") == "conversation_rename", "「改名」-> conversation_rename")
+  ok(i18n.builtinAction("删对话") == "conversation_delete", "「删对话」-> conversation_delete")
+  ok(i18n.builtinAction("清空") == "clear", "「清空」还是清屏（没被抢走）")
+  ok(i18n.builtinAction("清空上下文") == "reset_history", "「清空上下文」还是 reset_history")
+  ok(i18n.builtinAction("history") == "versions", "history 还是版本栈（没被对话抢走）")
+
+  -- 命令表里有对话这一行，键位不和别的撞
+  local keys, ids = {}, {}
+  for _, r in ipairs(i18n.menuCommands()) do
+    keys[#keys + 1] = tostring(r.keys)
+    ids[r.id] = true
+  end
+  ok(ids.conversations, "命令表里有 conversations 行")
+  local seen, dup = {}, {}
+  for _, k in ipairs(keys) do
+    if seen[k] then dup[#dup + 1] = k end
+    seen[k] = true
+  end
+  ok(#dup == 0, "键位没撞车，重复的：" .. table.concat(dup, ","))
+
+  -- 对话表：走的是命令表那套交互（编号 / 点行 / 悬浮）
+  local p = panel.new{ frameImage = function() return nil end }
+  local picked = {}
+  p.opts.onAction = function(id, arg) picked[#picked + 1] = { id = id, arg = arg } end
+  local rows = {
+    { id = "conv:1", keys = "", label = "外壳配色", note = "12 条 / 3.4k ← 当前" },
+    { id = "conv:2", keys = "", label = "图标方案", note = "4 条 / 0.9k" },
+    { id = "conversation_new", keys = "n", label = "新对话", note = "干净的一页" },
+    { id = "conversation_rename", keys = "r", label = "改名当前对话", note = "下一行输入就是新名字" },
+    { id = "conversation_delete", keys = "d", label = "删除当前对话", note = "移进回收站" },
+  }
+  p:openTable(rows, "对话表   --   敲编号切换", "conv")
+  ok(p:menuIsOpen(), "打开对话表后进入可选状态")
+  ok(#p.menuRows == 5, "五行都在，实际 " .. #p.menuRows)
+
+  p:fillInput("2")
+  p:_submit()
+  ok(#picked == 1 and picked[1].id == "conv:2", "敲编号 2 -> conv:2，实际 " ..
+    tostring(picked[1] and picked[1].id))
+
+  p:fillInput("n")
+  p:_submit()
+  ok(picked[#picked].id == "conversation_new", "敲字母 n -> 新对话，实际 " .. tostring(picked[#picked].id))
+
+  -- 重打的是对话表，不是命令表（以前写死重打命令表，这里会串）
+  local sawConvTitle = false
+  for _, l in ipairs(p.lines) do
+    if tostring(l.text):find("对话表", 1, true) then sawConvTitle = true end
+  end
+  ok(sawConvTitle, "重打的还是对话表")
+  local sawMenuTitle = false
+  for _, l in ipairs(p.lines) do
+    if tostring(l.text):find(i18n.t("menuTitle"), 1, true) then sawMenuTitle = true end
+  end
+  ok(not sawMenuTitle, "没有把命令表顶上来")
+
+  -- 待输入参数：只吃下一行，不当命令也不当聊天
+  local p2 = panel.new{ frameImage = function() return nil end }
+  local got, chats = {}, {}
+  p2.opts.onAction = function(id, arg) got[#got + 1] = { id = id, arg = arg } end
+  p2.opts.onSend = function(text) chats[#chats + 1] = text end
+  p2:setPendingInput("conversation_rename", i18n.t("convRenameAsk"), function(t) return t ~= "x" end)
+  p2:fillInput("外壳配色")
+  p2:_submit()
+  ok(#got == 1 and got[1].id == "conversation_rename" and got[1].arg == "外壳配色",
+    "下一行输入成了参数：" .. tostring(got[1] and got[1].arg))
+  ok(#chats == 0, "没被当成聊天发出去")
+  ok(p2.pendingInput == nil, "用完就清掉")
+  p2:fillInput("普通一句话")
+  p2:_submit()
+  ok(#chats == 1 and #got == 1, "第二行恢复成正常聊天")
+
+  -- 取消：accept 返回 false
+  p2:setPendingInput("conversation_delete", i18n.t("convDeleteAsk"), function(t) return t == "确认" end)
+  p2:fillInput("算了")
+  p2:_submit()
+  ok(#got == 1, "取消时不该发动作")
+  local sawCancel = false
+  for _, l in ipairs(p2.lines) do
+    if l.text == i18n.t("convCancelled") then sawCancel = true end
+  end
+  ok(sawCancel, "取消要提示一句")
+  p2:setPendingInput("conversation_delete", i18n.t("convDeleteAsk"), function(t) return t == "确认" end)
+  p2:fillInput("确认")
+  p2:_submit()
+  ok(got[#got].id == "conversation_delete", "确认后才真的发删除")
+
+  -- 回放：替换（不是追加），带 kind，带表头
+  local p3 = panel.new{ frameImage = function() return nil end }
+  p3:log("先有一行旧的", "info")
+  p3:replayLines({
+    { kind = "user", text = "画个苹果" },
+    { kind = "tool", text = "已画 128 像素" },
+    { kind = "ai", text = "画好了" },
+    { kind = "info", text = "Bridge ready.", i18n = "ctxRestored" },
+  }, 7)
+  local stale = false
+  local kinds = {}
+  for _, l in ipairs(p3.lines) do
+    if l.text == "先有一行旧的" then stale = true end
+    kinds[l.kind] = (kinds[l.kind] or 0) + 1
+  end
+  ok(not stale, "回放是替换：旧行不在了")
+  ok(#p3.lines == 5, "表头 + 四行 = 5 行，实际 " .. #p3.lines)
+  ok(kinds.user == 1 and kinds.tool == 1 and kinds.ai == 1, "回放保留了 kind（颜色）")
+  local head = tostring(p3.lines[1].text)
+  ok(head:find("恢复", 1, true) ~= nil and head:find("7", 1, true) ~= nil, "表头写了行数和更早的条数：" .. head)
+  local localized = false
+  for _, l in ipairs(p3.lines) do
+    if l.text == i18n.t("ctxRestored") then localized = true end
+  end
+  ok(localized, "带 i18n 键的行按本地化文案渲染")
+
+  -- 空记录也要说一句，不能是一片空白
+  local p4 = panel.new{ frameImage = function() return nil end }
+  p4:replayLines({}, 0)
+  ok(#p4.lines == 1 and p4.lines[1].text == i18n.t("replayNone"), "没有记录时提示一句")
+
+  -- 面板本地产的行要告诉桥（记进回放），桥来的行不转发（否则记两遍）
+  local p5 = panel.new{ frameImage = function() return nil end }
+  local forwarded = {}
+  p5.opts.onLog = function(kind, text) forwarded[#forwarded + 1] = { kind = kind, text = text } end
+  p5:log("形态已切换到 底边栏", "info")
+  ok(#forwarded == 1 and forwarded[1].text == "形态已切换到 底边栏", "本地产的行转给了桥")
+  p5:log("桥发来的一行", "ai", { fromBridge = true })
+  ok(#forwarded == 1, "桥来的行不转发")
+  p5:echo("用户敲的")
+  ok(#forwarded == 1, "回显（用户那行）不转发 —— 桥自己会记")
+
+  -- token 短标签（对话表里用）
+  ok(panel.shortTokens(3400) == "3.4k", "3400 -> 3.4k，实际 " .. panel.shortTokens(3400))
+  ok(panel.shortTokens(2000) == "2k", "2000 -> 2k")
+  ok(panel.shortTokens(950) == "950", "950 -> 950")
+end
+
 print(string.format("%d passed, %d failed", pass, fail))

@@ -4,16 +4,22 @@
 //   * 重启桥（或重启 Aseprite）就忘光了，用户感觉"它没有记忆"；
 //   * 硬砍尾巴会把"我们刚才决定用哪个颜色/哪个文件"整段丢掉。
 //
-// 这个模块做两件事（和 dsh / ZCode 的上下文管理同一个思路）：
-//   1) **落盘**：历史写到 data/history.json，重启继续。
+// 这个模块做四件事：
+//   1) **落盘**：历史写到对话文件，重启继续。
 //   2) **压缩**：超过预算时，把最老的一段交给 LLM 摘要成几句话，
 //      作为常驻摘要挂在系统提示后面，只保留最近的原始消息。
+//   3) **留档**（v0.5.8）：压缩掉的老消息进 `archive`，**不再从磁盘上消失** ——
+//      摘要只是"不再发给模型"，不是"删掉"。以前的写法是 `messages = keep` 直接落盘，
+//      老消息就真没了。
+//   4) **回放**（v0.5.8）：面板上滚过去的那段记录（`log`）也存下来。
+//      只存消息不够 —— 用户看到的"它记得我们聊过"是屏幕上那些字，
+//      而面板的滚回区原本只在 Lua 内存里，重启 Aseprite 就是一片空白。
 //
 // 预算按 **token 估算**算（不是条数）：条数和长度没关系，一条字符网格能顶几十条闲聊。
 // 估法故意保守：中英混排按 2.5 字符 ≈ 1 token 折算（中文接近 1:1、英文约 4:1）。
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 const NL = String.fromCharCode(10);   // 不写字面量换行，免得被各层转义吃掉
 
@@ -22,6 +28,13 @@ export const MAX_BUDGET_TOKENS = 200000;      // 想开大可以，但别把 128
 const MAX_SUMMARY_CHARS = 1200;               // 单次摘要字数上限
 const MAX_SUMMARY_TOTAL = 3600;               // 累计摘要上限（超了留最新的那截）
 const MAX_CONTENT_CHARS = 2000;               // 单条消息进摘要前的截断，防止把整张字符网格喂进去
+
+export const DEFAULT_ARCHIVE_CAP = 2000;      // 留档上限（条）；超了丢最老的
+export const DEFAULT_LOG_CAP = 400;           // 面板回放行数上限
+const MAX_TITLE_CHARS = 24;
+
+/** 用户消息被 buildUserMessage 包成 `[Current canvas state]…[User request]…`，标题要取后面那截 */
+const USER_REQUEST_MARK = '[User request]';
 
 /** 粗估 token 数。故意不引入 tokenizer：这里只需要"别超窗"的量级判断。 */
 export function estimateTokens(s) {
@@ -46,14 +59,43 @@ export function clampBudget(n) {
   return Math.min(MAX_BUDGET_TOKENS, Math.max(1000, Math.round(v)));
 }
 
+/**
+ * 从一条 user 消息里抠出用户真正打的那句话（去掉画布上下文那一段）。
+ * 标题就靠它 —— 直接拿 content 开头会是 "[Current canvas state]"。
+ */
+export function userRequestOf(content) {
+  const s = typeof content === 'string' ? content : '';
+  const i = s.indexOf(USER_REQUEST_MARK);
+  return (i >= 0 ? s.slice(i + USER_REQUEST_MARK.length) : s).trim();
+}
+
+/** 从消息数组里派生一个标题：第一条用户消息的首行，按字符数截断 */
+export function deriveTitle(messages, fallback = '') {
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (m?.role !== 'user') continue;
+    const text = userRequestOf(m.content);
+    if (!text) continue;
+    const first = text.split(NL)[0].trim();
+    const chars = [...first];                       // 按字符数截，不是字节数
+    if (chars.length <= MAX_TITLE_CHARS) return first;
+    return chars.slice(0, MAX_TITLE_CHARS).join('') + '…';
+  }
+  return fallback;
+}
+
 export class Conversation {
   /**
    * @param {object} opts
-   *   file          持久化路径（data/history.json）
+   *   file          持久化路径（data/conversations/<id>.json）
+   *   id            对话 id（缺省用文件名）
+   *   title         标题（缺省空，之后由 deriveTitle 填）
    *   budgetTokens  历史预算（token 估算）；超了触发压缩
    *   keepRatio     压缩后保留多少比例的最新原文（默认 0.4）
    *   minKeep       至少保留几条（默认 4），免得压缩完只剩一条孤零零的
    *   maxMessages   条数安全阀（默认 120）：工具调用刷屏时兜底
+   *   archiveCap    留档上限（默认 2000 条）
+   *   logCap        面板回放行上限（默认 400 行）
+   *   now           取当前时间的函数（测试用，保证时间戳确定）
    */
   constructor(opts = {}) {
     this.file = opts.file || join(process.cwd(), 'data', 'history.json');
@@ -61,8 +103,19 @@ export class Conversation {
     this.keepRatio = opts.keepRatio ?? 0.4;
     this.minKeep = opts.minKeep ?? 4;
     this.maxMessages = opts.maxMessages ?? 120;
+    this.archiveCap = opts.archiveCap ?? DEFAULT_ARCHIVE_CAP;
+    this.logCap = opts.logCap ?? DEFAULT_LOG_CAP;
+    this.now = opts.now || (() => new Date());
+
+    const stamp = this.now().toISOString();
+    this.id = opts.id || basename(this.file).replace(/\.json$/i, '');
+    this.title = opts.title || '';
+    this.createdAt = opts.createdAt || stamp;
+    this.updatedAt = opts.updatedAt || stamp;
     this.messages = [];
     this.summary = '';
+    this.archive = [];
+    this.log = [];
     this.load();
   }
 
@@ -72,10 +125,18 @@ export class Conversation {
       const raw = JSON.parse(readFileSync(this.file, 'utf8'));
       if (Array.isArray(raw.messages)) this.messages = raw.messages;
       if (typeof raw.summary === 'string') this.summary = raw.summary;
+      if (typeof raw.id === 'string' && raw.id) this.id = raw.id;
+      if (typeof raw.title === 'string') this.title = raw.title;
+      if (typeof raw.createdAt === 'string' && raw.createdAt) this.createdAt = raw.createdAt;
+      if (typeof raw.updatedAt === 'string' && raw.updatedAt) this.updatedAt = raw.updatedAt;
+      if (Array.isArray(raw.archive)) this.archive = raw.archive;
+      if (Array.isArray(raw.log)) this.log = raw.log;
     } catch {
       // 文件坏了就当新的开始，别让桥起不来
       this.messages = [];
       this.summary = '';
+      this.archive = [];
+      this.log = [];
     }
     return this;
   }
@@ -108,28 +169,68 @@ export class Conversation {
 
   save() {
     this.trimIncompleteTail();
+    if (!this.title) this.title = deriveTitle(this.messages);
     try {
       mkdirSync(dirname(this.file), { recursive: true });
-      writeFileSync(this.file, JSON.stringify({ summary: this.summary, messages: this.messages }, null, 2), 'utf8');
+      const stamp = this.now().toISOString();
+      if (stamp > this.updatedAt) this.updatedAt = stamp;
+      writeFileSync(this.file, JSON.stringify({
+        id: this.id,
+        title: this.title,
+        createdAt: this.createdAt,
+        updatedAt: this.updatedAt,
+        summary: this.summary,
+        messages: this.messages,
+        archive: this.archive,
+        log: this.log,
+      }, null, 2), 'utf8');
       return true;
     } catch {
       return false;                    // 存不下来不影响本次会话
     }
   }
 
+  /**
+   * 清空这个对话（消息/摘要/留档/回放），但**保留 id 和标题**。
+   * "清空"不等于"删掉这个对话" —— 删对话是 store 的事（移进回收站）。
+   */
   reset() {
     this.messages = [];
     this.summary = '';
+    this.archive = [];
+    this.log = [];
     this.save();
     return { ok: true, messages: 0, tokens: 0, summary: '' };
   }
 
+  /** 面板回放行：屏幕上滚过去的每一行。i18nKey 有值时面板会本地化重渲染。 */
+  pushLog(kind, text, i18nKey) {
+    const t = String(text == null ? '' : text);
+    if (!t) return this;
+    const row = { kind: String(kind || 'info'), text: t };
+    if (i18nKey) row.i18n = String(i18nKey);
+    this.log.push(row);
+    if (this.log.length > this.logCap) this.log = this.log.slice(-this.logCap);
+    return this;
+  }
+
+  /** 留档：压缩掉的老消息进 archive（只留档，永不外发） */
+  _archive(msgs) {
+    if (!Array.isArray(msgs) || msgs.length === 0) return;
+    this.archive = this.archive.concat(msgs);
+    if (this.archive.length > this.archiveCap) this.archive = this.archive.slice(-this.archiveCap);
+  }
+
   stats() {
     return {
+      id: this.id,
+      title: this.title,
       messages: this.messages.length,
       tokens: this.usedTokens(),
       budgetTokens: this.budgetTokens,
       summaryChars: this.summary.length,
+      archived: this.archive.length,
+      logLines: this.log.length,
     };
   }
 
@@ -162,6 +263,7 @@ export class Conversation {
   needsCompaction() {
     return this.usedTokens() > this.budgetTokens || this.messages.length > this.maxMessages;
   }
+
 
   /**
    * 切分：新的留下、老的拿去摘要。
@@ -231,7 +333,8 @@ export class Conversation {
 
     const text = this._renderForSummary(drop);
     if (!text.trim()) {
-      // 全是工具噪音：直接丢掉，不用麻烦 LLM
+      // 全是工具噪音：直接丢掉，不用麻烦 LLM（但照样留档）
+      this._archive(drop);
       this.messages = keep;
       this.save();
       return { compacted: true, summary: this.summary, dropped: drop.length, tokensBefore: before, reason: 'tool-noise-only' };
@@ -250,8 +353,9 @@ export class Conversation {
       // 摘要本身也不能无限涨：留下最后一截（越新的越相关）
       this.summary = this.summary.slice(-MAX_SUMMARY_TOTAL);
     }
+    this._archive(drop);          // 摘要 ≠ 删除：原文进留档
     this.messages = keep;
     this.save();
-    return { compacted: true, summary: this.summary, dropped: drop.length, tokensBefore: before };
+    return { compacted: true, summary: this.summary, dropped: drop.length, tokensBefore: before, archived: this.archive.length };
   }
 }

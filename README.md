@@ -417,22 +417,60 @@ STATUS.md             当前进度、踩坑记录、下一步
 - **算子报"只支持 32 位 RGB/RGBA"**：先执行 精灵 > 色彩模式 > RGB。
 - **单张图超过 512x512**：逐像素算子有上限（512x512），先缩小范围或分区域处理。
 
-## 上下文与记忆（v0.5.2）
+## 上下文与记忆（v0.5.2；v0.5.8 起分对话、压缩不再真删）
 
 助手有两层记忆，互不干扰：
 
-1. **对话上下文**（本轮新增）—— 存在 `bridge/data/history.json`，重启桥 / 重启 Aseprite
-   都接得上，握手时面板会提示"已恢复上次会话的上下文"。
-   长度按 **token 预算**算（默认 16000，设置里可调 1000–200000）：超了就把最老的一段交给
-   LLM 摘要成几句话，摘要常驻系统提示，只保留最近的原始消息 ——
-   所以"外壳用 #2E86DE"这种决定不会因为聊久了被忘掉。
-   摘要失败时**宁可不压**（留着原文），绝不把上下文弄丢。
-   想重新开始：敲 `forget` / `清空上下文`（命令表里是 `M` 键）。
+1. **对话上下文** —— 存在 `bridge/data/conversations/<对话 id>.json`，**一个对话一个文件**，
+   重启桥 / 重启 Aseprite / 重启电脑都接得上。长度按 **token 预算**算（默认 16000，
+   设置里可调 1000–200000）：超了就把最老的一段交给 LLM 摘要成几句话，摘要常驻系统提示，
+   只保留最近的原始消息 —— 所以"外壳用 #2E86DE"这种决定不会因为聊久了被忘掉。
+   **摘要不等于删除**：被摘要掉的原文进同一个文件的 `archive` 段留着（上限 2000 条），
+   只是不再发给模型。摘要失败时**宁可不压**（留着原文），绝不把上下文弄丢。
 2. **长期记忆**（v0.4.0 就有）—— `remember` / `recall` 工具 + `bridge/data/memory.json`，
    只在你明确让它记的时候才存，按关键词召回，不会全量塞进提示词（省 token）。
+   **全局共享**：换对话也还记得你的偏好。
 
 一次请求最多调几次工具由 `Steps per request` 决定（默认 24）。撞上上限时它会说
 "已达本轮步数上限，说『继续』我就接着做"—— 因为有上下文，接着说"继续"真的能接着画。
+
+## 多对话（v0.5.8）
+
+**打开面板就是上次那段对话**，屏幕上那段记录也回来了（不只是上下文，是你看到的那些字）。
+
+```
+▸ 会话
+对话表   --   敲编号切换 · 点行也行 · x 关闭
+ 1:  把背景改成蓝色            12 条 / 3.4k tok
+ 2:  图标配色方案               4 条 / 0.9k tok ← 当前
+ 3:  工作区交付流程            31 条 / 9.1k tok
+ 8:n 新对话                    干净的一页，旧的留着
+ 9:r 改名当前对话              下一行输入就是新名字
+ 0:d 删除当前对话              移进回收站，不是真删
+▸ 2
+已切换对话。
+── 以下是恢复的记录：14 行 ──
+▸ 换个风格画个 16x16 的药水图标
+· 已画 128 像素（16x16），图层 主体
+…
+```
+
+命令（中英都能敲）：
+
+| 敲什么 | 干什么 |
+|---|---|
+| `会话` / `对话表` / `chats` | 列出对话表，敲编号切过去 |
+| `新对话` / `new chat` | 开一条新的（旧的留着，随时切回来） |
+| `改名` / `rename` | 改当前对话的名字（下一行输入就是新名字） |
+| `删对话` / `delete chat` | 删当前对话（要敲一次确认；进回收站，可捞回） |
+| `忘记` / `forget` | 清空**当前**对话的内容（对话本身还在） |
+
+- 命令表里也有这一行（`A` 键）。
+- **删除是移进 `data/conversations/trash/`**，不是真删；**只剩一个对话时拒绝删除**
+  （否则界面没地方可去）。
+- **老用户的 `data/history.json` 会自动变成第一个对话**（标题从老消息里派生），
+  原文件改名 `history.json.migrated` 留底。
+- 对话文件是普通 JSON，想备份/搬走直接拷 `data/conversations/` 就行。
 
 ## 输入行上的控件（v0.5.3 起；v0.5.4 起所有形态都有；v0.5.5 起多了最小化）
 
@@ -568,6 +606,13 @@ python tools/bdf2ttf.py <字体.bdf> -o fusion-pixel-10px.ttf --family "Fusion P
 - **面板窗口点一下会跳回原大小这件事已经修了**（v0.5.0）：根因是每次点画布都会
   `dlg:modify` 改焦点，而那会触发重新布局把窗口撑回内容自然尺寸。现在只在
   焦点确实不在输入框、且窗口还是自然尺寸时才 modify。
+- **桥只有一个"活动对话"**：一个桥进程（一个端口）服务所有 Aseprite 窗口，
+  所以多开窗口共享同一个活动对话（后开的那个会把当前对话切走）。
+  协议里留了 `hello.conversation` 字段，以后要做"每窗口一个对话"不用改结构。
+- **回放上限 400 行**：更早的仍在文件里，只是不再回放到屏幕；命令历史（↑/↓）不落盘。
+- **回放是"替换"不是"追加"**：桥是唯一真相来源，连上就把面板滚回区换成该对话的记录
+  （短暂断线重连会重画一遍，不会重复）。
+- **归档会占磁盘**：`archive` 上限 2000 条，超出丢最老的。
 
 ## 测试
 
@@ -578,19 +623,20 @@ aseprite.exe -b --script tests/lua/ops_test.lua       # 52 项
 aseprite.exe -b --script tests/lua/versions_test.lua  # 20 项
 aseprite.exe -b --script tests/lua/sizelib_test.lua   # 23 项（裁剪/缩放/包围盒）
 aseprite.exe -b --script tests/lua/artlib_test.lua    # 40 项（字符网格作画）
-aseprite.exe -b --script tests/lua/artop_test.lua     # 72 项（协议层：桥的消息 -> 真动画布）
-aseprite.exe -b --script tests/lua/panel_test.lua     # 204 项（滚轮/状态转圈/Esc 中断/选项输入/四种形态/控件几何）
+aseprite.exe -b --script tests/lua/artop_test.lua     # 103 项（协议层：桥的消息 -> 真动画布）
+aseprite.exe -b --script tests/lua/panel_test.lua     # 242 项（滚轮/状态转圈/Esc 中断/选项输入/四种形态/控件几何/多对话）
 aseprite.exe -b --script tests/lua/settings_test.lua  # 36 项（设置窗：步数/上下文/温度/思考强度）
 aseprite.exe -b --script tests/lua/path_test.lua      # 安装路径机制
-aseprite.exe -b --script tests/lua/workspace_test.lua # 177 项（工作区：备份/副本/交付/打开/上传，用真文件）
+aseprite.exe -b --script tests/lua/workspace_test.lua # 183 项（工作区：备份/副本/交付/打开/上传，用真文件）
 
 # 桥的自测（mock LLM + mock Aseprite，不联网、不花 token）
-cd bridge && npm test                                 # 382 项，跑下面六个
-node test/selftest.mjs                                # 100 项（端到端：桥 <-> 假 LLM <-> 假 Aseprite）
+cd bridge && npm test                                 # 450 项，跑下面七个
+node test/selftest.mjs                                # 140 项（端到端：桥 <-> 假 LLM <-> 假 Aseprite）
 node test/memory_test.mjs                             # 23 项（记忆库）
 node test/styles_test.mjs                             # 47 项（风格库：优先级/清洗/只注入当前）
 node test/tools_test.mjs                              # 180 项（25 个工具的分发 + 幂等 + 能力清单交叉核对）
-node test/history_test.mjs                            # 19 项（上下文：预算/压缩/摘要失败不丢原文）
+node test/history_test.mjs                            # 24 项（上下文：预算/压缩/留档/摘要失败不丢原文）
+node test/conversations_test.mjs                      # 23 项（多对话：建切改删/迁移/回收站/活动对话落盘）
 node test/gaps_test.mjs                               # 13 项（做不到清单：去重计数/淘汰/已处理段保留/CLI）
 
 # GUI 可视化验证（会短暂弹 Aseprite 窗口并自动截图）

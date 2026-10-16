@@ -16,7 +16,8 @@ import { Memory } from './memory.mjs';
 import { Styles } from './styles.mjs';
 import { TOOLS, makeDispatcher } from './tools.mjs';
 import { runTurn, chatCompletion } from './llm.mjs';
-import { Conversation, clampBudget } from './history.mjs';
+import { clampBudget } from './history.mjs';
+import { ConversationStore } from './conversations.mjs';
 import { GapLog } from './gaps.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -55,11 +56,32 @@ const bank = new ColorBank(BANK_PATH);
 const MEMORY_PATH = join(ROOT, cfg.paths?.memory || 'data/memory.json');
 const memory = new Memory(MEMORY_PATH);
 
-// 对话历史：落盘 + 超长自动压缩（data/history.json）
-const history = new Conversation({
-  file: join(ROOT, cfg.paths?.history || 'data/history.json'),
+// 对话：一个对话一个文件（data/conversations/<id>.json），超长自动压缩。
+// 老的 data/history.json 会被 store 自动迁成第一个对话（原文件留底）。
+//   * `history` 是**稳定引用**：切对话时 store 换的是它的 file 再 load，
+//     所以下面所有 `history.xxx` 调用都不用关心"现在是哪个对话"。
+//   * 消息 + 摘要 + 留档 + 面板回放行，全在同一个文件里（见 history.mjs）。
+const store = new ConversationStore({
+  dir: join(ROOT, cfg.paths?.conversations || 'data/conversations'),
   budgetTokens: cfg.llm?.contextTokens,
+  legacyFile: join(ROOT, cfg.paths?.history || 'data/history.json'),
+  activeId: cfg.activeConversation || '',
 });
+const history = store.current;
+
+// "当前是哪个对话"落盘（和 activeStyle 一个套路），重启桥还认
+function persistActiveConversation(id) {
+  cfg.activeConversation = id;
+  try {
+    const raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
+    raw.activeConversation = id;
+    writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2), 'utf8');
+  } catch { /* 存不下来不影响本次会话 */ }
+}
+
+// 第一次跑（或上次那个被删了）时 store 会自动建/挑一个，这里把它记下来 ——
+// 不记的话下次重启就只能靠"最近更新过的那个"猜。
+if (cfg.activeConversation !== store.activeId) persistActiveConversation(store.activeId);
 
 // 做不到的需求：模型（或自动兜底）记进 data/gaps.md，开发者读它去实现。
 const gaps = new GapLog({ file: join(ROOT, cfg.paths?.gaps || 'data/gaps.md') });
@@ -105,6 +127,11 @@ function configPayload() {
     colorBank: BANK_PATH,
     perfectPixelReady: existsSync(BUNDLE),
     workspace: { root: cfg.workspace?.root || '' },
+    conversation: {
+      id: store.activeId,
+      title: history.title,
+      count: store.stats().count,
+    },
     ui: {
       mode: cfg.ui?.mode || 'panel',
       barBg: cfg.ui?.barBg || '',
@@ -141,8 +168,31 @@ class Session {
   }
 
   // i18nKey 有值时，面板会用本地化文案覆盖 text（P3 的中断提示等）
-  say(kind, text, i18nKey) {
+  // record=false 的行不进对话回放（握手提示这种连接噪声不该污染记录）
+  say(kind, text, i18nKey, record = true) {
+    if (record) history.pushLog(kind, text, i18nKey);
     this.send({ type: 'say', kind, text, i18n: i18nKey });
+  }
+
+  // 把当前对话的记录推给面板（面板收到就清屏重画）——关掉面板 / 重启 Aseprite 之后
+  // "它还记得我们聊过"靠的就是这条。桥是唯一真相来源，所以是替换不是追加。
+  sendReplay() {
+    const r = store.replay(400);
+    this.send({
+      type: 'replay',
+      id: store.activeId,
+      title: history.title,
+      count: store.stats().count,
+      lines: r.lines,
+      more: r.more,
+    });
+  }
+
+  // 切/建/删对话之后的统一收尾：落盘活动对话 + 刷新电量条 + 回放新对话
+  afterConversationChange() {
+    persistActiveConversation(store.activeId);
+    this.pushContext();
+    this.sendReplay();
   }
 
   status(text, kind) {
@@ -193,6 +243,8 @@ class Session {
   enqueueChat(text, context) {
     // gaps 记录要用：这一轮用户说的原话
     this.lastUserText = String(text || '').slice(0, 300);
+    // 面板回放要看到"我说过什么"，所以用户这句也记一行
+    history.pushLog('user', text);
     this.queue.push({ text, context });
     if (!this.busy) this.drain();
   }
@@ -341,22 +393,29 @@ class Session {
     switch (msg.type) {
       case 'hello': {
         this.info = msg;
-        this.say('info', `Bridge ready. Aseprite ${msg.aseprite}, ${(msg.ops || []).length} ops available.`);
+        // 先回放上次的记录（面板收到就清屏重画），再发握手提示 —— 反过来的话
+        // 提示会被回放冲掉，用户看到的第一屏就少了那几行。
+        this.sendReplay();
+        // 下面这些都是连接噪声：只给面板看，不进对话记录
+        this.say('info', `Bridge ready. Aseprite ${msg.aseprite}, ${(msg.ops || []).length} ops available.`, null, false);
         this.status('ready', 'ok');
         this.send(configPayload());
         if (!cfg.llm?.apiKey) {
-          this.say('info', 'No API key yet -- click Settings in the panel to paste one.');
+          this.say('info', 'No API key yet -- click Settings in the panel to paste one.', null, false);
         }
         this.pushContext();
         const gs = gaps.stats();
         if (gs.entries > 0) {
-          this.say('info', `Known gaps on file: ${gs.entries} (see ${gs.file}).`, 'gapsKnown');
+          this.say('info', `Known gaps on file: ${gs.entries} (see ${gs.file}).`, 'gapsKnown', false);
         }
+        const cs = store.stats();
+        this.say('info', `Conversation "${cs.title || 'untitled'}" -- ${cs.count} on file. Type "chats" to switch.`, 'convActive', false);
         const st = history.stats();
         if (st.messages > 0) {
           this.say('info', `Context restored: ${st.messages} message(s), about ${st.tokens} tokens` +
             (st.summaryChars ? `, plus a ${st.summaryChars}-char summary` : '') +
-            '.', 'ctxRestored');
+            (st.archived ? `, ${st.archived} archived` : '') +
+            '.', 'ctxRestored', false);
         }
         break;
       }
@@ -449,7 +508,7 @@ class Session {
         const rep = history.reset();
         this.historyReset = true;
         this.pushContext();
-        this.say('info', 'Conversation context cleared.', 'ctxCleared');
+        this.say('info', 'This conversation is now empty. Use "new chat" if you want to keep it and start another.', 'ctxCleared');
         this.send({ type: 'history_result', id: msg.id, reset: true, ...rep });
         break;
       }
@@ -460,6 +519,81 @@ class Session {
       }
       case 'history_info':
         this.send({ type: 'history_result', id: msg.id, ...history.stats(), summary: history.summary });
+        break;
+
+      // ---- 多对话（v0.5.8）。注意 msg.id 是【请求 id】，对话 id 走 msg.target，
+      //      两个都是 id 太容易串，所以回复里对话 id 一律叫 convId。
+      case 'conversation_list':
+        this.send({
+          type: 'conversations_result',
+          id: msg.id,
+          items: store.list(),
+          active: store.activeId,
+          title: history.title,
+          dir: store.dir,
+        });
+        break;
+      case 'conversation_new': {
+        const rep = store.create({ title: msg.title || '' });
+        this.say('info', `New conversation started (#${store.stats().count}).`, 'convNew');
+        this.afterConversationChange();
+        this.send({
+          type: 'conversation_result', id: msg.id, ok: true, action: 'new',
+          convId: rep.id, active: store.activeId, title: history.title, count: store.stats().count,
+        });
+        break;
+      }
+      case 'conversation_switch': {
+        const rep = store.activate(msg.target ?? msg.index ?? msg.convId);
+        if (!rep.ok) {
+          this.say('error', `No such conversation: ${msg.target ?? msg.index ?? ''}`, 'convNotFound');
+        } else {
+          this.say('info', `Switched to "${rep.title || history.title || 'untitled'}".`, 'convSwitched');
+          this.afterConversationChange();
+        }
+        this.send({
+          type: 'conversation_result', id: msg.id, ok: rep.ok, action: 'switch',
+          convId: rep.id || store.activeId, active: store.activeId, title: history.title,
+          reason: rep.reason, unchanged: rep.unchanged,
+          count: store.stats().count,
+        });
+        break;
+      }
+      case 'conversation_rename': {
+        const rep = store.rename(msg.target ?? msg.convId ?? store.activeId, msg.title);
+        if (rep.ok) this.say('info', `Renamed to "${rep.title}".`, 'convRenamed');
+        else this.say('error', rep.reason === 'empty-title' ? 'A name is required.' : 'No such conversation.', 'convRenameFailed');
+        this.send({
+          type: 'conversation_result', id: msg.id, ok: rep.ok, action: 'rename',
+          convId: rep.id || store.activeId, active: store.activeId, title: rep.title, reason: rep.reason,
+          count: store.stats().count,
+        });
+        break;
+      }
+      case 'conversation_delete': {
+        const rep = store.remove(msg.target ?? msg.convId ?? store.activeId);
+        if (rep.ok) {
+          this.say('info', `Deleted "${rep.title}" (moved to trash). Now on "${history.title || 'untitled'}".`, 'convDeleted');
+          this.afterConversationChange();
+        } else if (rep.reason === 'last') {
+          this.say('warn', 'That is the only conversation left -- use "clear" to empty it instead.', 'convLast');
+        } else {
+          this.say('error', 'No such conversation.', 'convNotFound');
+        }
+        this.send({
+          type: 'conversation_result', id: msg.id, ok: rep.ok, action: 'delete',
+          convId: rep.id || store.activeId, active: store.activeId, title: rep.title, reason: rep.reason,
+          next: rep.next, count: store.stats().count,
+        });
+        break;
+      }
+      case 'history_replay':
+        this.sendReplay();
+        break;
+      // 面板本地产的那几行（切形态、设置保存…）也记一笔，回放时才和现场一致。
+      // 只记账，不回声 —— 面板自己已经画过了。
+      case 'log':
+        history.pushLog(msg.kind || 'info', msg.text);
         break;
       case 'open_doc_result':
         this.resolvePending(msg.id, msg.ok
@@ -538,6 +672,8 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     sessions.delete(session);
+    // 关面板/关 Aseprite：把最后一轮之后产生的行（工具提示、错误…）也落盘
+    try { history.save(); } catch { /* 存不下来不影响退出 */ }
     console.log('[bridge] Aseprite disconnected');
   });
 
@@ -557,6 +693,7 @@ httpServer.listen(PORT, '127.0.0.1', () => {
   console.log(`[bridge] listening on ws://127.0.0.1:${PORT}`);
   console.log(`[bridge] health check http://127.0.0.1:${PORT}/health`);
   console.log(`[bridge] model ${cfg.llm?.model || '(unset)'} @ ${cfg.llm?.baseUrl || '(unset)'}`);
+  console.log(`[bridge] conversation ${store.activeId} "${history.title || '(untitled)'}" (${store.stats().count} on file, ${history.messages.length} messages)`);
   if (!cfg.llm?.apiKey) {
     console.log('[bridge] note: llm.apiKey is empty in config.json; chat will be refused.');
   }

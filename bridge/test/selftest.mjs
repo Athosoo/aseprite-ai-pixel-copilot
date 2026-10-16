@@ -10,7 +10,7 @@
 
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import WebSocket from 'ws';
@@ -315,7 +315,10 @@ async function main() {
     paths: {
       perfectPixelBundle: 'vendor/perfectPixel.mjs',
       colorBank: `test/.tmp/colors.json`,
-      // 历史也要隔离：不然场景之间会互相"记得"，而且压缩会偷偷吃掉 mock LLM 的脚本步
+      // 对话也要隔离：不然场景之间会互相"记得"，而且压缩会偷偷吃掉 mock LLM 的脚本步。
+      // conversations 是 v0.5.8 起的对话目录；history 只剩"老文件迁移源"这一个身份，
+      // 这里指一个不存在的路径 = 不迁移（要测迁移的场景自己造文件）。
+      conversations: 'test/.tmp/conversations',
       history: 'test/.tmp/history.json',
       gaps: 'test/.tmp/gaps.md',
     },
@@ -775,13 +778,18 @@ async function main() {
 
   // ---- 场景 13：上下文记忆（v0.5.2 上下文管理）
   console.log('== 场景 13：对话记忆落盘 -> 跨桥重启还在 -> 可清空 -> 步数/思考可调 ==');
-  const HIST = join(TMP, 'history13.json');
-  rmSync(HIST, { force: true });
+  const CONV13 = join(TMP, 'conversations13');
+  rmSync(CONV13, { recursive: true, force: true });
+  // 这个场景只有一个对话，所以"活动对话文件"就是目录里唯一那个 json
+  const convFile13 = () => {
+    const names = readdirSync(CONV13).filter((f) => f.endsWith('.json'));
+    return names.length ? join(CONV13, names[0]) : '';
+  };
   const cfg7 = {
     ...testConfig,
     port: BRIDGE_PORT + 60,
     llm: { ...testConfig.llm, maxSteps: 24 },
-    paths: { ...testConfig.paths, history: 'test/.tmp/history13.json' },
+    paths: { ...testConfig.paths, conversations: 'test/.tmp/conversations13' },
   };
   const configPath7 = join(TMP, 'config7.json');
   writeFileSync(configPath7, JSON.stringify(cfg7, null, 2), 'utf8');
@@ -811,13 +819,17 @@ async function main() {
   check('握手就推了一次上下文用量（底边栏电量条靠它）',
     ctxPushes.length > 0 && ctxPushes[0].budget === 16000 && typeof ctxPushes[0].used === 'number',
     ctxPushes[0]);
-  check('对话落盘了', existsSync(HIST), HIST);
-  const saved = JSON.parse(readFileSync(HIST, 'utf8'));
+  check('对话落盘了（一个对话一个文件）', existsSync(convFile13()), convFile13());
+  const saved = JSON.parse(readFileSync(convFile13(), 'utf8'));
   // 用户那条前面带着画布上下文（buildUserMessage 拼的），所以用 includes 判断
   check('落盘内容 = 用户那句 + 助手那句', saved.messages.length === 2
     && saved.messages[0].role === 'user'
     && String(saved.messages[0].content).includes('记住：外壳用 #2E86DE')
     && saved.messages[1].role === 'assistant', saved.messages.map((m) => m.role));
+  check('落盘里还有面板回放行（用户那行 + 助手回复）',
+    Array.isArray(saved.log) && saved.log.some((l) => l.kind === 'user' && l.text.includes('#2E86DE')),
+    saved.log);
+  check('标题从第一句用户话派生', saved.title === '记住：外壳用 #2E86DE', saved.title);
 
   // 重启桥：历史要读回来，并在握手后提示用户
   bridge7.kill();
@@ -833,6 +845,18 @@ async function main() {
   await sleep(300);
   check('重启后握手就告诉用户"上下文已恢复"',
     ase7b.says.some((s) => s.i18n === 'ctxRestored'), ase7b.says.map((s) => s.i18n));
+  // 面板的滚回区是 Lua 内存里的，重启就没了 —— 靠桥回放补回来
+  const replay1 = ase7b.received.find((m) => m.type === 'replay');
+  check('握手就把上次的记录回放给面板', !!replay1 && replay1.lines.length >= 2, replay1);
+  check('回放里有用户那行和助手那行',
+    replay1?.lines.some((l) => l.kind === 'user' && l.text.includes('#2E86DE'))
+    && replay1?.lines.some((l) => l.kind === 'ai'),
+    replay1?.lines);
+  check('回放带着对话标题和个数', typeof replay1?.title === 'string' && replay1?.count === 1, replay1);
+  check('回放排在握手提示之前（不然提示会被冲掉）',
+    ase7b.received.findIndex((m) => m.type === 'replay')
+    < ase7b.received.findIndex((m) => m.type === 'say' && String(m.text).includes('Bridge ready')),
+    ase7b.received.map((m) => m.type).slice(0, 6));
 
   mockLlm.close();
   global.__sentMessages = null;
@@ -860,7 +884,7 @@ async function main() {
   check('reset 回执', cleared?.reset === true, cleared);
   check('清空后桥提示了用户（带本地化键）',
     ase7b.says.some((s) => s.i18n === 'ctxCleared'), ase7b.says.map((s) => s.i18n));
-  const afterReset = JSON.parse(readFileSync(HIST, 'utf8'));
+  const afterReset = JSON.parse(readFileSync(convFile13(), 'utf8'));
   check('清空后文件里没有消息了', afterReset.messages.length === 0 && afterReset.summary === '',
     afterReset.messages.length);
 
@@ -1040,6 +1064,213 @@ async function main() {
 
   bridge7.kill();
   ase7b.close();
+  await sleep(200);
+
+  // ---- 场景 16：多对话（v0.5.8）
+  console.log('== 场景 16：多对话 -> 各聊各的 -> 重启桥还认 -> 删进回收站 ==');
+  const CONV16 = join(TMP, 'conversations16');
+  rmSync(CONV16, { recursive: true, force: true });
+  const cfg8 = {
+    ...testConfig,
+    port: BRIDGE_PORT + 70,
+    paths: { ...testConfig.paths, conversations: 'test/.tmp/conversations16' },
+  };
+  const configPath8 = join(TMP, 'config8.json');
+  writeFileSync(configPath8, JSON.stringify(cfg8, null, 2), 'utf8');
+
+  const spawnBridge8 = async () => {
+    const b = spawn(process.execPath, [join(ROOT, 'src', 'server.mjs'), '--config', configPath8], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    b.stderr.on('data', (d) => process.stdout.write(`[bridge:err] ${d}`));
+    await sleep(700);
+    return b;
+  };
+
+  let bridge8 = await spawnBridge8();
+  let ase8 = new MockAseprite(BRIDGE_PORT + 70);
+  await ase8.connect();
+  await sleep(250);
+
+  check('握手就报了当前对话与个数',
+    ase8.says.some((s) => s.i18n === 'convActive'), ase8.says.map((s) => s.i18n));
+  check('自动建了第一个对话（目录里一个文件）',
+    readdirSync(CONV16).filter((f) => f.endsWith('.json')).length === 1, readdirSync(CONV16));
+
+  // 对话 A 聊一句
+  mockLlm.close();
+  mockLlm = await startMockLlm([() => textReply('A：外壳用 #2E86DE。')]);
+  await sleep(150);
+  ase8.chat('A 话题：外壳用什么颜色');
+  await sleep(900);
+  const convA = JSON.parse(readFileSync(join(TMP, 'config8.json'), 'utf8')).activeConversation;
+  check('活动对话 id 落到了 config.json', /^c-\d{8}-[a-z0-9]{4}$/.test(String(convA)), convA);
+
+  // 开新对话 -> 上下文清空、回放是空的
+  ase8.received.length = 0;
+  ase8.send({ type: 'conversation_new', id: 201 });
+  await sleep(400);
+  const newRes = ase8.received.find((m) => m.type === 'conversation_result');
+  check('新建对话回执带新 id 和个数 2', newRes?.ok === true && newRes?.action === 'new'
+    && newRes?.count === 2 && newRes.convId !== convA, newRes);
+  const replayNew = ase8.received.filter((m) => m.type === 'replay').at(-1);
+  check('新对话的回放是空的（切过去就是干净的一页）',
+    replayNew && replayNew.lines.length <= 1, replayNew);
+  const ctxNew = ase8.received.filter((m) => m.type === 'context').at(-1);
+  check('切完电量条归零', ctxNew?.used === 0 && ctxNew?.messages === 0, ctxNew);
+
+  mockLlm.close();
+  mockLlm = await startMockLlm([() => textReply('B：药水图标画好了。')]);
+  await sleep(150);
+  ase8.chat('B 话题：画个药水图标');
+  await sleep(900);
+  const convB = JSON.parse(readFileSync(join(TMP, 'config8.json'), 'utf8')).activeConversation;
+  check('B 是另一个对话', convB && convB !== convA, { convA, convB });
+
+  // 列表：两个对话，B 是当前
+  ase8.received.length = 0;
+  ase8.send({ type: 'conversation_list', id: 202 });
+  await sleep(300);
+  const listRes = ase8.received.find((m) => m.type === 'conversations_result');
+  check('列表报出两个对话', listRes?.items?.length === 2, listRes?.items);
+  check('列表标出了当前那个', listRes?.active === convB && listRes.items.filter((i) => i.active).length === 1,
+    listRes?.items?.map((i) => [i.id, i.active]));
+  check('列表带标题（从第一句用户话派生）',
+    listRes?.items?.some((i) => i.title === 'B 话题：画个药水图标')
+    && listRes.items.some((i) => i.title === 'A 话题：外壳用什么颜色'),
+    listRes?.items?.map((i) => i.title));
+  check('列表带条数与 token 估算',
+    listRes?.items?.every((i) => i.messages === 2 && i.tokens > 0), listRes?.items);
+
+  // 切回 A：拿回 A 的上下文，不是 B 的
+  mockLlm.close();
+  global.__sentMessages16 = null;
+  mockLlm = await startMockLlm([
+    (body) => { global.__sentMessages16 = body.messages; return textReply('A：外壳是 #2E86DE。'); },
+  ]);
+  await sleep(150);
+  ase8.received.length = 0;
+  ase8.send({ type: 'conversation_switch', id: 203, target: convA });
+  await sleep(400);
+  const swRes = ase8.received.find((m) => m.type === 'conversation_result');
+  check('切回 A 的回执', swRes?.ok === true && swRes?.convId === convA, swRes);
+  const replayA = ase8.received.filter((m) => m.type === 'replay').at(-1);
+  check('回放的是 A 的记录（不是 B 的）',
+    replayA?.lines.some((l) => l.text.includes('A 话题'))
+    && !replayA?.lines.some((l) => l.text.includes('B 话题')), replayA?.lines);
+  await sleep(200);
+  ase8.chat('我刚才问的是什么颜色？');
+  await sleep(900);
+  const seenA = (global.__sentMessages16 || []).some(
+    (m) => typeof m.content === 'string' && m.content.includes('A 话题：外壳用什么颜色'));
+  const seenB = (global.__sentMessages16 || []).some(
+    (m) => typeof m.content === 'string' && m.content.includes('B 话题'));
+  check('A 的上下文回来了', seenA, (global.__sentMessages16 || []).map((m) => String(m.content).slice(0, 16)));
+  check('B 的话没有串进 A', !seenB, (global.__sentMessages16 || []).map((m) => String(m.content).slice(0, 16)));
+
+  // 改名（带空格要清掉）
+  ase8.received.length = 0;
+  ase8.send({ type: 'conversation_rename', id: 204, title: '  外壳配色  ' });
+  await sleep(300);
+  const renRes = ase8.received.find((m) => m.type === 'conversation_result');
+  check('改名回执', renRes?.ok === true && renRes?.title === '外壳配色', renRes);
+  check('改名也提示了用户', ase8.says.some((s) => s.i18n === 'convRenamed'), ase8.says.map((s) => s.i18n));
+  const renamedOnDisk = JSON.parse(readFileSync(join(CONV16, `${convA}.json`), 'utf8'));
+  check('新名字落盘了', renamedOnDisk.title === '外壳配色', renamedOnDisk.title);
+
+  // 重启桥：活动对话与内容都要在
+  bridge8.kill();
+  ase8.close();
+  await sleep(300);
+  bridge8 = await spawnBridge8();
+  ase8 = new MockAseprite(BRIDGE_PORT + 70);
+  await ase8.connect();
+  await sleep(300);
+  const replayAfterRestart = ase8.received.filter((m) => m.type === 'replay').at(-1);
+  check('重启后还在 A（活动对话落盘了）',
+    replayAfterRestart?.id === convA && replayAfterRestart?.count === 2, replayAfterRestart);
+  check('重启后回放里是 A 的记录和改过的名字',
+    replayAfterRestart?.title === '外壳配色'
+    && replayAfterRestart?.lines.some((l) => l.text.includes('A 话题')), replayAfterRestart?.title);
+  ase8.send({ type: 'history_info', id: 205 });
+  await sleep(300);
+  const infoAfter = ase8.received.filter((m) => m.type === 'history_result').at(-1);
+  check('重启后 A 的消息条数还在', infoAfter?.messages >= 3, infoAfter);
+
+  // 删掉当前对话（A）-> 自动切到 B，文件进 trash
+  ase8.received.length = 0;
+  ase8.send({ type: 'conversation_delete', id: 206, target: convA });
+  await sleep(400);
+  const delRes = ase8.received.find((m) => m.type === 'conversation_result');
+  check('删除回执', delRes?.ok === true && delRes?.action === 'delete' && delRes?.count === 1, delRes);
+  check('删当前那个 -> 自动切到另一个', delRes?.next === convB && delRes?.active === convB, delRes);
+  check('删完回放的是 B', ase8.received.filter((m) => m.type === 'replay').at(-1)?.id === convB);
+  const trash = readdirSync(join(CONV16, 'trash'));
+  check('文件进了回收站（不是真删）', trash.length === 1, trash);
+  check('回收站那份内容完整',
+    JSON.parse(readFileSync(join(CONV16, 'trash', trash[0]), 'utf8')).title === '外壳配色');
+
+  // 只剩一个 -> 拒绝删除
+  ase8.received.length = 0;
+  ase8.send({ type: 'conversation_delete', id: 207, target: convB });
+  await sleep(300);
+  const lastRes = ase8.received.find((m) => m.type === 'conversation_result');
+  check('删最后一个被拒（界面不能没地方可去）',
+    lastRes?.ok === false && lastRes?.reason === 'last', lastRes);
+  check('拒绝时提示了用户', ase8.says.some((s) => s.i18n === 'convLast'), ase8.says.map((s) => s.i18n));
+  check('拒绝后对话还在', readdirSync(CONV16).filter((f) => f.endsWith('.json')).length === 1);
+
+  // 面板本地产的行也要进回放（切形态、设置保存那些）
+  ase8.received.length = 0;
+  ase8.send({ type: 'log', kind: 'info', text: '形态已切换到 底边栏' });
+  await sleep(200);
+  ase8.send({ type: 'history_replay', id: 208 });
+  await sleep(300);
+  const replayWithLocal = ase8.received.find((m) => m.type === 'replay');
+  check('面板本地产的行也记进了回放',
+    replayWithLocal?.lines.some((l) => l.text === '形态已切换到 底边栏'), replayWithLocal?.lines);
+
+  // 迁移：老的单文件历史变成第一个对话（用独立目录，别污染上面这个）
+  const CONV17 = join(TMP, 'conversations17');
+  const LEGACY17 = join(TMP, 'history17.json');
+  rmSync(CONV17, { recursive: true, force: true });
+  writeFileSync(LEGACY17, JSON.stringify({
+    summary: '老摘要',
+    messages: [
+      { role: 'user', content: '[Current canvas state]\n(pixels)\n\n[User request]\n把角色改成 32x32' },
+      { role: 'assistant', content: '好的' },
+    ],
+  }, null, 2), 'utf8');
+  const cfg9 = {
+    ...testConfig,
+    port: BRIDGE_PORT + 80,
+    paths: { ...testConfig.paths, conversations: 'test/.tmp/conversations17', history: 'test/.tmp/history17.json' },
+  };
+  const configPath9 = join(TMP, 'config9.json');
+  writeFileSync(configPath9, JSON.stringify(cfg9, null, 2), 'utf8');
+  const bridge9 = spawn(process.execPath, [join(ROOT, 'src', 'server.mjs'), '--config', configPath9], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  bridge9.stderr.on('data', (d) => process.stdout.write(`[bridge:err] ${d}`));
+  await sleep(700);
+  const ase9 = new MockAseprite(BRIDGE_PORT + 80);
+  await ase9.connect();
+  await sleep(300);
+  const migrated = ase9.received.filter((m) => m.type === 'replay').at(-1);
+  check('老 history.json 迁成了第一个对话', readdirSync(CONV17).filter((f) => f.endsWith('.json')).length === 1,
+    readdirSync(CONV17));
+  check('迁移后标题从老对话派生', migrated?.title === '把角色改成 32x32', migrated?.title);
+  check('迁移后原文件留底', existsSync(`${LEGACY17}.migrated`) && !existsSync(LEGACY17));
+  ase9.send({ type: 'history_info', id: 209 });
+  await sleep(300);
+  check('老消息一条不少（含摘要）',
+    ase9.received.filter((m) => m.type === 'history_result').at(-1)?.summaryChars === 3,
+    ase9.received.filter((m) => m.type === 'history_result').at(-1));
+
+  bridge9.kill();
+  ase9.close();
+  bridge8.kill();
+  ase8.close();
   await sleep(200);
 
 

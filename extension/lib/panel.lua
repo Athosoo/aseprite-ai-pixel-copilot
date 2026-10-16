@@ -185,8 +185,11 @@ function panel.new(opts)
     -- 命令表
     menuOpen = false,
     menuRows = nil,
+    tableTitle = nil,          -- 当前开着的是哪张表（命令表 / 对话表…）
     menuHover = 0,
     hitRows = {},
+    -- 下一行输入当作参数（改名 / 删除确认）
+    pendingInput = nil,
     -- 状态栏（P2/P5a）：busy 决定转圈，docName 显示当前文件
     statusRaw = "",
     statusKind = "ok",
@@ -245,12 +248,49 @@ function Panel:log(text, kind, meta)
   while #self.lines > MAX_LINES do table.remove(self.lines, 1) end
   self.dirty = true
   self.scroll = 0
+  -- 面板本地产的行也告诉桥一声（只记账、不回显），这样重启后回放的和现场一致。
+  -- fromBridge 的行不转发 —— 它们本来就是桥发过来的，转发会记两遍。
+  if not (meta and meta.fromBridge) and self.opts.onLog then
+    local ok, err = pcall(self.opts.onLog, kind, tostring(text))
+    if not ok then self.opts.onLog = nil; self.alert = tostring(err) end
+  end
   self:repaint()
 end
 
 -- 终端风格：把用户敲的命令回显出来
 function Panel:echo(text)
-  self:log(text, "user")
+  self:log(text, "user", { fromBridge = true })
+end
+
+-- 让"下一行输入"当参数交给某个动作（改名 / 删除确认）。
+-- accept(text) 返回 false 表示用户取消了；不传 = 任何输入都算接受。
+function Panel:setPendingInput(action, hint, accept)
+  self.pendingInput = { action = action, accept = accept }
+  self:log(hint, "info")
+  self:repaint()
+end
+
+-- 回放桥发来的记录（关掉面板 / 重启 Aseprite 之后"它还记得"就靠这个）。
+-- 是【替换】不是追加：桥是唯一真相来源，避免重连时同一段记录出现两遍。
+function Panel:replayLines(lines, more, title)
+  self:clear()
+  local n = #(lines or {})
+  if n == 0 then
+    self:log(i18n.t("replayNone"), "info", { fromBridge = true })
+    return
+  end
+  local tail = ""
+  if more and more > 0 then tail = string.format(i18n.t("replayMore"), more) end
+  self:log(string.format(i18n.t("replayHead"), n, tail), "info", { fromBridge = true })
+  for _, l in ipairs(lines) do
+    local text = l.text
+    local key = l.i18n
+    if key then
+      local loc = i18n.t(key)
+      if loc then text = loc end
+    end
+    self:log(text, l.kind or "info", { fromBridge = true })
+  end
 end
 
 -- 解析 "#RRGGBB" / "#RGB"（栏底色的用户配置）。认不出来返回 nil，调用方回落到默认底色。
@@ -508,6 +548,26 @@ function Panel:_submit()
       if self.opts.onAskAnswer then self.opts.onAskAnswer(ans) end
       return
     end
+  end
+
+  -- 正在等一个参数（改名 / 删除确认）：下一行就是参数，不当命令也不当聊天。
+  -- 故意不做"命令 + 空格 + 参数"的前缀匹配 —— 那会把"帮我打开 这张图"这种
+  -- 聊天文本误判成命令。宁可多一步提示。
+  if self.pendingInput then
+    local p = self.pendingInput
+    self.pendingInput = nil
+    self:echo(text)
+    local accepted = true
+    if p.accept then
+      local ok, res = pcall(p.accept, text)
+      accepted = ok and res and true or false
+    end
+    if accepted then
+      if self.opts.onAction then self.opts.onAction(p.action, text) end
+    else
+      self:log(i18n.t("convCancelled"), "info")
+    end
+    return
   end
 
   -- 命令表开着：编号 / 键位 / x 关闭
@@ -872,16 +932,18 @@ end
 
 -- "8.2k/16k" 这种短标签（栏里寸土寸金）
 function Panel:ctxLabel()
-  local function short(n)
-    n = math.floor(n)
-    if n >= 1000 then
-      if n % 1000 == 0 then return string.format("%dk", n / 1000) end
-      return string.format("%.1fk", n / 1000)
-    end
-    return tostring(n)
-  end
   if self.ctx.budget <= 0 then return "-" end
-  return short(self.ctx.used) .. "/" .. short(self.ctx.budget)
+  return panel.shortTokens(self.ctx.used) .. "/" .. panel.shortTokens(self.ctx.budget)
+end
+
+-- 3400 -> "3.4k"。对话表、电量条标签都用它，别各写一份。
+function panel.shortTokens(n)
+  n = math.floor(tonumber(n) or 0)
+  if n >= 1000 then
+    if n % 1000 == 0 then return string.format("%dk", n / 1000) end
+    return string.format("%.1fk", n / 1000)
+  end
+  return tostring(n)
 end
 
 -- 桥发来的权威值（配置回推 / 启动恢复）：连"已提交"一起对齐
@@ -1362,10 +1424,13 @@ function Panel:_menuRowData()
   return {}
 end
 
--- 打印一份新的命令表到滚回缓冲
-function Panel:_printMenuTable()
-  self.menuRows = self:_menuRowData()
-  self:log(menu.titleLine(i18n), "info")
+-- 打印一份表到滚回缓冲（命令表 / 对话表都用它）。
+-- rows = { {id, keys, label, note}, ... }，title 是表头那一行，kind 决定重打时怎么重建。
+function Panel:_printTable(rows, title, kind)
+  self.menuRows = rows or {}
+  self.tableTitle = title
+  self.tableKind = kind or "conv"
+  self:log(title or menu.titleLine(i18n), "info")
   local lines = menu.tableLines(self.menuRows)
   if #lines == 0 then
     self:log(i18n.t("noCommands"), "info")
@@ -1376,11 +1441,25 @@ function Panel:_printMenuTable()
   end
 end
 
+-- 打印一份新的命令表到滚回缓冲
+function Panel:_printMenuTable()
+  self:_printTable(self:_menuRowData(), menu.titleLine(i18n), "menu")
+end
+
 function Panel:openMenu()
   self:show()
   self.menuOpen = true
   self.menuHover = 0
   self:_printMenuTable()
+  self:repaint()
+end
+
+-- 打开任意一张可选的表（对话表就是这么复用的：悬浮高亮 / 点行 / 敲编号/字母全都一样）
+function Panel:openTable(rows, title, kind)
+  self:show()
+  self.menuOpen = true
+  self.menuHover = 0
+  self:_printTable(rows, title, kind)
   self:repaint()
 end
 
@@ -1409,8 +1488,12 @@ function Panel:_runMenuIndex(idx)
     if self.opts.onAction then self.opts.onAction(id) end
   end
 
-  -- 执行后自动重打一份（旧的往上滚）
-  if self.menuOpen then self:_printMenuTable() end
+  -- 执行后自动重打一份（旧的往上滚）。
+  -- 重打的是【当前这张表】：以前写死重打命令表，从对话表里挑一行会把命令表顶上来。
+  if self.menuOpen then
+    if self.tableKind == "menu" then self:_printMenuTable()
+    else self:_printTable(self.menuRows, self.tableTitle, self.tableKind) end
+  end
 end
 
 -- 鼠标命中：返回命中行的菜单序号
