@@ -522,6 +522,12 @@ function Agent:action(name)
     self:deliver()
   elseif name == "reset_history" then
     self:resetHistory()
+  elseif name == "gaps" then
+    if self.conn and self.conn:isOpen() then
+      self:send{ type = "gaps_info", id = self:nextId() }
+    else
+      self.panel:log(i18n.t("gapsFailed"), "error")
+    end
   elseif name == "ctx_info" then
     if self.conn and self.conn:isOpen() then
       self:send{ type = "history_info", id = self:nextId() }
@@ -783,6 +789,18 @@ function Agent:onMessage(msg)
 
   elseif t == "ask" then
     self:askUser(msg)
+
+  elseif t == "gaps_result" then
+    if (msg.entries or 0) == 0 then
+      self.panel:log(i18n.t("gapsNone"), "info")
+    else
+      self.panel:log(string.format(i18n.t("gapsReport"), msg.entries or 0, msg.mentions or 0), "info")
+      self.panel:log(string.format(i18n.t("gapsWhere"), tostring(msg.file or "")), "info")
+      local last = msg.recent and msg.recent[#msg.recent]
+      if last and last.request then
+        self.panel:log(string.format(i18n.t("gapsRecent"), tostring(last.request)), "tool")
+      end
+    end
 
   elseif t == "context" then
     -- 上下文用量：底边栏的 20 格电量条

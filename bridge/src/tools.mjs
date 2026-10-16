@@ -6,6 +6,7 @@
 
 import { perfectPixel } from './perfectpixel.mjs';
 import { isAsciiName } from './styles.mjs';
+import { looksLikeCapabilityGap } from './gaps.mjs';
 
 // RGBA 里有多少种不同的颜色（忽略全透明像素）。
 // 给 perfect_pixel 当诊断数据：像素画通常几十色以内，照片则成千上万。
@@ -246,6 +247,26 @@ export const TOOLS = [
           },
         },
         required: ['question', 'options'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'log_gap',
+      description:
+        'Record a request you could NOT fulfil, into the project backlog file the developer reads. ' +
+        'Call this EVERY time the user asks for something your tools cannot do (after you have checked ' +
+        'capabilities), or when you had to refuse/limit a request. Say what they asked for and why it is ' +
+        'not possible right now. Then still answer the user honestly -- logging is not a substitute for it.',
+      parameters: {
+        type: 'object',
+        properties: {
+          request: { type: 'string', description: "what the user asked for, in their words (short)" },
+          why: { type: 'string', description: 'why it cannot be done with the current tools' },
+          workaround: { type: 'string', description: 'what you offered instead, if anything' },
+        },
+        required: ['request', 'why'],
       },
     },
   },
@@ -563,7 +584,33 @@ export function buildCapabilities(session, cfg = {}) {
   };
 }
 
-export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath, getActiveStyle, setActiveStyle }) {  return async function dispatch(name, args) {
+export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath, getActiveStyle, setActiveStyle, gaps }) {
+  // 每个工具的结果都过一道：出现"做不到"类错误就自动记一笔（模型可能忘了调 log_gap）
+  const autoLog = (tool, args, result) => {
+    if (!gaps || !result || typeof result !== 'object') return result;
+    if (result.ok === true) return result;
+    const text = result.error || result.hint || '';
+    if (!text || !looksLikeCapabilityGap(text)) return result;
+    try {
+      gaps.add({
+        request: session?.lastUserText || `(tool ${tool} failed)`,
+        why: String(text),
+        tool,
+        model: cfg?.llm?.model || '',
+        context: typeof args === 'object' ? JSON.stringify(args).slice(0, 180) : '',
+        source: 'auto',
+      });
+      result.logged = true;      // 让模型知道"已经记下了"，不用再补一次
+    } catch { /* 记不下来不影响这次调用 */ }
+    return result;
+  };
+
+  return async function dispatch(name, args) {
+    const out = await dispatchInner(name, args);
+    return autoLog(name, args, out);
+  };
+
+  async function dispatchInner(name, args) {
     switch (name) {
       case 'canvas_info':
         return await session.request('canvas_info');
@@ -823,6 +870,24 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
         });
       }
 
+      case 'log_gap': {
+        if (!gaps) return { error: 'gap log is not available' };
+        return gaps.add({
+          request: args.request,
+          why: args.why,
+          workaround: args.workaround,
+          tool: session?.lastTool || '',
+          model: cfg?.llm?.model || '',
+          context: session?.lastUserText || '',
+          source: 'model',
+        });
+      }
+
+      case 'gaps_info': {
+        if (!gaps) return { error: 'gap log is not available' };
+        return { ...gaps.stats(), recent: gaps.recent(5) };
+      }
+
       case 'recall':
         return memory.recall(args);
 
@@ -836,7 +901,7 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
         return bank.search(args);
 
       default:
-        return { error: `unknown tool: ${name}` };
+        return { error: `unknown tool: ${name}`, hint: 'not supported by this build' };
     }
   };
 }

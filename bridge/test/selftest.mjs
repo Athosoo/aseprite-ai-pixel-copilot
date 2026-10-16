@@ -317,6 +317,7 @@ async function main() {
       colorBank: `test/.tmp/colors.json`,
       // 历史也要隔离：不然场景之间会互相"记得"，而且压缩会偷偷吃掉 mock LLM 的脚本步
       history: 'test/.tmp/history.json',
+      gaps: 'test/.tmp/gaps.md',
     },
   };
   const configPath = join(TMP, 'config.json');
@@ -951,6 +952,91 @@ async function main() {
     global.__quantOk?.ops?.[0]?.op === 'quantize'
     && global.__quantOk.ops[0].extra?.colorsBefore === 128
     && global.__quantOk.ops[0].extra?.colorsAfter === 61, global.__quantOk);
+
+  // ---- 场景 15：做不到的请求会记进文档（v0.5.6）
+  console.log('== 场景 15：做不到的请求 -> 落进开发者读的那份文档 ==');
+  const GAPS = join(TMP, 'gaps.md');
+  rmSync(GAPS, { force: true });
+  rmSync(GAPS + '.json', { force: true });
+
+  mockLlm.close();
+  global.__gapResult = null;
+  mockLlm = await startMockLlm([
+    toolCall('call_15a', 'log_gap', {
+      request: '把工具按钮放进 Aseprite 自己的状态栏',
+      why: '脚本没有往主窗口状态栏加控件的 API',
+      workaround: '放在面板的输入行里',
+    }),
+    (body) => {
+      const msgs = (body.messages || []).filter((m) => m.role === 'tool');
+      global.__gapResult = msgs.length ? JSON.parse(msgs[msgs.length - 1].content) : null;
+      return textReply('做不到：Aseprite 没给脚本这个接口，我先把需求记下来了。');
+    },
+  ]);
+  await sleep(150);
+  ase7b.chat('把这个按钮放到 Aseprite 底部那条状态栏里');
+  await sleep(900);
+
+  check('模型调 log_gap 拿到了回执', global.__gapResult?.ok === true && global.__gapResult?.added === true,
+    global.__gapResult);
+  check('落盘文件里有这条需求', existsSync(GAPS), GAPS);
+  const gapMd = readFileSync(GAPS, 'utf8');
+  check('文档里有原话和原因',
+    gapMd.includes('把工具按钮放进 Aseprite 自己的状态栏')
+    && gapMd.includes('脚本没有往主窗口状态栏加控件的 API'), gapMd.slice(0, 200));
+  check('文档里写了"给开发者看"和路径', gapMd.includes('给开发者') && gapMd.includes('gaps.md'));
+
+  // 同一条再说一遍 -> 只加计数
+  mockLlm.close();
+  global.__gapResult = null;
+  mockLlm = await startMockLlm([
+    toolCall('call_15b', 'log_gap', {
+      request: '把工具按钮放进 Aseprite 自己的状态栏。',
+      why: '脚本没有往主窗口状态栏加控件的 API！',
+    }),
+    (body) => {
+      const msgs = (body.messages || []).filter((m) => m.role === 'tool');
+      global.__gapResult = msgs.length ? JSON.parse(msgs[msgs.length - 1].content) : null;
+      return textReply('这条之前记过了，我再记一次。');
+    },
+  ]);
+  await sleep(150);
+  ase7b.chat('再试一次，放到状态栏');
+  await sleep(900);
+  check('重复的只加计数不新增', global.__gapResult?.added === false && global.__gapResult?.count === 2,
+    global.__gapResult);
+
+  // 自动兜底：工具报"做不到"类错误，模型没调 log_gap 也要记
+  mockLlm.close();
+  global.__unknownOp = null;
+  mockLlm = await startMockLlm([
+    toolCall('call_15c', 'apply_ops', { ops: [{ op: 'blur_everything' }] }),
+    (body) => {
+      const msgs = (body.messages || []).filter((m) => m.role === 'tool');
+      global.__unknownOp = msgs.length ? JSON.parse(msgs[msgs.length - 1].content) : null;
+      return textReply('这个算子没有。');
+    },
+  ]);
+  await sleep(150);
+  ase7b.failNextOps = 'unknown op blur_everything; available ops: replace_color, quantize';
+  ase7b.chat('帮我整张图做个高斯模糊');
+  await sleep(900);
+  check('工具错误的原文回到了模型', typeof global.__unknownOp?.error === 'string'
+    && global.__unknownOp.error.includes('unknown op'), global.__unknownOp);
+  check('自动兜底记了一笔（模型没调 log_gap 也记）', global.__unknownOp?.logged === true,
+    global.__unknownOp);
+  const gapMd2 = readFileSync(GAPS, 'utf8');
+  check('文档里有自动记录的那条 + 当时的请求',
+    gapMd2.includes('自动记录') && gapMd2.includes('帮我整张图做个高斯模糊'), gapMd2.slice(0, 400));
+  check('条数是 2（状态栏那条 + 模糊这条）', /待处理：\*\*2\*\*/.test(gapMd2), gapMd2.match(/待处理.*/)?.[0]);
+
+  // 面板里敲 gaps 能查到
+  ase7b.received.length = 0;
+  ase7b.send({ type: 'gaps_info', id: 99 });
+  await sleep(300);
+  const gapsMsg = ase7b.received.find((m) => m.type === 'gaps_result');
+  check('gaps_info 报出条数与路径', gapsMsg?.entries === 2 && String(gapsMsg.file).includes('gaps.md'),
+    gapsMsg);
 
   bridge7.kill();
   ase7b.close();

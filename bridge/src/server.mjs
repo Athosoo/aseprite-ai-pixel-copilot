@@ -17,6 +17,7 @@ import { Styles } from './styles.mjs';
 import { TOOLS, makeDispatcher } from './tools.mjs';
 import { runTurn, chatCompletion } from './llm.mjs';
 import { Conversation, clampBudget } from './history.mjs';
+import { GapLog } from './gaps.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -59,6 +60,9 @@ const history = new Conversation({
   file: join(ROOT, cfg.paths?.history || 'data/history.json'),
   budgetTokens: cfg.llm?.contextTokens,
 });
+
+// 做不到的需求：模型（或自动兜底）记进 data/gaps.md，开发者读它去实现。
+const gaps = new GapLog({ file: join(ROOT, cfg.paths?.gaps || 'data/gaps.md') });
 
 // 风格库：调色板 + 图层结构 + 作画规矩的模板。切换风格时**只注入当前那一个**，
 // 不是把整库塞进 prompt —— 这是省 token 的关键。
@@ -187,6 +191,8 @@ class Session {
 
   // 收到一个用户指令，串行处理（同一时间只跑一轮对话）
   enqueueChat(text, context) {
+    // gaps 记录要用：这一轮用户说的原话
+    this.lastUserText = String(text || '').slice(0, 300);
     this.queue.push({ text, context });
     if (!this.busy) this.drain();
   }
@@ -217,7 +223,7 @@ class Session {
 
     try {
       const dispatch = makeDispatcher({
-        session: this, bank, memory, styles, cfg, bundlePath: BUNDLE,
+        session: this, bank, memory, styles, cfg, bundlePath: BUNDLE, gaps,
         getActiveStyle: () => activeStyle,
         setActiveStyle: (n) => {
           activeStyle = n || '';
@@ -342,6 +348,10 @@ class Session {
           this.say('info', 'No API key yet -- click Settings in the panel to paste one.');
         }
         this.pushContext();
+        const gs = gaps.stats();
+        if (gs.entries > 0) {
+          this.say('info', `Known gaps on file: ${gs.entries} (see ${gs.file}).`, 'gapsKnown');
+        }
         const st = history.stats();
         if (st.messages > 0) {
           this.say('info', `Context restored: ${st.messages} message(s), about ${st.tokens} tokens` +
@@ -441,6 +451,11 @@ class Session {
         this.pushContext();
         this.say('info', 'Conversation context cleared.', 'ctxCleared');
         this.send({ type: 'history_result', id: msg.id, reset: true, ...rep });
+        break;
+      }
+      case 'gaps_info': {
+        const gs = gaps.stats();
+        this.send({ type: 'gaps_result', id: msg.id, ...gs, recent: gaps.recent(3) });
         break;
       }
       case 'history_info':

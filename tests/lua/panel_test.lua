@@ -311,6 +311,18 @@ do
   ok(i18n.builtinAction("cls") == "clear", "cls 还是清屏")
   ok(i18n.miniLabel("reset_history") ~= "" and i18n.miniLabel("reset_history") ~= "reset_history",
     "小面板标签有本地化文案")
+
+  -- 做不到清单（v0.5.6）：中英都能敲，命令表里有位置
+  ok(i18n.builtinAction("gaps") == "gaps", "gaps -> gaps")
+  ok(i18n.builtinAction("backlog") == "gaps", "backlog -> gaps")
+  ok(i18n.builtinAction("做不到") == "gaps", "「做不到」-> gaps")
+  ok(i18n.miniLabel("gaps") ~= "gaps", "做不到清单有本地化标签，实际 " .. tostring(i18n.miniLabel("gaps")))
+  local rows = i18n.menuCommands()
+  local found = false
+  for _, row in ipairs(rows) do if row.id == "gaps" then found = true end end
+  ok(found, "命令表里有「我做不到的事」这一行")
+  ok(i18n.t("gapsNone") ~= nil and i18n.t("gapsReport") ~= nil and i18n.t("gapsWhere") ~= nil,
+    "做不到清单的文案键都在")
   local of = nil
   for _, r in ipairs(rows) do if r.id == "open_file" then of = r end end
   ok(of ~= nil, "菜单里有「打开文件…」这一行")

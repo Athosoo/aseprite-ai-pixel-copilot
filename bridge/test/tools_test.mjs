@@ -48,7 +48,8 @@ console.log('== 工具注册 ==');
                 'open_document', 'list_workspace',
                 'new_sprite', 'add_layer', 'draw_art',
                 'perfect_pixel', 'snapshot', 'rollback', 'list_versions',
-                'remember', 'recall', 'forget', 'remember_color', 'search_colors'];
+                'remember', 'recall', 'forget', 'remember_color', 'search_colors',
+                'log_gap'];
   for (const n of want) ok(names.includes(n), `注册了 ${n}`);
   ok(names.length === want.length, `工具总数 = ${want.length}，实际 ${names.length}`);
   ok(new Set(names).size === names.length, '工具名没有重复');

@@ -48,6 +48,11 @@ local LOCALES = {
     dockHint     = "Dock to the bottom / to the side",
     modeSmall    = "Small window",
     smallHint    = "minimised - click here to restore",
+    gapsNone     = "Nothing recorded yet: I have not hit anything I could not do.",
+    gapsReport   = "%d request(s) I could not do are on file (mentioned %d time(s) in total).",
+    gapsWhere    = "The developer reads this file: %s",
+    gapsRecent   = "  latest: %s",
+    gapsFailed   = "Could not read the backlog: the bridge is not connected.",
     ctxInfo      = "Context: %d message(s), about %d of %d tokens used. Click the bar again after a reply to see it grow; forget clears it.",
     settingsTitle = "Bridge / LLM Settings",
     wsTitle     = "Workspace & look",
@@ -189,7 +194,7 @@ local LOCALES = {
     mini = {
       snapshot = "Snapshot", rollback = "Rollback", versions = "Versions",
       fix = "Fix images", bar = "Layout", settings = "Settings", close = "Hide",
-      reset_history = "Forget context",
+      reset_history = "Forget context", gaps = "Backlog",
     },
     -- 内建命令 -> 动作 id
     builtins = {
@@ -200,6 +205,7 @@ local LOCALES = {
       stop = "abort", abort = "abort", interrupt = "abort", cancel = "abort",
       deliver = "deliver", opendoc = "open_doc", ["open-doc"] = "open_doc",
       reset = "reset_history", context = "reset_history", forget = "reset_history",
+      gaps = "gaps", backlog = "gaps",
       exit = "@exit", quit = "@exit", close = "@exit", bye = "@exit",
     },
   },
@@ -238,6 +244,11 @@ local LOCALES = {
     dockHint     = "贴底 / 贴侧边（点一下切换）",
     modeSmall    = "小窗",
     smallHint    = "已最小化 —— 点这里还原",
+    gapsNone     = "还没有记录：目前没遇到我做不到的事。",
+    gapsReport   = "有 %d 条我做不到的需求已经记下来了（累计被提到 %d 次）。",
+    gapsWhere    = "开发者读的就是这个文件：%s",
+    gapsRecent   = "  最近一条：%s",
+    gapsFailed   = "读不到那份文档：桥没连上。",
     ctxInfo      = "上下文：%d 条消息，约用 %d / %d token。回复一次它会涨；敲 forget 可以清空。",
     settingsTitle = "桥 / LLM 设置",
     wsTitle     = "工作区与外观",
@@ -379,7 +390,7 @@ local LOCALES = {
     mini = {
       snapshot = "快照", rollback = "回滚", versions = "版本栈",
       fix = "矫正图片", bar = "切形态", settings = "设置", close = "收起",
-      reset_history = "清空上下文",
+      reset_history = "清空上下文", gaps = "做不到清单",
     },
     builtins = {
       menu = "menu", ["菜单"] = "menu", ["命令"] = "menu", ["命令表"] = "menu",
@@ -399,6 +410,7 @@ local LOCALES = {
       bar = "bar", ["栏"] = "bar", ["边栏"] = "bar", ["侧栏"] = "bar", ["形态"] = "bar",
       ["终止"] = "abort", ["打断"] = "abort",
       reset = "reset_history", forget = "reset_history", context = "reset_history",
+      gaps = "gaps", backlog = "gaps", ["做不到"] = "gaps", ["缺口"] = "gaps",
       ["清空上下文"] = "reset_history",
       ["忘记"] = "reset_history", ["重置上下文"] = "reset_history",
       exit = "@exit", quit = "@exit", close = "@exit", bye = "@exit",
@@ -424,6 +436,7 @@ local BUILDER = {
       { id = "open_doc",  keys = "P", label = "Open a document by path",            note = "the assistant resolves it" },
       { id = "bar",       keys = "B", label = "Switch layout",                     note = "panel / bottom bar / side bar" },
       { id = "reset_history", keys = "M", label = "Forget the conversation",        note = "clear the assistant's context" },
+      { id = "gaps",          keys = "K", label = "What I could not do",            note = "the backlog the developer reads" },
       { id = "clear",     keys = "L", label = "Clear console",                      note = "wipe the scrollback" },
       { id = "help",      keys = "H", label = "Help / examples",                    note = "how to talk to the AI" },
     }
@@ -443,6 +456,7 @@ local BUILDER = {
       { id = "open_doc",  keys = "P", label = "按路径打开文档",          note = "由助手在工作区里找" },
       { id = "bar",       keys = "B", label = "切换形态",                note = "面板 / 底边栏 / 侧边栏" },
       { id = "reset_history", keys = "M", label = "清空对话上下文",        note = "让助手忘掉之前聊的" },
+      { id = "gaps",          keys = "K", label = "我做不到的事",          note = "给开发者看的清单" },
       { id = "clear",     keys = "L", label = "清屏",                    note = "清空回滚缓冲" },
       { id = "help",      keys = "H", label = "帮助 / 示例",             note = "怎么跟 AI 说话" },
     }
