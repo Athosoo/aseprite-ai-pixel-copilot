@@ -102,6 +102,9 @@ function workbench.new(opts)
       elapsed = 0,
     },
     input = "",
+    -- 原生输入行（entry + 磁吸按钮）默认收起来：用户明确说过那条白横条是控制台时代遗留。
+    -- 但 entry 不能删 —— Aseprite 里只有 ui::Entry 开 IME，自绘 canvas 收不到中文。
+    inputOpen = false,
     completionOpen = false,
     paletteOpen = false,
     paletteQuery = "",
@@ -811,8 +814,10 @@ function Workbench:drawComposer(kit, r)
   local maxW = enterR.x - 8 - tx
   local text = self.input or ""
   if text == "" then
+    -- 提示文字给光标让出一个字符位：不然光标会压在提示的第一个字上，
+    -- 看起来像"文字被画了两遍"（这条是看真机截图发现的）
     local ph = kit:pick("说点什么，或敲 / 叫命令…", "say something, or press / for commands")
-    kit:text({ x = tx, y = y }, ph, { tone = "faint" })
+    kit:text({ x = tx + 8, y = y }, ph, { tone = "faint" })
     self.caretX = tx
   else
     local tw = kit:measure(text, {})
@@ -836,8 +841,11 @@ function Workbench:drawComposer(kit, r)
     end
     local tr = kit:text({ x = tx, y = y }, draw, { tone = "text" })
     self.caretX = tr.x + tr.w
-    kit:fill({ x = self.caretX + 1, y = y, w = 1, h = m.lineH }, "accent")
   end
+
+  -- 光标位：空输入时画在提示文字起点，有字时画在字尾。
+  -- 原生输入行收起来之后，这个光标就是"可以打字"的唯一可见凭证。
+  kit:fill({ x = self.caretX + 1, y = y, w = 1, h = m.lineH }, self.inputOpen and "accent" or "dim")
 
   if self.completionOpen then
     self:drawCompletion(kit, r)
@@ -1019,6 +1027,11 @@ function Workbench:escape()
     self:invalidate("main")
     return "popup"
   end
+  -- Esc 收起输入行：不提交、草稿留在 self.input 里（再点一下就能接着写）
+  if self.inputOpen then
+    self:closeInput()
+    return "input"
+  end
   if self.state.busy then
     local t = self.now()
     if self.interruptArmed and (t - self.interruptArmed) <= 2 then
@@ -1067,6 +1080,8 @@ function Workbench:submit()
   local text = tostring(self.input or ""):gsub("^%s+", ""):gsub("%s+$", "")
   self:setInput("")
   self.completionOpen = false
+  -- 提交即收：输入行是一次性的，常驻的只有自绘 composer
+  self:closeInput()
   if text == "" then return false end
   if self.paletteOpen then
     local items = self:paletteMatches()
@@ -1176,10 +1191,12 @@ end
 function Workbench:mouseDown(ev)
   local x, y, isLeft = self:_evPoint(ev)
   if not isLeft then return false end
-  -- 只有点进 composer 才碰焦点：别的地方抢焦点会打断输入法组合（旧面板同款判断）
+  -- 点自绘 composer = 想打字：这一刻才把原生输入行浮出来并给焦点。
+  -- 别的地方抢焦点会打断输入法组合（旧面板同款判断）。
   local L = self.L or self:layout()
   if L.composer and L.composer.h > 0 and y >= L.composer.y then
     self:focusComposer()
+    self:openInput()
   end
   return true
 end
@@ -1203,12 +1220,42 @@ function Workbench:mouseWheel(ev)
 end
 
 -- 面板注册给 canvas 的那组回调（build 与测试共用同一份，避免"测的不是真机跑的"）
+-- 是不是"敲了一个可打印字符"？带 Ctrl/Alt 的一律不算（那是快捷键）。
+function Workbench:_typedChar(ev)
+  if not ev then return nil end
+  local k = ev.key or ev
+  if k.ctrl or k.alt then return nil end
+  local u = k.unicode
+  if type(u) == "string" then
+    local b = u:byte(1)
+    if b and b >= 32 and b ~= 127 then return u end
+  end
+  local c = k.code
+  if type(c) == "string" and #c == 1 then
+    local b = c:byte(1)
+    if b and b >= 32 and b < 127 then return c end
+  end
+  return nil
+end
+
 function Workbench:handlers()
   return {
     onpaint = function(ev) self:paint(ev and ev.context or nil) end,
     onkeydown = function(ev)
       self:_input("key", function()
-        if self:key(ev) and ev and ev.stopPropagation then ev.stopPropagation() end
+        -- 快捷键优先（Ctrl+K / Alt+数字 / / / Esc…）
+        local handled = self:key(ev)
+        -- 输入行收着的时候，敲一个可打印字符应当"叫出"输入行并把这一下吞进来，
+        -- 否则用户看到的是"键盘没反应"。
+        if not handled and not self.inputOpen then
+          local ch = self:_typedChar(ev)
+          if ch then
+            self:openInput()
+            self:setInput((self.input or "") .. ch)
+            handled = true
+          end
+        end
+        if handled and ev and ev.stopPropagation then ev.stopPropagation() end
       end)
     end,
     onmousedown = function(ev) self:_input("mousedown", function() return self:mouseDown(ev) end) end,
@@ -1335,11 +1382,14 @@ function Workbench:build(dlg)
     onwheel = h.onwheel,
   }
   dlg:newrow()
-  dlg:entry{ id = "input", text = workbench.SENTINEL, hexpand = true,
+  -- 初始隐藏：常驻的白横条就是用户要去掉的那个"控制台遗留"。
+  -- entry 留着是因为中文输入只走原生 ui::Entry（自绘 canvas 收不到 IME）。
+  dlg:entry{ id = "input", text = workbench.SENTINEL, hexpand = true, visible = false,
              onchange = function() self:onEntryChange() end }
   dlg:samerow()
-  -- 磁吸按钮：focus=true 的按钮吃 ENTER（README 约束 5），所以提交挂在它身上
-  dlg:button{ id = "send", text = "⏎", hexpand = false, focus = true,
+  -- 磁吸按钮：focus=true 的按钮吃 ENTER（README 约束 5），所以提交挂在它身上。
+  -- 它必须和 entry **同显同隐** —— 按钮藏着，ENTER 就没人捕获。
+  dlg:button{ id = "send", text = "⏎", hexpand = false, focus = true, visible = false,
               onclick = function() self:submit() end }
   self.dlg = dlg
   return dlg
@@ -1363,6 +1413,77 @@ function Workbench:onEntryChange()
   end
   self:_resetEntry()
   self:invalidate("composer")
+end
+
+----------------------------------------------------------------------
+-- 原生输入行：按需浮出（点 composer / 敲字才出现），提交或 Esc 收起
+--
+-- visible 切换是一次 dlg:modify，而 modify 会触发重新布局、Aseprite 顺手把窗口
+-- 撑回"内容自然尺寸"——用户手动缩过窗口，这一下就跳回去了。旧面板为此写了
+-- Panel:_preserveBounds（panel.lua:655），这里照抄同一手法，不发明新的。
+----------------------------------------------------------------------
+
+function Workbench:_preserveBounds(fn)
+  local before = nil
+  if self.dlg and self.shown then
+    local ok, b = pcall(function() return self.dlg.bounds end)
+    if ok and b and (b.width or 0) > 0 and (b.height or 0) > 0 then
+      before = { x = b.x, y = b.y, w = b.width, h = b.height }
+    end
+  end
+
+  local okCall, err = pcall(fn)
+
+  if before and self.dlg then
+    local ok2, b2 = pcall(function() return self.dlg.bounds end)
+    if ok2 and b2 and ((b2.width or 0) ~= before.w or (b2.height or 0) ~= before.h) then
+      pcall(function()
+        self.dlg.bounds = Rectangle(before.x, before.y, before.w, before.h)
+      end)
+    end
+  end
+
+  if not okCall then error(err) end
+end
+
+function Workbench:focusCanvas()
+  if not self.dlg then return false end
+  local ok = pcall(function() self.dlg:modify{ id = "screen", focus = true } end)
+  self.state.focus = "composer"
+  return ok
+end
+
+function Workbench:setInputRowVisible(on)
+  on = on and true or false
+  self.inputOpen = on
+  local dlg = self.dlg
+  if dlg then
+    self:_preserveBounds(function()
+      pcall(function() dlg:modify{ id = "input", visible = on } end)
+      pcall(function() dlg:modify{ id = "send", visible = on } end)
+    end)
+    if on then
+      -- 焦点给 entry（不然打不了字、也开不了输入法）
+      self:_preserveBounds(function()
+        pcall(function() dlg:modify{ id = "input", focus = true } end)
+      end)
+    else
+      self:focusCanvas()
+    end
+  end
+  self:invalidate("composer")
+  return self.inputOpen
+end
+
+function Workbench:openInput()
+  if self.inputOpen then return true end
+  return self:setInputRowVisible(true)
+end
+
+function Workbench:closeInput()
+  if not self.inputOpen then return false end
+  self:setInputRowVisible(false)
+  return true
 end
 
 -- 把 Entry 恢复成"只有一个哨兵"，并可选把光标送回末尾
