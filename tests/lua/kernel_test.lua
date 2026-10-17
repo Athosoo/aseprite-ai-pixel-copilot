@@ -521,6 +521,79 @@ do
     nilKernel == nil and tostring(loadErr):find("kernel.bus.lua failed to load", 1, true) ~= nil, loadErr)
 end
 
+-- --------------------------- main.lua：工作台起来后把 agent.panel 换成适配层
+print("== main.lua: agent.panel 换适配层（点不动那个 bug 的入口侧） ==")
+do
+  local chunk = assert(loadfile(EXT .. "/main.lua"))
+  chunk()
+  check("main.lua 导出了 swapAgentPanel", type(swapAgentPanel) == "function")
+
+  local oldPanel = { tag = "old" }
+  local fakeWb = { tag = "wb" }
+  local fakeAgent = { panel = oldPanel }
+
+  -- 1) 拿不到适配层：panel 保持原样（回落行为一字不变）
+  local swapped = swapAgentPanel(fakeAgent, fakeWb, false)
+  check("没有适配层时不换 panel（回落不变）",
+    swapped == false and fakeAgent.panel == oldPanel)
+
+  -- 2) 正式入口 attach(agent, wb) 优先
+  local attachArgs = nil
+  local okSwap = swapAgentPanel(fakeAgent, fakeWb, {
+    attach = function(agent, wb) attachArgs = { agent = agent, wb = wb }; return { tag = "attached" } end,
+  })
+  check("有 attach 时 agent.panel 被换成适配层",
+    okSwap == true and fakeAgent.panel ~= oldPanel and fakeAgent.panel.tag == "attached",
+    tostring(fakeAgent.panel and fakeAgent.panel.tag))
+  check("attach 拿到 (agent, wb) 两个参数",
+    attachArgs ~= nil and attachArgs.agent == fakeAgent and attachArgs.wb == fakeWb)
+
+  -- 2b) 没有 attach 时用 new(wb, { fallback, agent })；fallback 必须是"换之前"那个 panel
+  local panelBeforeNew = fakeAgent.panel
+  local newArgs = nil
+  local okNew = swapAgentPanel(fakeAgent, fakeWb, {
+    new = function(wb, opts) newArgs = { wb = wb, opts = opts }; return { tag = "made" } end,
+  })
+  check("没有 attach 时退回 new(wb, { fallback = 换之前的 panel, agent })",
+    okNew == true and fakeAgent.panel.tag == "made"
+      and newArgs ~= nil and newArgs.wb == fakeWb
+      and newArgs.opts ~= nil and newArgs.opts.agent == fakeAgent
+      and newArgs.opts.fallback == panelBeforeNew,
+    newArgs and newArgs.opts and tostring(newArgs.opts.fallback))
+
+  -- 3) 适配层构造抛错：保持当前 panel，不崩
+  local kept = fakeAgent.panel
+  local okBoom = swapAgentPanel(fakeAgent, fakeWb, { new = function() error("adapter blew up") end })
+  check("适配层构造抛错时保持当前 panel 且不崩",
+    okBoom == false and fakeAgent.panel == kept)
+
+  -- 4) 既没有 attach 也没有 new：保留当前 panel（不乱换）
+  local kept3 = fakeAgent.panel
+  local okShape = swapAgentPanel(fakeAgent, fakeWb, { something = 1 })
+  check("适配层形状不认时保持当前 panel", okShape == false and fakeAgent.panel == kept3)
+
+  -- 5) 返回 non-table 视为失败，保留当前 panel
+  local kept2 = fakeAgent.panel
+  local okNil = swapAgentPanel(fakeAgent, fakeWb, { new = function() return nil end })
+  check("适配层没返回对象时保持当前 panel（不把 panel 换成 nil）",
+    okNil == false and fakeAgent.panel == kept2)
+
+  -- 6) 真适配层（T2 的 lib/panel_adapter）：装上去以后 agent.panel 必须像个面板
+  local realOk, realAdapter = pcall(require, "lib/panel_adapter")
+  check("lib/panel_adapter 可用（main.lua 的接线对象）", realOk and type(realAdapter) == "table",
+    realAdapter)
+  if realOk and type(realAdapter) == "table" then
+    local realAgent = { panel = { tag = "legacy" } }
+    local okReal = swapAgentPanel(realAgent, fakeWb, realAdapter)
+    check("真适配层装到 agent 上后仍是个面板（log/setStatus 等 API 在）",
+      okReal == true and realAgent.panel ~= nil
+        and type(realAgent.panel.log) == "function"
+        and type(realAgent.panel.setStatus) == "function"
+        and type(realAgent.panel.openMenu) == "function",
+      realAgent.panel and tostring(realAgent.panel.log))
+  end
+end
+
 -- --------------------------------------------------- 薄入口 main.lua
 print("== extension/main.lua 薄入口 ==")
 do

@@ -1147,6 +1147,77 @@ end
 -- 鼠标
 ----------------------------------------------------------------------
 
+-- canvas 事件的统一入口：按旧面板踩出来的规矩
+--   1) mousedown 只管焦点（不抢输入法），**激活在 mouseup**；
+--   2) ev.button 缺字段就当左键，坐标一律 tonumber 兜 0 —— 真机上坐标给 nil
+--      曾在 mousedown 里抛错，错误穿进 C++ 之后整个面板就"点不动"了；
+--   3) 每个回调整体 pcall，错误只进 lastInputError，绝不外泄。
+local LEFT_BUTTON = (type(MouseButton) == "table" and MouseButton.LEFT) or 1
+
+function Workbench:_evPoint(ev)
+  ev = ev or {}
+  local x = tonumber(ev.x) or 0
+  local y = tonumber(ev.y) or 0
+  local btn = ev.button
+  local isLeft = (btn == nil) or (btn == LEFT_BUTTON)
+  return x, y, isLeft
+end
+
+function Workbench:_input(label, fn, ...)
+  local ok, res = pcall(fn, ...)
+  if not ok then
+    self.lastInputError = label .. ": " .. tostring(res)
+    return nil
+  end
+  self.lastInputError = nil
+  return res
+end
+
+function Workbench:mouseDown(ev)
+  local x, y, isLeft = self:_evPoint(ev)
+  if not isLeft then return false end
+  -- 只有点进 composer 才碰焦点：别的地方抢焦点会打断输入法组合（旧面板同款判断）
+  local L = self.L or self:layout()
+  if L.composer and L.composer.h > 0 and y >= L.composer.y then
+    self:focusComposer()
+  end
+  return true
+end
+
+function Workbench:mouseUp(ev)
+  local x, y, isLeft = self:_evPoint(ev)
+  if not isLeft then return nil end
+  return self:mouse("click", x, y)
+end
+
+function Workbench:mouseMove(ev)
+  local x, y = self:_evPoint(ev)
+  return self:mouse("move", x, y)
+end
+
+function Workbench:mouseWheel(ev)
+  ev = ev or {}
+  local x, y = self:_evPoint(ev)
+  local dy = tonumber(ev.wheelDelta) or tonumber(ev.delta) or 0
+  return self:wheel(x, y, dy)
+end
+
+-- 面板注册给 canvas 的那组回调（build 与测试共用同一份，避免"测的不是真机跑的"）
+function Workbench:handlers()
+  return {
+    onpaint = function(ev) self:paint(ev and ev.context or nil) end,
+    onkeydown = function(ev)
+      self:_input("key", function()
+        if self:key(ev) and ev and ev.stopPropagation then ev.stopPropagation() end
+      end)
+    end,
+    onmousedown = function(ev) self:_input("mousedown", function() return self:mouseDown(ev) end) end,
+    onmouseup = function(ev) self:_input("mouseup", function() return self:mouseUp(ev) end) end,
+    onmousemove = function(ev) self:_input("mousemove", function() return self:mouseMove(ev) end) end,
+    onwheel = function(ev) self:_input("wheel", function() return self:mouseWheel(ev) end) end,
+  }
+end
+
 function Workbench:mouse(kind, x, y)
   if kind == "move" then
     local h = self:hitTest(x, y)
@@ -1181,6 +1252,11 @@ function Workbench:mouse(kind, x, y)
     elseif h.kind == "retry" then
       self:setConnected(true)
       return "retry"
+    end
+    -- 视图自己画的按钮（启用/停用、算子行、示例…）：交给视图处理，壳不猜语义
+    if self.view and type(self.view.click) == "function" then
+      local ok = pcall(self.view.click, self.view, h)
+      if ok then return "view-click:" .. tostring(h.kind) end
     end
     return h.kind
   end
@@ -1244,16 +1320,19 @@ function Workbench:build(dlg)
   if self.dlg then return self.dlg end
   if not dlg then return nil end
   local m = self.th.metrics
+  -- 五个回调都从 handlers() 来：测试驱动的是同一份函数，不是它的影子实现
+  local h = self:handlers()
   dlg:canvas{
     id = "screen",
     width = self.w,
     height = self.h,
     autoscaling = true,
-    onpaint = function(ev) self:paint(ev.context) end,
-    onkeydown = function(ev) if self:key(ev) and ev.stopPropagation then ev.stopPropagation() end end,
-    onmousemove = function(ev) self:mouse("move", ev.x, ev.y) end,
-    onmousedown = function(ev) self:mouse("click", ev.x, ev.y) end,
-    onwheel = function(ev) self:wheel(ev.x, ev.y, ev.wheelDelta or ev.delta or 0) end,
+    onpaint = h.onpaint,
+    onkeydown = h.onkeydown,
+    onmousedown = h.onmousedown,
+    onmouseup = h.onmouseup,
+    onmousemove = h.onmousemove,
+    onwheel = h.onwheel,
   }
   dlg:newrow()
   dlg:entry{ id = "input", text = workbench.SENTINEL, hexpand = true,

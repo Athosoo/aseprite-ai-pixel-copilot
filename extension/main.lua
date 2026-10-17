@@ -128,10 +128,54 @@ end
 
 -- 工作台（T2 的 lib.workbench）：它没落地时回落到旧面板，三路并行谁也别等谁。
 -- 接口按 arch §2 的依赖方向：工作台只认 registry / bus / host，不认具体视图。
+
+-- agent 调 panel 的 25 个方法、工作台只有 6 个：界面换成工作台却不换 agent 的数据通道，
+-- 就是「界面活、数据全进旧面板」—— 面板点不动的真根因。适配层由 T2 提供
+-- （lib/panel_adapter），这里只负责把它装到 agent 上；装不上就原样保留旧 panel。
+-- 导出成全局 + 第三个参数可注入模块，是为了让无头测试能直接验"换得成/换不成"两条分支
+-- （脚本里的 local 测试够不到；生产调用只传前两个参数）。
+function swapAgentPanel(a, wb, adapterModule)
+  if not (a and a.panel) then return false end
+  local mod = adapterModule
+  if mod == nil then mod = M.panelAdapter or tryRequire("lib.panel_adapter") end
+  if not mod then
+    note("lib/panel_adapter 不可用：工作台已显示，但 agent 仍绑旧面板（界面会点不动）")
+    return false
+  end
+
+  local function attempt(fn, ...)
+    local ok, res = pcall(fn, ...)
+    if not ok then return nil, res end
+    if type(res) ~= "table" then return nil, "构造没有返回对象（got " .. type(res) .. "）" end
+    return res, nil
+  end
+
+  -- lib/panel_adapter 的正式入口是 attach(agent, wb)（它自己就把 agent.panel 换掉）；
+  -- 次选是 new(wb, { fallback = 旧panel, agent = agent })。两种都不认就保留旧 panel。
+  local built, buildErr
+  if type(mod) == "table" and type(mod.attach) == "function" then
+    built, buildErr = attempt(mod.attach, a, wb)
+  elseif type(mod) == "table" and type(mod.new) == "function" then
+    built, buildErr = attempt(mod.new, wb, { fallback = a.panel, agent = a, kernel = state.kernel })
+  else
+    buildErr = "lib/panel_adapter 既没有 attach 也没有 new"
+  end
+
+  if not built then
+    note("面板适配层构造失败，agent 仍绑旧面板: " .. tostring(buildErr))
+    return false
+  end
+  a.panel = built
+  state.panelAdapter = built
+  return true
+end
+
 local function openWorkbench(a)
   if not M.workbench or not M.workbench.new then return false end
-  local wb, err = nil, nil
-  local ok = pcall(function()
+  local wb = nil
+  -- pcall 的第二个返回值才是真正的错误：只接 ok 会让日志永远说"returned nil"，
+  -- 真机排查时那条日志等于没用。抛错和返回 nil 分开记，一眼能分辨。
+  local ok, err = pcall(function()
     wb = M.workbench.new{
       kernel = state.kernel,
       agent = a,
@@ -140,8 +184,12 @@ local function openWorkbench(a)
       host = state.kernel and state.kernel.host or nil,
     }
   end)
-  if not ok or not wb then
-    note("工作台启动失败，已回落到旧面板: " .. tostring(err or "lib.workbench.new returned nil"))
+  if not ok then
+    note("工作台构造失败，已回落到旧面板: " .. tostring(err))
+    return false
+  end
+  if not wb then
+    note("lib.workbench.new 返回了 nil，已回落到旧面板")
     return false
   end
   state.workbench = wb
@@ -158,6 +206,11 @@ local function openWorkbench(a)
       return false
     end
   end
+
+  -- 界面换成工作台之后，agent 的数据通道仍指着旧 panel：不换就是「界面活、数据全进死面板」。
+  -- 但 agent 调 panel 的 25 个方法、工作台只有 6 个，所以中间必须有适配层（T2 的
+  -- lib/panel_adapter）。拿不到适配层就保持旧 panel —— 行为与之前一字不变。
+  swapAgentPanel(a, wb)
   return true
 end
 
@@ -295,10 +348,11 @@ end
 local function packsDirs()
   local dirs = {}
   if CFG.extPath then dirs[#dirs + 1] = CFG.extPath .. "/packs/builtin" end
-  pcall(function()
+  local okUser, userErr = pcall(function()
     local user = app.fs.joinPath(app.fs.joinPath(app.fs.userConfigPath, "ai-pixel-copilot"), "packs")
     dirs[#dirs + 1] = user
   end)
+  if not okUser then note("拿不到用户能力包目录（自建包将不可见）: " .. tostring(userErr)) end
   return dirs
 end
 
@@ -312,7 +366,8 @@ local function loadKernel()
   end
 
   local kernel, kerr = nil, nil
-  local ok = pcall(function()
+  -- 同一个毛病：抛错时 kernel 是 nil，只接 ok 会把"内核组装失败: nil"写进日志
+  local ok, kErr = pcall(function()
     kernel, kerr = mod.new{
       app = app,
       versions = M.versions,
@@ -322,7 +377,7 @@ local function loadKernel()
     }
   end)
   if not ok then
-    state.kernelError = "内核组装失败: " .. tostring(kernel)
+    state.kernelError = "内核组装抛错: " .. tostring(kErr)
     note(state.kernelError)
     return nil
   end
@@ -353,6 +408,8 @@ function init(plugin)
   M.versions = (tryRequire("lib.versions"))
   M.ops = (tryRequire("lib.ops"))
   M.workbench = (tryRequire("lib.workbench"))
+  -- 适配层可能还没落地（T2 在写）：晚于本行出现也没关系，swapAgentPanel 里还有一次运行时补试
+  M.panelAdapter = (tryRequire("lib.panel_adapter"))
   -- 工作台若自带视图渲染器表就用它的，否则用 lib/views/*（内核不决定布局，只负责接线）
   M.renderers = (M.workbench and M.workbench.renderers) or buildRenderers()
   if not M.workbench then
@@ -391,6 +448,7 @@ end
 
 function exit(plugin)
   state.workbench = nil
+  state.panelAdapter = nil
   if state.agent then
     pcall(function() state.agent:destroy() end)
     state.agent = nil

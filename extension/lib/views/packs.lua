@@ -132,6 +132,25 @@ function View:render(kit, r, state)
   return self
 end
 
+-- 点壳分发过来的命中框（Workbench:mouse 的 view:click 约定）
+function View:click(hit)
+  if not hit then return false end
+  local l = self:ledger()
+  if hit.kind == "toggle" then
+    if not (l and hit.id) then return false end
+    if l:isEnabled(hit.id) then l:disable(hit.id) else l:enable(hit.id) end
+    return true
+  elseif hit.kind == "rollback" then
+    if not (l and hit.id and type(l.rollback) == "function") then return false end
+    pcall(l.rollback, l, hit.id)
+    return true
+  elseif hit.kind == "pack" then
+    self.sel = hit.index or self.sel
+    return true
+  end
+  return false
+end
+
 function View:hitAt(x, y)
   for _, h in ipairs(self.hits) do
     if x >= h.rect.x and x < h.rect.x + h.rect.w and y >= h.rect.y and y < h.rect.y + h.rect.h then

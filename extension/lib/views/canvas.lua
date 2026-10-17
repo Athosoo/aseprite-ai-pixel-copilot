@@ -160,6 +160,15 @@ function View:history()
   return out
 end
 
+function View:click(hit)
+  if not hit then return false end
+  if hit.kind == "op" and hit.index then
+    self.sel = hit.index
+    return true
+  end
+  return false
+end
+
 function View:hitAt(x, y)
   for _, h in ipairs(self.hits) do
     if x >= h.rect.x and x < h.rect.x + h.rect.w and y >= h.rect.y and y < h.rect.y + h.rect.h then

@@ -9,8 +9,11 @@
 
 设计契约（先冻结再施工，三路并行才成立）：`docs/arch-v1.0.md`、`docs/ui-v1.0.md`；交付说明 `docs/v1.0-delivery.md`。
 
-**终值**：Lua **1476 通过 / 0 失败**（14 文件）；桥 **636 通过 / 3 失败**（那 3 条是 v0.5.9 就有、纯净 worktree 同样失败的
+**终值**：Lua **1601 通过 / 0 失败**（16 文件，含迭代二新增的 panel_contract_test 与 workbench_click_test）；桥 **636 通过 / 3 失败**（那 3 条是 v0.5.9 就有、纯净 worktree 同样失败的
 测试隔离问题）。基线是 Lua 960/0、桥 470/3。
+
+**迭代二（用户实测「面板点不动」）**：agent 的 panel 从未接到工作台（25 个方法只实现 6 个），已由 lib/panel_adapter.lua 补齐；
+点击激活从 onmousedown 改回旧面板验证过的 onmouseup 语义。详见 docs/v1.0-delivery.md 第 8 节。
 
 **真机 GUI 验收**：`tests/lua/gui_v1_{console,packs,offline}.png`，跑法 `tests/run_gui_v1.ps1`。
 这一环抓到两个无头测不出的宿主陷阱，已固化成 kit_test 的不变式：
@@ -626,20 +629,3 @@ Aseprite，不是就**拒绝截图**（防隐私泄露）。
 8. **扩展只在启动时加载**；`Rescan Scripts Folder`（`cmd_refresh.cpp:45`）不重载扩展 → 改扩展必须重启。
 9. **权限授权**（`security.cpp`）：`io.open/popen`、`os.execute/remove/rename`、`WebSocket` 首次调用弹授权框。
    键 = **脚本"源文件名"的 sha1**（小写 hex，`security.cpp:79` + `convert_to.cpp`），值 = 权限位掩码
-   （Read 4 / Write 2 / Execute 1 / OpenSocket 8 / LoadLib 16，Full=31）。授权一次即长期记住，
-   **改代码不会重弹**（键取自文件名不是内容）。
-   - 用户首次使用会看到 **3~4 个授权框**（`lib/ws.lua` 开 socket、`lib/versions.lua` 写文件/删文件、
-     `lib/agent.lua` 读上传的图片、`main.lua` 执行命令拉起桥）。每个勾"不再提示"即可，一次性。
-   - 写自动化测试时要预置这些键，键串是 **chunk source name**：`--script` 传入的路径会被
-     `get_absolute_path` 规范成**反斜杠绝对路径**；而 `require` 的模块名走 `package.path` 模板，
-     Lua 把 `lib.ws` 里的点换成 **Windows 分隔符 `\`**，所以会得到
-     `<repo>/extension/lib\ws.lua` 这种**混合分隔符**。两种都要写上（见 `run_gui_visual.sh`）。
-10. **`ask_access` 在无 UI 时直接放行**（`security.cpp:436`）→ 无头测试能读写文件。
-
-### JSON 与消息
-11. **`json.decode` 返回的是 `JsonObj` userdata，不是 Lua table**（`json_class.cpp`）。
-    它支持 `obj.key` / `obj[i]` / `#obj`，但**这一版数组的 `ipairs/pairs` 迭代器有 bug**
-    （`JsonObj_ipairs_next` 返回 0 而不是 2，循环立刻结束）→ 数组必须用 `#obj` + `obj[i]` 取。
-    `lib/ws.lua` 里的 `fromJson()` 统一转成普通 table。
-12. **无头（`-b`）模式下 WebSocket 回调不触发**（回调走 `os::queue_event`，批处理没有事件循环；
-    33ms 的 Timer 只在 `isGui()` 时建）→ WS 链路只能在 GUI 下验证，但 Lua 逻辑可 `-b` 全量测。

@@ -28,11 +28,15 @@ try {
     $parkedNow = $true
     Write-Output 'parked installed extension'
   }
-  Start-Process -FilePath $ASE -ArgumentList @('--script', $probe)
+  $log = Join-Path $ROOT ("tests\lua\" + $Mode + ".stdout.log")
+  if (Test-Path $log) { Move-Item -LiteralPath $log -Destination ($log + '.old') -Force }
+  if (Test-Path ($log + '.err')) { Move-Item -LiteralPath ($log + '.err') -Destination ($log + '.err.old') -Force }
+  Start-Process -FilePath $ASE -ArgumentList @('--script', $probe) -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') | Out-Null
   Start-Sleep -Seconds $Settle
   $alive = (Get-Process aseprite -ErrorAction SilentlyContinue | Measure-Object).Count
   Write-Output ("aseprite alive: " + $alive)
   & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ROOT 'tests\shot_window.ps1') -Out $outFull
+  Write-Output ("probe log: " + $log)
   if (Test-Path $outFull) { Write-Output ("screenshot: " + (Get-Item $outFull).Length + " bytes -> " + $outFull) }
   else { Write-Output 'NO SCREENSHOT' }
 }

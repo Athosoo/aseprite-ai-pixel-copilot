@@ -29,7 +29,8 @@ $luaTests = @(
   'tests\lua\settings_test.lua','tests\lua\sizelib_test.lua','tests\lua\versions_test.lua',
   'tests\lua\path_test.lua','tests\lua\artlib_test.lua','tests\lua\menu_test.lua',
   'tests\lua\panel_test.lua','tests\lua\ws_test.lua',
-  'tests\lua\kernel_test.lua','tests\lua\kit_test.lua','tests\lua\e2e_pack_test.lua'
+  'tests\lua\kernel_test.lua','tests\lua\kit_test.lua','tests\lua\e2e_pack_test.lua',
+  'tests\lua\panel_contract_test.lua','tests\lua\workbench_click_test.lua'
 )
 
 $rows = @(); $sumP = 0; $sumF = 0

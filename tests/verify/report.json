@@ -1,6 +1,6 @@
 {
-    "when":  "2026-10-17T19:57:27",
-    "luaPass":  1476,
+    "when":  "2026-10-17T20:39:07",
+    "luaPass":  1601,
     "luaFail":  0,
     "bridgePass":  636,
     "bridgeFail":  3,
@@ -19,7 +19,7 @@
                 },
                 {
                     "suite":  "tests\\lua\\workspace_test.lua",
-                    "pass":  307,
+                    "pass":  333,
                     "fail":  0,
                     "note":  ""
                 },
@@ -73,7 +73,7 @@
                 },
                 {
                     "suite":  "tests\\lua\\kernel_test.lua",
-                    "pass":  178,
+                    "pass":  188,
                     "fail":  0,
                     "note":  ""
                 },
@@ -86,6 +86,18 @@
                 {
                     "suite":  "tests\\lua\\e2e_pack_test.lua",
                     "pass":  78,
+                    "fail":  0,
+                    "note":  ""
+                },
+                {
+                    "suite":  "tests\\lua\\panel_contract_test.lua",
+                    "pass":  58,
+                    "fail":  0,
+                    "note":  ""
+                },
+                {
+                    "suite":  "tests\\lua\\workbench_click_test.lua",
+                    "pass":  31,
                     "fail":  0,
                     "note":  ""
                 }

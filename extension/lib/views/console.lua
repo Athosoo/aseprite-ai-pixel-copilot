@@ -386,6 +386,24 @@ local function kitHit(r, x, y)
 end
 console.hit = kitHit
 
+-- 空状态的三个示例是可点的：点一下等于把它填进 composer（不是直接发送）
+function Console:click(hit)
+  if not hit then return false end
+  if hit.kind == "example" then
+    local wb = self.ctx and self.ctx.workbench or nil
+    if wb and hit.text then
+      wb:setInput(hit.text)
+      return true
+    end
+  elseif hit.kind == "menu" and hit.index then
+    self.menuHover = hit.index
+    return true
+  elseif hit.kind == "session" then
+    return true
+  end
+  return false
+end
+
 function Console:hitAt(x, y)
   for _, h in ipairs(self.hits) do
     if kitHit(h.rect, x, y) then return h end
