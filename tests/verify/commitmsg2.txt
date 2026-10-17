@@ -1,0 +1,13 @@
+fix(ui): chat actually sends, and the input row is permanent again
+
+submit called agent.send(text), which sends a protocol frame, so the bridge
+silently dropped whatever the user typed. It now uses sendChat (which queues
+until the socket is up) with sendChatNow as a fallback, and always echoes the
+user line locally so the conversation shows it.
+
+The native entry and send button are visible by default again: inputOpen starts
+true, submit no longer collapses the row, and closeInput is refused outright
+(INPUT_ALWAYS) so no later change can silently take away the only place to type.
+Chinese input, sentinel diffing and the backspace caret fix are untouched.
+
+Lua 1842/0.

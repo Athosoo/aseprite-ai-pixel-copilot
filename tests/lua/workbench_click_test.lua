@@ -230,9 +230,9 @@ do
   eq(seen, 7, "命中视图内的框后调用了 view:click(hit)")
 end
 
-print("== 10. 原生输入行按需浮出（task-7）==")
+print("== 10. 原生输入行常驻（用户要求：输入框固定保留）==")
 do
-  -- 假 Dialog：只实现 build / modify / bounds 用到的那几个面
+  -- 假 Dialog：记 visible/focus/modify，并模拟 modify 触发的重排
   local function fakeDialog()
     local d = { data = {}, widgets = {}, layoutChanges = 0, modifyLog = {} }
     d._bounds = { x = 100, y = 100, w = 912, h = 531 }
@@ -258,14 +258,11 @@ do
       elseif opts.id == "screen" then
         self.widgets.screen.focus = opts.focus
       end
-      -- 真实 modify 会让 Aseprite 重新布局、把窗口撑回自然尺寸：这里模拟它
       if opts.visible ~= nil then
         self.layoutChanges = self.layoutChanges + 1
         self._bounds = { x = self._bounds.x, y = self._bounds.y, w = 912, h = 700 }
       end
     end
-    -- 真机上 dlg.bounds 是 Rectangle（.width/.height）；假件也要照这个面来，
-    -- 否则 _preserveBounds 里 (b.width or 0) > 0 判不出来，测的就成了假的
     function d:_boundsView()
       return { x = self._bounds.x, y = self._bounds.y, width = self._bounds.w, height = self._bounds.h }
     end
@@ -279,8 +276,16 @@ do
   end
 
   local function freshWB()
-    local a = { sent = {}, docName = function() return "001.ase" end }
-    function a:send(t) self.sent[#self.sent + 1] = t; return true end
+    local a = { sent = {}, chats = {}, frames = {}, docName = function() return "001.ase" end }
+    -- 关键：聊天必须走 sendChat（send 是协议帧，语义完全不同）
+    function a:send(tbl)
+      local t2 = type(tbl) == "table" and (tostring(tbl.type) .. "") or "SCALAR"
+      self.frames[#self.frames + 1] = t2
+      if t2 == "SCALAR" then self.sent[#self.sent + 1] = tostring(tbl) end
+      return true
+    end
+    function a:sendChat(text) self.chats[#self.chats + 1] = tostring(text); return true end
+    function a:sendChatNow(text) self.chats[#self.chats + 1] = tostring(text); return true end
     local w = workbench.new({ width = 900, height = 620 })
     w:mount(nil, a)
     w:setSize(900, 620)
@@ -293,81 +298,66 @@ do
   end
 
   local w, d, a = freshWB()
-  eq(d.widgets.input.visible, false, "初始：entry 不可见（不再常驻白横条）")
-  eq(d.widgets.send.visible, false, "初始：磁吸按钮也不可见（同显同隐）")
-  eq(w.inputOpen, false, "初始 inputOpen=false")
+  eq(d.widgets.input.visible, true, "初始：entry 常驻可见")
+  eq(d.widgets.send.visible, true, "初始：磁吸按钮常驻可见（否则 ENTER 提交不了）")
+  eq(w.inputOpen, true, "初始 inputOpen=true")
 
-  -- 隐藏态：自绘 composer 仍有输入提示与光标
-  local gc0 = fakeGC(900, 620)
-  w:invalidate()
-  w:paint(gc0)
-  local hasHint, caret = false, false
-  for _, txt in ipairs(gc0.texts) do
-    if txt:find("say something", 1, true) then hasHint = true end
-  end
-  for _, c in ipairs(w.kit.calls) do
-    if c.region == "composer" and c.op == "fill" and c.w <= 1 and c.h >= 10 then caret = true end
-  end
-  ok(hasHint, "隐藏态：composer 仍画出输入提示")
-  ok(caret, "隐藏态：composer 仍画出光标位")
+  -- 常驻后不该再有人能把它收起来
+  w:closeInput()
+  eq(w.inputOpen, true, "closeInput() 被拒绝：输入行常驻，关掉就没地方打字了")
+  eq(d.widgets.input.visible, true, "拒绝隐藏后 entry 仍可见")
+  ok((w.inputHideRefused or 0) >= 1, "记下了被拒绝的隐藏请求", w.inputHideRefused)
 
-  -- 点 composer → 两者浮出 + 聚焦 entry
+  -- 点 composer → 只给焦点，不改变可见性
   local L = w:layout()
-  local cx = math.floor(L.composer.w / 2)
-  local cy = L.composer.y + math.floor(L.composer.h / 2)
-  h = w:handlers()
-  h.onmousedown({ x = cx, y = cy, button = LEFT })
-  h.onmouseup({ x = cx, y = cy, button = LEFT })
-  eq(w.inputOpen, true, "点 composer 后输入行浮出")
-  eq(d.widgets.input.visible, true, "entry 变可见")
-  eq(d.widgets.send.visible, true, "磁吸按钮一起可见（否则 ENTER 提交不了）")
-  eq(d.widgets.input.focus, true, "焦点给了 entry")
+  local hh = w:handlers()
+  hh.onmousedown({ x = math.floor(L.composer.w / 2), y = L.composer.y + 5, button = LEFT })
+  hh.onmouseup({ x = math.floor(L.composer.w / 2), y = L.composer.y + 5, button = LEFT })
+  eq(d.widgets.input.visible, true, "点 composer 后 entry 仍可见（本来就常驻）")
+  eq(d.widgets.input.focus, true, "点 composer 把焦点给了 entry")
   ok(w.lastInputError == nil, "点 composer 不抛错", w.lastInputError)
 
-  -- 窗口重排防护：modify 把窗口撑大了，_preserveBounds 必须还原
-  eq(d._bounds.h, 531, "visible 切换后窗口高度被还原（_preserveBounds 生效），没有被撑回自然尺寸")
-
-  -- 提交 → 两收回，焦点回 canvas
+  -- 提交 → 输入行不收起；聊天走 sendChat；并且自己回显用户那行
+  local cv = w.views.console
+  local before = cv:count()
   w:setInput("hello agent")
   w:submit()
-  eq(w.inputOpen, false, "提交后输入行收起")
-  eq(d.widgets.input.visible, false, "提交后 entry 不可见")
-  eq(d.widgets.send.visible, false, "提交后按钮不可见")
-  eq(d.widgets.screen.focus, true, "提交后焦点交回 canvas")
-  eq(a.sent[1], "hello agent", "提交的文本真的发出去了")
-  eq(#a.sent, 1, "只发一次")
+  eq(w.inputOpen, true, "提交后输入行**不**收起（常驻）")
+  eq(d.widgets.input.visible, true, "提交后 entry 仍可见")
+  eq(d.widgets.send.visible, true, "提交后按钮仍可见")
+  eq(w:getInput(), "", "提交后输入内容清空")
+  eq(a.chats[1], "hello agent", "聊天走 sendChat（不是把输入当协议帧发出去）")
+  eq(#a.chats, 1, "只发一次聊天")
+  local sentAsFrame = false
+  for _, f in ipairs(a.frames) do if f == "SCALAR" then sentAsFrame = true end end
+  ok(not sentAsFrame, "没有把用户输入当裸帧发出去（旧 bug：send(text) 桥不认识 → 静默丢弃）", table.concat(a.frames, ","))
+  eq(cv:count(), before + 1, "自己回显了用户那行（sendChat 明确不负责回显）")
 
-  -- Esc：收起但不提交
-  w:openInput()
+  -- Esc：不再收起输入行；不清草稿
   w:setInput("draft text")
-  local before = #a.sent
-  eq(w:escape(), "input", "Esc 第一优先处理输入行")
-  eq(w.inputOpen, false, "Esc 后输入行收起")
+  local lvl = w:escape()
+  ok(lvl ~= "input", "Esc 不再处理输入行（常驻，没有可收起的）", tostring(lvl))
+  eq(w.inputOpen, true, "Esc 后输入行仍在")
   eq(w:getInput(), "draft text", "Esc 不丢草稿")
-  eq(#a.sent, before, "Esc 不提交")
 
-  -- 隐藏态敲字：自动浮出并吞下该字符
-  local w2, d2, a2 = freshWB()
-  h = w2:handlers()
-  h.onkeydown({ key = { unicode = "a", code = "a" } })
-  eq(w2.inputOpen, true, "隐藏态敲 a → 输入行自动浮出")
-  eq(w2:getInput(), "a", "隐藏态敲 a → 字符被吞进输入")
-  eq(d2.widgets.input.visible, true, "自动浮出时 entry 可见")
-  eq(d2.widgets.send.visible, true, "自动浮出时按钮也可见")
-  ok(w2.lastInputError == nil, "敲字不抛错", w2.lastInputError)
-
-  -- 组合键不算打字
-  local w3 = freshWB()
-  h = w3:handlers()
-  h.onkeydown({ key = { unicode = "k", code = "k", ctrl = true } })
-  eq(w3.inputOpen, false, "Ctrl+K 不被当成打字（走快捷键，不浮出输入行）")
-
-  -- 已展开时不重复吞字（字由 entry 收）
-  local w4 = freshWB()
-  h = w4:handlers()
-  w4:openInput()
-  h.onkeydown({ key = { unicode = "z", code = "z" } })
-  eq(w4:getInput(), "", "输入行已展开时 canvas 不再重复收集字符（避免双份）")
+  -- 编辑态下回车只提交字段，不发聊天
+  local settingsAgent = a
+  settingsAgent.config = { model = "gpt-4o" }
+  w:setView("settings")
+  w:invalidate(); w:paint(fakeGC(900, 620))
+  local modelHit = nil
+  for _, hit in ipairs(w.view.hits or {}) do if hit.id == "model" then modelHit = hit end end
+  ok(modelHit ~= nil, "设置页有模型行")
+  if modelHit then
+    hh.onmousedown({ x = modelHit.rect.x + 5, y = modelHit.rect.y + 5, button = LEFT })
+    hh.onmouseup({ x = modelHit.rect.x + 5, y = modelHit.rect.y + 5, button = LEFT })
+    ok(w.fieldEdit ~= nil, "点行进编辑态")
+    local chatsBefore = #a.chats
+    w:setInput("gpt-4.1")
+    w:submit()
+    eq(#a.chats, chatsBefore, "**编辑态回车不发聊天**（只提交字段）")
+    eq(w.fieldEdit, nil, "提交字段后退出编辑态")
+  end
 end
 
 print("== 11. 逃生口：命令面板里有一条「使用旧面板」 ==")

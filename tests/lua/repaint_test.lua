@@ -133,17 +133,16 @@ expectRepaint("refresh", function() wb:refresh() end)
 print("== 4. 输入 / 交互类 ==")
 expectRepaint("输入回显", function() wb:setInput("make the red darker") end)
 expectRepaint("提交", function() wb:submit() end)
-expectRepaint("打开输入行", function() wb:openInput() end)
-expectRepaint("收起输入行", function() wb:closeInput() end)
+-- 输入行现在常驻：openInput 无变化（不该重绘），closeInput 被拒绝（也不该重绘）
+expectRepaint("焦点给 composer", function() wb:focusComposer() end)
 expectRepaint("滚动", function() wb:wheel(400, 300, 1) end)
 -- "/" 只在焦点不在 composer 时才被壳接住（焦点在 composer 时它由 entry 收）
 wb.state.focus = "main"
 expectRepaint("按 /", function() wb:key({ code = "/" }) end)
 expectRepaint("Esc", function() wb:key({ code = "Escape" }) end)
--- Esc 只关弹层、不清草稿（正确的产品行为），所以先把上一段的 "/" 清掉再验"隐藏态敲字"
+-- Esc 只关弹层、不清草稿（正确的产品行为），所以先把上一段的 "/" 清掉
 wb:setInput("")
-wb:closeInput()
-expectRepaint("隐藏态敲字", function() wb:handlers().onkeydown({ key = { unicode = "a", code = "a" } }) end)
+expectRepaint("输入回显（常驻行）", function() wb:setInput("typed") end)
 
 print("== 5. 鼠标点击类（real wiring 下的 rail / titlebar）==")
 do

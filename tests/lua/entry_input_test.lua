@@ -182,15 +182,17 @@ do
   eq(wb:getInput(), "换", "退两格回到「换」")
 end
 
-print("== 5. 提交后输入行收起，草稿清空 ==")
+print("== 5. 提交后输入行仍常驻，草稿清空 ==")
 do
   local wb, dlg = freshWB()
   dlg:typeChar("h")
   dlg:typeChar("i")
   wb:submit()
   eq(wb:getInput(), "", "提交后草稿清空")
-  eq(wb.inputOpen, false, "提交后输入行收起")
-  eq(dlg.widgets.input.visible, false, "entry 不可见")
+  eq(wb.inputOpen, true, "提交后输入行仍在（用户要求常驻）")
+  eq(dlg.widgets.input.visible, true, "entry 仍可见")
+  dlg:typeChar("y")
+  eq(wb:getInput(), "y", "提交后接着打字仍然进得来")
 end
 
 print("== 6. 复位期间不会重复跑插入/退格逻辑（entrySyncing 挡住）==")

@@ -422,12 +422,11 @@ do
   ok(mainCalls > 0, "小窗状态行真的画了东西", mainCalls)
   ok(compCalls > 0, "小窗 composer 真的画了东西（不是全黑）", compCalls)
 
-  -- 小窗里能打字
-  local h = wb:handlers()
-  wb.state.focus = "main"
-  h.onkeydown({ key = { unicode = "h", code = "h" } })
-  eq(wb:getInput(), "h", "小窗里敲字进得了输入")
-  ok(wb.inputOpen, "小窗里敲字会把原生输入行浮出来")
+  -- 小窗里输入行常驻，能直接打字（entry 有焦点时由宿主把字符送进 entry）
+  ok(wb.inputOpen, "小窗里输入行常驻（不必先点一下）")
+  wb:setInput("h")
+  eq(wb:getInput(), "h", "小窗里输入可用")
+  ok(L.composer.h > 0, "小窗 composer 可见", L.composer.h)
 
   -- 再点 － 回到面板形态，内容区恢复
   wb:setMode("panel")
@@ -494,7 +493,7 @@ do
   local payload = nil
   for _, s in ipairs(agent.sentPayloads or {}) do payload = s end
   ok(wb.fieldEdit == nil, "保存成功后退出编辑态")
-  eq(wb.inputOpen, false, "保存后输入行收起")
+  eq(wb.inputOpen, true, "保存后输入行仍常驻")
 end
 
 print("== 11. 设置字段：Enter 落盘 / Esc 不落盘 / 非法值保留编辑态 ==")

@@ -1,6 +1,6 @@
 {
-    "when":  "2026-10-17T21:50:20",
-    "luaPass":  1839,
+    "when":  "2026-10-17T21:57:33",
+    "luaPass":  1842,
     "luaFail":  0,
     "bridgePass":  484,
     "bridgeFail":  1,
@@ -19,7 +19,7 @@
                 },
                 {
                     "suite":  "tests\\lua\\workspace_test.lua",
-                    "pass":  439,
+                    "pass":  445,
                     "fail":  0,
                     "note":  ""
                 },
@@ -97,7 +97,7 @@
                 },
                 {
                     "suite":  "tests\\lua\\workbench_click_test.lua",
-                    "pass":  72,
+                    "pass":  68,
                     "fail":  0,
                     "note":  ""
                 },
@@ -109,7 +109,7 @@
                 },
                 {
                     "suite":  "tests\\lua\\entry_input_test.lua",
-                    "pass":  19,
+                    "pass":  20,
                     "fail":  0,
                     "note":  ""
                 }

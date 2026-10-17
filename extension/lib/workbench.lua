@@ -151,9 +151,9 @@ function workbench.new(opts)
     input = "",
     -- 字段编辑态：设置页点一行就进这里，composer 变单行编辑器（不再弹旧面板的原生设置窗）
     fieldEdit = nil,
-    -- 原生输入行（entry + 磁吸按钮）默认收起来：用户明确说过那条白横条是控制台时代遗留。
-    -- 但 entry 不能删 —— Aseprite 里只有 ui::Entry 开 IME，自绘 canvas 收不到中文。
-    inputOpen = false,
+    -- 原生输入行（entry + 磁吸按钮）**常驻**：用户后来明确要求"输入框保留成固定的"。
+    -- entry 不能删 —— Aseprite 里只有 ui::Entry 开 IME，自绘 canvas 收不到中文。
+    inputOpen = true,
     completionOpen = false,
     paletteOpen = false,
     paletteQuery = "",
@@ -1201,11 +1201,6 @@ function Workbench:escape()
     self:invalidate("main")
     return "popup"
   end
-  -- Esc 收起输入行：不提交、草稿留在 self.input 里（再点一下就能接着写）
-  if self.inputOpen then
-    self:closeInput()
-    return "input"
-  end
   if self.state.busy then
     local t = self.now()
     if self.interruptArmed and (t - self.interruptArmed) <= 2 then
@@ -1256,8 +1251,6 @@ function Workbench:submit()
   local text = tostring(self.input or ""):gsub("^%s+", ""):gsub("%s+$", "")
   self:setInput("")
   self.completionOpen = false
-  -- 提交即收：输入行是一次性的，常驻的只有自绘 composer
-  self:closeInput()
   if text == "" then return false end
   if self.paletteOpen then
     local items = self:paletteMatches()
@@ -1268,11 +1261,21 @@ function Workbench:submit()
       return true
     end
   end
-  if self.agent and type(self.agent.send) == "function" then
-    local ok = pcall(self.agent.send, self.agent, text)
-    if not ok then self:log(text, "user") end
-  else
-    self:log(text, "user")
+  -- 注意 API 语义：Agent:send(tbl) 是**发协议帧**；聊天要用 sendChat（未连上时它会排队，
+  -- 连上后由 flushPendingChats 补发）。以前这里把用户输入当帧发出去，桥不认识 → 静默丢弃，
+  -- 用户看到的就是"回车没反应"。
+  local sent = false
+  local a = self.agent
+  if a and type(a.sendChat) == "function" then
+    sent = pcall(a.sendChat, a, text) and true or false
+  elseif a and type(a.sendChatNow) == "function" then
+    sent = pcall(a.sendChatNow, a, text) and true or false
+  end
+  -- 回显由面板负责（agent:sendChat 里明确不 log）：不在这里补一行，用户就看不到自己说的话
+  self:log(text, "user")
+  if not sent and a then
+    self:log(i18n.isZh() and "（没连上桥：这条已排队，连上会自动发出）"
+                          or "(bridge not connected: queued, will send when it is up)", "info")
   end
   return true
 end
@@ -1371,8 +1374,8 @@ function Workbench:mouseDown(ev)
   -- 别的地方抢焦点会打断输入法组合（旧面板同款判断）。
   local L = self.L or self:layout()
   if L.composer and L.composer.h > 0 and y >= L.composer.y then
+    -- 输入行常驻，这里只要把焦点给 entry（别的地方抢焦点会打断输入法）
     self:focusComposer()
-    self:openInput()
   end
   return true
 end
@@ -1581,8 +1584,7 @@ function Workbench:cancelFieldEdit()
   if not self.fieldEdit then return false end
   local fe = self.fieldEdit
   self.fieldEdit = nil
-  self:setInput("")
-  self:closeInput()
+  self:setInput("")   -- 输入行常驻，只清内容，不收起
   self:log(string.format(i18n.isZh() and "已取消编辑 %s（未保存）" or "cancelled %s (not saved)",
     tostring(fe.label or fe.id)), "info")
   self:invalidate()
@@ -1604,8 +1606,7 @@ function Workbench:commitFieldEdit()
     return false
   end
   self.fieldEdit = nil
-  self:setInput("")
-  self:closeInput()
+  self:setInput("")   -- 输入行常驻，只清内容，不收起
   self:invalidate()
   return true
 end
@@ -1739,14 +1740,14 @@ function Workbench:build(dlg)
     onwheel = h.onwheel,
   }
   dlg:newrow()
-  -- 初始隐藏：常驻的白横条就是用户要去掉的那个"控制台遗留"。
-  -- entry 留着是因为中文输入只走原生 ui::Entry（自绘 canvas 收不到 IME）。
-  dlg:entry{ id = "input", text = workbench.SENTINEL, hexpand = true, visible = false,
+  -- 常驻：用户先要"别常驻"、后来又改口要"固定保留"——以最新要求为准（2026-xx 用户原话
+  -- 「把那个输入框修复保留成固定的吧」）。中文输入只走原生 ui::Entry，所以它必须在。
+  dlg:entry{ id = "input", text = workbench.SENTINEL, hexpand = true, visible = true,
              onchange = function() self:onEntryChange() end }
   dlg:samerow()
   -- 磁吸按钮：focus=true 的按钮吃 ENTER（README 约束 5），所以提交挂在它身上。
   -- 它必须和 entry **同显同隐** —— 按钮藏着，ENTER 就没人捕获。
-  dlg:button{ id = "send", text = "⏎", hexpand = false, focus = true, visible = false,
+  dlg:button{ id = "send", text = "⏎", hexpand = false, focus = true, visible = true,
               onclick = function() self:submit() end }
   self.dlg = dlg
   return dlg
@@ -1816,8 +1817,16 @@ function Workbench:focusCanvas()
   return ok
 end
 
+-- 输入行常驻（用户明确要求）；保留这个开关只为测试与极端场景，正常路径不会关它。
+workbench.INPUT_ALWAYS = true
+
 function Workbench:setInputRowVisible(on)
   on = on and true or false
+  if not on and workbench.INPUT_ALWAYS then
+    -- 常驻模式下"隐藏输入行"这个请求直接拒绝：关掉之后用户就没地方打字了
+    self.inputHideRefused = (self.inputHideRefused or 0) + 1
+    return true
+  end
   self.inputOpen = on
   local dlg = self.dlg
   if dlg then
