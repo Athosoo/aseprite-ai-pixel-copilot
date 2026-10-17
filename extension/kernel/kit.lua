@@ -357,14 +357,15 @@ function Kit:text(xy, text, style)
 end
 
 -- 键值行：label 左、value 右对齐成列。像素数/颜色值/耗时全靠它对齐（ui §1 第 2 条）。
-function Kit:field(r, label, value)
+-- opts：{ valueTone = "err" } —— 必填项没配时值用红色（"未设置"要一眼看见）
+function Kit:field(r, label, value, opts)
   local lh = self.th.metrics.lineH
   local y = r.y + math.floor((r.h - lh) / 2)
   local lr = self:text({ x = r.x, y = y }, label, { tone = "dim" })
   local vw = self:measure(value, { mono = true })
   local vx = r.x + r.w - vw
   if vx < lr.x + lr.w + 8 then vx = lr.x + lr.w + 8 end
-  self:text({ x = vx, y = y }, value, { tone = "text", mono = true })
+  self:text({ x = vx, y = y }, value, { tone = (opts and opts.valueTone) or "text", mono = true })
   push(self, "field", r, { tone = "text" })
   return r
 end

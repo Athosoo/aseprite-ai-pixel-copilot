@@ -1,6 +1,6 @@
 {
-    "when":  "2026-10-17T22:09:09",
-    "luaPass":  1919,
+    "when":  "2026-10-17T22:16:43",
+    "luaPass":  1964,
     "luaFail":  0,
     "bridgePass":  484,
     "bridgeFail":  1,
@@ -19,7 +19,7 @@
                 },
                 {
                     "suite":  "tests\\lua\\workspace_test.lua",
-                    "pass":  463,
+                    "pass":  475,
                     "fail":  0,
                     "note":  ""
                 },
@@ -116,6 +116,12 @@
                 {
                     "suite":  "tests\\lua\\bridge_retry_test.lua",
                     "pass":  54,
+                    "fail":  0,
+                    "note":  ""
+                },
+                {
+                    "suite":  "tests\\lua\\send_gate_test.lua",
+                    "pass":  33,
                     "fail":  0,
                     "note":  ""
                 }

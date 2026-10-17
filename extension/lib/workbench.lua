@@ -750,8 +750,8 @@ function Workbench:drawMain(kit, r)
     local bar = { x = r.x, y = r.y, w = r.w, h = barH }
     kit:fill(bar, "surface2")
     kit:fill({ x = bar.x, y = bar.y, w = m.accentBar, h = barH }, "err")
-    local reason = self.state.reason or (i18n.isZh() and "桥没连上" or "bridge not connected")
-    kit:text({ x = bar.x + m.pad + 4, y = bar.y + 4 }, reason, { tone = "err" })
+    local reason, tone = self:disconnectReason()
+    kit:text({ x = bar.x + m.pad + 4, y = bar.y + 4 }, reason, { tone = tone })
     local cmd = self.state.bridgeCmd or workbench.BRIDGE_CMD
     kit:text({ x = bar.x + m.pad + 4, y = bar.y + 4 + m.lineH }, cmd, { tone = "dim", mono = true })
     local label = kit:pick("重试", "Retry")
@@ -1338,10 +1338,18 @@ function Workbench:setStatus(status, kind)
   if kind == "ok" then
     self.state.connected = true
     self.state.reason = nil
+    self.state.connectStartedAt = nil   -- 有结果了，不再显示"在等授权"
+    self.state.authWaited = nil
     self:invalidate("main")
   elseif kind == "error" or kind == "err" then
     self.state.connected = false
     self:invalidate("main")
+  elseif kind == "busy" then
+    -- agent 连之前在状态栏写「连接中…」：这是"发起了一次连接"的信号（启动路径也覆盖到）
+    local s = tostring(status or "")
+    if s:find("连接", 1, true) or s:find("connect", 1, true) then
+      if not self.state.connectStartedAt then self:noteConnectAttempt() end
+    end
   end
   self:invalidate("titlebar")
   return status
@@ -1361,6 +1369,7 @@ function Workbench:retryConnect()
   if ok then
     local text = i18n.isZh() and "正在重连…" or "reconnecting..."
     self.state.reconnecting = true
+    self:noteConnectAttempt()
     self:setBusy(true, text)
     self:invalidate("main")
     return "retry"
@@ -1686,6 +1695,66 @@ end
 
 -- 原生模态窗（设置窗 / 文件选择器）关掉之后，宿主有可能把工作台一起收掉。
 -- 这里兜一层：只要工作台自己的 dlg 还在就重新显示，用户看到的是"设置窗关了、面板还在"。
+----------------------------------------------------------------------
+-- 连接卡在授权框上（真机实测：ws.connect 之后不再返回，屏幕上是一个 Security 模态框）
+--
+-- 合成点击点不动模态框，所以只能让用户自己点一次；但我们要让面板**说清楚现在在等什么**，
+-- 而不是让他对着「已断开」发呆。判据用时间差（不阻塞 UI）：发起连接 3s 后既没 onOpen
+-- 也没 onError，就认为是在等授权。
+----------------------------------------------------------------------
+
+workbench.AUTH_WAIT_SEC = 3
+
+function Workbench:noteConnectAttempt()
+  self.state.connectStartedAt = os.clock()
+  self.state.connected = false
+  self:invalidate("titlebar")
+  self:invalidate("main")
+  self:_armAuthWatch()
+  return self.state.connectStartedAt
+end
+
+function Workbench:_authWaitSeconds()
+  local started = self.state.connectStartedAt
+  if not started then return nil end
+  return os.clock() - started
+end
+
+function Workbench:waitingForAuth()
+  local elapsed = self:_authWaitSeconds()
+  if not elapsed then return false end
+  return elapsed >= workbench.AUTH_WAIT_SEC
+end
+
+-- 断连红条的第一行文案：优先说"在等授权"，因为那是最容易被误读成"坏了"的状态
+function Workbench:disconnectReason()
+  if self:waitingForAuth() then
+    local text = i18n.isZh()
+      and "等待 Aseprite 授权：请在 Security 窗口点 Allow to Open Connections，并勾选 Don't show this specific alert again"
+      or "waiting for Aseprite authorisation: click Allow to Open Connections in the Security window (tick Don't show this specific alert again)"
+    return text, "warn"
+  end
+  return self.state.reason or (i18n.isZh() and "桥没连上" or "bridge not connected"), "err"
+end
+
+-- GUI 下用一次性 Timer 在 3s 后自动刷一次，让"在等授权"自己出现（无头下 Timer 不 tick，无副作用）
+function Workbench:_armAuthWatch()
+  if type(Timer) ~= "table" then return end
+  local t
+  t = Timer{
+    interval = workbench.AUTH_WAIT_SEC + 0.2,
+    ontick = function()
+      pcall(function() t:stop() end)
+      if self.state.connected == false and self:waitingForAuth() then
+        self.state.authWaited = true
+        self:invalidate("main")
+        self:invalidate("titlebar")
+        self:_requestRepaint()
+      end
+    end,
+  }
+end
+
 function Workbench:_afterModal()
   if self.legacyMode then return end
   if not self.dlg then return end

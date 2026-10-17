@@ -379,8 +379,13 @@ function Agent:_attempt(quiet)
         ops = agent.opNames(self:kernel()),
         opsHelp = agent.opsHelp(self:kernel()),
       }
-      self:flushPendingChats()
+      self:_flushControl()          -- 离线期间积压的控制帧（hello 已先发）
+      self:flushPendingChats()      -- 再发聊天：顺序 hello → 控制帧 → 聊天
       self:flushPendingFixes()
+      if (self._droppedLogs or 0) > 0 then
+        self.panel:log(string.format("离线期间有 %d 条日志未送达（不影响对话）", self._droppedLogs), "info")
+        self._droppedLogs = 0
+      end
     end,
     onText = function(msg) if current() then self:onMessage(msg) end end,
     onBinary = function(header, data) if current() then self:onBinary(header, data) end end,
@@ -439,9 +444,86 @@ function Agent:_scheduleNextAttempt()
   if self._retryHandle == true then self._retryHandle = handle end
 end
 
+-- ---- 统一发送闸门 ------------------------------------------------------
+-- 真机日志里那行红字（lib/ws.lua:125 WebSocket is not connected, can't send text）
+-- 就是"socket 还没 open 就 send"：conn:send 直接抛，异常一路甩进会话区。
+-- 所有发送点因此统一走这道闸门：能发就发，不能发就排队（log 帧丢弃），绝不抛。
+local SEND_QUEUE_MAX = 32
+
+function Agent:_isOpen()
+  local conn = self.conn
+  if not conn then return false end
+  local ok, open = pcall(function() return conn:isOpen() end)
+  return ok and open == true
+end
+
+function Agent:_pendingQueue()
+  if not self._pendingSend then self._pendingSend = {} end
+  return self._pendingSend
+end
+
+function Agent:_enqueue(item)
+  local q = self:_pendingQueue()
+  while #q >= SEND_QUEUE_MAX do table.remove(q, 1) end   -- 离线太久就丢最老的，别无限堆
+  q[#q + 1] = item
+end
+
+function Agent:_safeSend(tbl)
+  if type(tbl) ~= "table" then return false end
+  if self:_isOpen() then
+    local ok, err = pcall(self.conn.send, self.conn, tbl)
+    if ok then return true end
+    -- isOpen 说开、底层其实已经死了：退化成排队，别把异常甩出去
+    self._lastSendError = tostring(err)
+  end
+
+  local kind = tostring(tbl.type or "")
+  if kind == "log" then
+    -- 离线期间的日志帧没有重放价值，而且是刷屏源头：丢掉并计数
+    self._droppedLogs = (self._droppedLogs or 0) + 1
+    return false
+  end
+  self:_enqueue({ kind = "text", tbl = tbl })
+  return false
+end
+
+function Agent:_safeSendBinary(header, data)
+  if type(header) ~= "table" then return false end
+  if self:_isOpen() then
+    local ok, err = pcall(self.conn.sendBinary, self.conn, header, data)
+    if ok then return true end
+    self._lastSendError = tostring(err)
+  end
+  self:_enqueue({ kind = "binary", header = header, data = data })
+  return false
+end
+
+-- 连上后的补发顺序：hello（onOpen 里先发）→ 积压的控制帧 → 待发聊天
+function Agent:_flushControl()
+  local q = self._pendingSend
+  if not q or #q == 0 then return 0 end
+  if not self:_isOpen() then return 0 end
+
+  local keep, sent = {}, 0
+  for _, item in ipairs(q) do
+    local ok
+    if item.kind == "binary" then
+      ok = pcall(self.conn.sendBinary, self.conn, item.header, item.data)
+    else
+      ok = pcall(self.conn.send, self.conn, item.tbl)
+    end
+    if ok then sent = sent + 1 else keep[#keep + 1] = item end
+  end
+  self._pendingSend = keep
+  if sent > 0 then
+    self.panel:log(string.format("已补发离线期间积压的 %d 条消息", sent), "info")
+  end
+  return sent
+end
+
+-- 对外保持原签名：所有 self:send{...} 都自动过闸门
 function Agent:send(tbl)
-  if not self.conn then return false end
-  return self.conn:send(tbl)
+  return self:_safeSend(tbl)
 end
 
 function Agent:nextId()
@@ -965,7 +1047,7 @@ function Agent:upload(path, fromQueue)
 
     self.panel:log(string.format(i18n.t("loadedSending"), w, h), "info")
     local id = self:nextId()
-    self.conn:sendBinary({ type = "upload", id = id, name = app.fs.fileName(path),
+    self:_safeSendBinary({ type = "upload", id = id, name = app.fs.fileName(path),
                            width = w, height = h }, data)
   end)
   if not ok then
@@ -995,7 +1077,7 @@ function Agent:sendCanvas(id)
     data = tmp.bytes
   end
 
-  self.conn:sendBinary({
+  self:_safeSendBinary({
     type = "canvas_pixels", id = id,
     width = img.width, height = img.height,
   }, data)
@@ -1569,6 +1651,8 @@ end
 
 function Agent:destroy()
   self:cancelRetry()          -- 面板/扩展关掉时别留一个还在跑的定时器
+  self._pendingSend = nil     -- 离线积压的帧也一起丢掉，别跨会话残留
+  self.pendingChats = nil
   if self.conn then self.conn:close() end
   if self.settings then self.settings:destroy() end
   if self.panel then self.panel:destroy() end

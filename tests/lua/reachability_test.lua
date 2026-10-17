@@ -41,10 +41,10 @@ end
 local LEFT = (type(MouseButton) == "table" and MouseButton.LEFT) or 1
 
 local function fakeGC(w, h)
-  local g = { width = w or 900, height = h or 620 }
+  local g = { width = w or 900, height = h or 620, texts = {} }
   g.measureText = function(_, s) s = tostring(s or ""); return { width = (utf8.len(s) or #s) * 6, height = 12 } end
   g.fillRect = function() end
-  g.fillText = function() end
+  g.fillText = function(_, s) g.texts[#g.texts + 1] = tostring(s) end
   g.drawImage = function() end
   return g
 end
@@ -592,6 +592,114 @@ do
   wb:setInput("high")
   wb:submit()
   eq(sends[#sends].llm.thinking, "high", "合法枚举值落盘")
+end
+
+print("== 12. 等待授权：3s 内没有结果就把红条改成「去点 Allow」 ==")
+do
+  local wb, agent, kernel, dlg = newWB()
+  wb:setConnected(false, { reason = "bridge refused", cmd = "node x.mjs" })
+  wb:invalidate(); wb:paint(fakeGC(900, 620))
+  local before = wb:disconnectReason()
+  ok(tostring(before):find("bridge refused", 1, true) ~= nil, "刚开始显示的是已知原因", before)
+
+  -- 模拟"发起连接已经过去 5 秒，既没 onOpen 也没 onError"
+  wb:noteConnectAttempt()
+  wb.state.connectStartedAt = os.clock() - 5
+  local reason, tone = wb:disconnectReason()
+  ok(tostring(reason):find("Allow to Open Connections", 1, true) ~= nil,
+     "超时后文案提示去点 Allow to Open Connections", reason)
+  ok(tostring(reason):find("Security", 1, true) ~= nil, "文案点明是 Security 窗口")
+  eq(tone, "warn", "等待授权用 warn 色（不是纯错误红）")
+
+  -- 画出来：红条上真的出现这段字
+  wb:invalidate(); local gc = fakeGC(900, 620); wb:paint(gc)
+  local drewAuth = false
+  for _, txt in ipairs(gc.texts) do
+    if txt:find("Allow to Open Connections", 1, true) then drewAuth = true end
+  end
+  ok(drewAuth, "红条上真的画出了授权提示")
+
+  -- 有结果之后文案回退，不再显示"在等授权"
+  wb:setStatus("connected", "ok")
+  eq(wb.state.connectStartedAt, nil, "连上后清掉等待计时")
+  eq(wb:waitingForAuth(), false, "连上后不再是等待授权态")
+
+  -- 3 秒内不该误报
+  local wb2 = newWB()
+  wb2:setConnected(false, { reason = "x", cmd = "y" })
+  wb2:noteConnectAttempt()
+  eq(wb2:waitingForAuth(), false, "刚发起连接（<3s）不显示授权提示")
+end
+
+print("== 13. 设置页：必填标记 / 未配置提示 / 顶部引导 ==")
+do
+  local wb, agent, kernel, dlg = newWB()
+  agent.cfg = { port = 8777 }
+  agent.config = { }        -- 什么都没配
+  wb:setView("settings")
+  wb:invalidate()
+  local gc = fakeGC(900, 620)
+  wb:paint(gc)
+
+  local introDrawn, starDrawn, unsetDrawn = false, false, false
+  for _, txt in ipairs(gc.texts) do
+    if txt:find("127.0.0.1:8777", 1, true) then introDrawn = true end
+    if txt:find(" *", 1, true) then starDrawn = true end
+    if txt == "not set" or txt == "未设置" then unsetDrawn = true end
+  end
+  ok(introDrawn, "顶部有本地桥地址与三项必填的引导")
+  ok(starDrawn, "必填字段带 * 标记")
+  ok(unsetDrawn, "未配置显示「未设置」/「not set」")
+
+  local rows = wb.view:fields()
+  local required, missing = 0, 0
+  for _, f in ipairs(rows) do
+    if f.required then required = required + 1 end
+    if f.missing then missing = missing + 1 end
+  end
+  eq(required, 3, "端点/模型/密钥三项标为必填")
+  ok(missing >= 3, "三项都没配时都标成 missing", missing)
+
+  -- 配好之后：密钥显示掩码而不是"未设置"
+  agent.config = { baseUrl = "https://api.openai.com/v1", model = "gpt-4o", apiKeySet = true, apiKeyHint = "9f2c" }
+  wb:invalidate()
+  local gc2 = fakeGC(900, 620)
+  wb:paint(gc2)
+  local masked = false
+  for _, txt in ipairs(gc2.texts) do if txt:find("***9f2c", 1, true) then masked = true end end
+  ok(masked, "已配置时密钥显示掩码 ***9f2c")
+end
+
+print("== 14. 未连接桥时保存：直接说「未连接桥，无法保存」 ==")
+do
+  local wb, agent, kernel, dlg = newWB()
+  local sends = {}
+  function agent:send(t) sends[#sends + 1] = t; return true end
+  agent.config = { model = "gpt-4o" }
+  wb:setView("settings")
+  wb:setConnected(false, { reason = "bridge refused", cmd = "node x.mjs" })
+  wb:invalidate(); wb:paint(fakeGC(900, 620))
+
+  local modelHit = nil
+  for _, hit in ipairs(wb.view.hits or {}) do if hit.id == "model" then modelHit = hit end end
+  ok(modelHit ~= nil, "设置页有模型行")
+  if modelHit then
+    clickAt(wb, rectCenter(modelHit.rect))
+    ok(wb.fieldEdit ~= nil, "进入编辑态")
+    wb:setInput("gpt-4.1")
+    local cv = wb.views.console
+    local linesBefore = cv:count()
+    wb:submit()
+    eq(#sends, 0, "未连接时不发 set_config（不静默失败）")
+    ok(cv:count() > linesBefore, "会话里出现一行说明")
+    local lastText = ""
+    for i = cv:count(), 1, -1 do
+      if cv.lines[i] then lastText = tostring(cv.lines[i].text); break end
+    end
+    ok(tostring(lastText):find("未连接桥", 1, true) ~= nil or tostring(lastText):find("not connected", 1, true) ~= nil,
+       "错误文案明确说「未连接桥，无法保存」", lastText)
+    ok(wb.fieldEdit ~= nil, "失败保留编辑态，值不丢")
+  end
 end
 
 print("")

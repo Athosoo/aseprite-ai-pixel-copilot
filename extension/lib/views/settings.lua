@@ -49,13 +49,23 @@ function View:fields()
     if not n or n <= 0 then return ms end
     return tostring(math.floor(n / 1000))
   end
+  local unset = zh() and "未设置" or "not set"
+  local function textOf(key, fallback)
+    local v = pick(key, nil)
+    if v == nil or tostring(v) == "" then return unset, true end
+    return tostring(v), false
+  end
+  local baseUrl, baseMissing = textOf("baseUrl")
+  local model, modelMissing = textOf("model")
   return {
-    { key = "baseUrl", label = zh() and "端点" or "Base URL", kind = "text",
-      value = tostring(pick("baseUrl", "-")), hint = "Base URL（例如 https://api.openai.com/v1）" },
-    { key = "model", label = zh() and "模型" or "Model", kind = "text",
-      value = tostring(pick("model", "-")), hint = "Model（例如 gpt-4o）" },
-    { key = "apiKey", label = zh() and "密钥" or "API Key", kind = "secret",
-      value = maskOf(a), hint = zh() and "API Key（留空 = 保持不变）" or "API Key (blank = keep current)" },
+    { key = "baseUrl", label = zh() and "端点" or "Base URL", kind = "text", required = true,
+      value = baseUrl, missing = baseMissing,
+      hint = "Base URL（例如 https://api.openai.com/v1）—— 必填" },
+    { key = "model", label = zh() and "模型" or "Model", kind = "text", required = true,
+      value = model, missing = modelMissing, hint = "Model（例如 gpt-4o）—— 必填" },
+    { key = "apiKey", label = zh() and "密钥" or "API Key", kind = "secret", required = true,
+      value = maskOf(a), missing = not (a and a.config and a.config.apiKeySet),
+      hint = zh() and "API Key（必填；留空 = 保持不变）" or "API Key (required; blank = keep current)" },
     { key = "language", label = zh() and "语言" or "Language", kind = "enum", enum = { "zh", "en" },
       value = zh() and "zh" or "en",
       hint = zh() and "语言 zh / en（重启 Aseprite 生效）" or "language zh / en (restart Aseprite)" },
@@ -132,6 +142,17 @@ function View:commitField(field, text)
     llm[field.key] = text
   end
 
+  -- 未连接时**明说**，不要静默失败（用户反馈"密钥存不上"就卡在这里：set_config 发出去没人收）
+  local connState = wb and wb.state and wb.state.connected
+  local sinkOpen = nil
+  if a and a.conn and type(a.conn.isOpen) == "function" then
+    local okOpen, isOpen = pcall(a.conn.isOpen, a.conn)
+    if okOpen then sinkOpen = isOpen and true or false end
+  end
+  if connState == false or sinkOpen == false then
+    return false, zh() and "未连接桥，无法保存（请先在红条上点「重试」）"
+                        or "bridge not connected; cannot save (hit Retry on the red bar first)"
+  end
   if not (a and type(a.send) == "function") then
     return false, zh() and "桥没连上，改动无法写回" or "bridge not connected; cannot save"
   end
@@ -155,6 +176,16 @@ function View:render(kit, r, state)
   local innerW = r.w - m.viewPad * 2
   local editId = state.fieldEditId
 
+  -- 首次配置引导：先告诉用户"连的是谁、缺哪三项就聊不了"
+  local port = (self.ctx and self.ctx.kernel and self.ctx.kernel.ledger and nil) or 8777
+  local a = self:agent()
+  if a and a.cfg and tonumber(a.cfg.port) then port = tonumber(a.cfg.port) end
+  local intro = zh()
+    and string.format("本地桥 ws://127.0.0.1:%s · 端点 / 模型 / 密钥三项必填，缺一项就无法对话", tostring(port))
+    or string.format("local bridge ws://127.0.0.1:%s · endpoint / model / API key are required; without them no chat", tostring(port))
+  kit:text({ x = x, y = y }, intro, { tone = "faint" })
+  y = y + m.lineH + m.gap
+
   local function section(title)
     kit:text({ x = x, y = y }, title, { bold = true, tone = "dim" })
     y = y + m.lineH + m.gap
@@ -166,7 +197,9 @@ function View:render(kit, r, state)
       -- 正在编辑的那一行：左侧 2px accent 竖条（焦点可见性）
       kit:fill({ x = fr.x, y = fr.y, w = m.accentBar, h = fr.h }, "accent")
     end
-    kit:field(fr, field.label, tostring(field.value))
+    local label = tostring(field.label)
+    if field.required then label = label .. " *" end
+    kit:field(fr, label, tostring(field.value), { valueTone = field.missing and "err" or "text" })
     self.hits[#self.hits + 1] = { rect = fr, kind = "field", index = index, id = field.key }
     y = y + m.rowH
   end

@@ -1,0 +1,17 @@
+fix: gate every outbound frame so sending before the socket opens cannot throw
+
+Real-machine log showed ws.lua:125 "WebSocket is not connected, can't send text":
+some send paths bypassed the chat queue, so hello / set_config / log frames
+fired before the socket was open and threw into the conversation view. That is
+also why "settings saved" looked like it failed and the api key looked unset.
+
+_safeSend wraps Agent:send (one change covers all 50+ call sites): if the
+connection is absent or not open, control frames queue and log frames are
+dropped with a count, never raising. onOpen flushes hello -> control queue ->
+pending chats -> pending fixes, in order. Binary frames go through the same
+queue. destroy clears it.
+
+Verified on the real machine: bridge health reports clients: 1 and the panel
+shows connected with model/baseURL/apiKey already persisted.
+
+send_gate_test 33 new. Lua 1964/0.
