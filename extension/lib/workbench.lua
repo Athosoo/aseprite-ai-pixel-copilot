@@ -371,12 +371,55 @@ end
 -- 形态（四形态全保留，D4）
 ----------------------------------------------------------------------
 
+function Workbench:modeLabel(mode)
+  local m = mode or self.mode
+  local zh = i18n.isZh()
+  local names = {
+    panel = zh and "面板" or "panel",
+    bar_bottom = zh and "底边栏" or "bottom bar",
+    bar_side = zh and "侧边栏" or "side bar",
+    small = zh and "小窗" or "small",
+  }
+  return names[m] or tostring(m)
+end
+
+-- 形态切换后在标题栏短暂显示形态名：真机验证/误触时能一眼确认"刚才发生了什么"
+workbench.MODE_FLASH_SEC = 1.5
+
+function Workbench:_flashMode()
+  self.state.modeFlash = { text = self:modeLabel(), untilT = os.clock() + workbench.MODE_FLASH_SEC }
+  self:invalidate("titlebar")
+  if type(Timer) ~= "table" then return end
+  local t
+  t = Timer{
+    interval = workbench.MODE_FLASH_SEC + 0.1,
+    ontick = function()
+      pcall(function() t:stop() end)
+      self.state.modeFlash = nil
+      self:invalidate("titlebar")
+      self:_requestRepaint()
+    end,
+  }
+end
+
+function Workbench:modeFlashActive()
+  local f = self.state.modeFlash
+  if not f then return nil end
+  if f.untilT and os.clock() > f.untilT then
+    self.state.modeFlash = nil
+    return nil
+  end
+  return f.text
+end
+
 function Workbench:setMode(mode)
   if mode == nil then return self.mode end
   local ok = false
   for _, m in ipairs(workbench.MODES) do if m == mode then ok = true end end
   if not ok then return self.mode end
+  local changed = (self.mode ~= mode)
   self.mode = mode
+  if changed then self:_flashMode() end
   self:invalidate()
   return self.mode
 end
@@ -614,6 +657,7 @@ function Workbench:drawTitlebar(kit, r)
   if status == nil or status == "" then
     status = ok and (i18n.isZh() and "已连接" or "connected") or (i18n.isZh() and "已断开" or "disconnected")
   end
+
   if self.state.busy then
     kit:spinner({ x = dot.x + dot.w + 6, y = ty }, self.state.spin or 0)
     kit:text({ x = dot.x + dot.w + 6 + 10, y = ty }, status, { tone = "busy" })
@@ -980,6 +1024,9 @@ function Workbench:drawComposer(kit, r)
     if fe then
       ph = fe.mask and (i18n.isZh() and "••••（留空 = 保持不变）" or "•••• (blank = keep current)")
                        or (i18n.isZh() and "回车确认 / Esc 取消" or "Enter to confirm / Esc to cancel")
+    elseif self:pendingAsk() then
+      ph = kit:pick("回答上面的提问：输入编号（1/2/…）或直接说；Esc 取消",
+                    "answer the question above: type a number or just say it; Esc cancels")
     else
       ph = kit:pick("说点什么，或敲 / 叫命令…", "say something, or press / for commands")
     end
@@ -1012,6 +1059,19 @@ function Workbench:drawComposer(kit, r)
   -- 光标位：空输入时画在提示文字起点，有字时画在字尾。
   -- 原生输入行收起来之后，这个光标就是"可以打字"的唯一可见凭证。
   kit:fill({ x = self.caretX + 1, y = y, w = 1, h = m.lineH }, self.inputOpen and "accent" or "dim")
+
+  -- 刚切过形态：在 composer 右侧短暂显示形态名（四种形态都有 composer，
+  -- 而栏形态没有 titlebar，所以统一画在这里）。这是"切换按钮生效了吗"的肉眼凭证。
+  local flash = self:modeFlashActive()
+  if flash then
+    local label = (i18n.isZh() and "形态：" or "mode ") .. tostring(flash)
+    local tw = kit:measure(label, { bold = true })
+    local box = { x = enterR.x - 12 - tw - 12, y = r.y + 4, w = tw + 12, h = r.h - 8 }
+    kit:fill(box, "surface2")
+    kit:frameRect(box, "accent")
+    kit:text({ x = box.x + 6, y = box.y + math.floor((box.h - m.lineH) / 2) }, label,
+              { tone = "accent", bold = true })
+  end
 
   if self.completionOpen then
     self:drawCompletion(kit, r)
@@ -1191,6 +1251,11 @@ function Workbench:escape()
     self:cancelFieldEdit()
     return "field"
   end
+  -- 有待答提问：Esc 取消这次提问（否则用户以为"按了没反应"）
+  if self:pendingAsk() then
+    self:cancelPendingAsk()
+    return "ask"
+  end
   if self.completionOpen then
     self.completionOpen = false
     self:invalidate("composer")
@@ -1260,6 +1325,26 @@ function Workbench:submit()
       self:runCommand(c, text)
       return true
     end
+  end
+
+  -- 桥在等 answer 帧时，chat 会被丢掉：先把提问处理掉，别制造静默死锁
+  local ask = self:pendingAsk()
+  if ask then
+    local n = tonumber(text)
+    if n ~= nil then
+      local opts = ask.options or {}
+      local label = opts[n]
+      if self:answerPendingAsk(n, label ~= nil and string.format("%d. %s", n, tostring(label)) or tostring(n)) then
+        return true
+      end
+    end
+    if self:isAskCancelWord(text) then
+      if self:cancelPendingAsk() then return true end
+    end
+    -- 自由文本当"补充说明"：先取消这次提问（桥才不会死等），再走普通聊天
+    self:cancelPendingAsk(true)
+    self:log(i18n.isZh() and "先取消了这次提问，下面这句按普通消息发出"
+                         or "cancelled the pending question; sending this as a normal message", "info")
   end
   -- 注意 API 语义：Agent:send(tbl) 是**发协议帧**；聊天要用 sendChat（未连上时它会排队，
   -- 连上后由 flushPendingChats 补发）。以前这里把用户输入当帧发出去，桥不认识 → 静默丢弃，
@@ -1650,6 +1735,69 @@ function Workbench:commitFieldEdit()
   self:setInput("")   -- 输入行常驻，只清内容，不收起
   self:invalidate()
   return true
+end
+
+----------------------------------------------------------------------
+-- 待答提问（P7 / ask_user）
+--
+-- 桥在等 answer 帧的时候，chat 帧会被**静默丢掉** —— 用户打字回复"2"，桥毫无反应，
+-- 看起来就是"再回复就没反应"。旧面板有 _interpretAskInput 处理这条，工作台漏了。
+-- 这里补上：submit 先看有没有待答提问，有就按"编号 / 取消词 / 自由文本"三路处理。
+----------------------------------------------------------------------
+
+-- 「取消/放弃」这类词（与 panel.lua 的 ASK_CANCEL 同一套语义）
+workbench.ASK_CANCEL = {
+  x = true, q = true, esc = true, cancel = true, skip = true, none = true, no = true,
+  ["取消"] = true, ["放弃"] = true, ["算了"] = true, ["不了"] = true, ["关闭"] = true, ["算了。"] = true,
+}
+
+function Workbench:pendingAsk()
+  local a = self.agent
+  if a and a.pendingAskId ~= nil then
+    return { id = a.pendingAskId, options = a.pendingAskOptions or {} }
+  end
+  -- agent 的字段是权威；适配层 setAsk 也会把同一份东西放进 state.ask（两处都要认）
+  if self.state.ask ~= nil then return self.state.ask end
+  return nil
+end
+
+function Workbench:hasPendingAsk() return self:pendingAsk() ~= nil end
+
+-- 方法而不是局部函数：submit 在这个文件里更靠前，局部函数在它那里是看不见的（会变成全局 nil）
+function Workbench:isAskCancelWord(text)
+  local s = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if s == "" then return false end
+  if workbench.ASK_CANCEL[s] then return true end
+  return workbench.ASK_CANCEL[lowerText(s)] == true
+end
+
+-- 把这次提问取消掉（agent:answerAsk(nil) 会发 answer{cancelled=true}）
+function Workbench:cancelPendingAsk(quiet)
+  local a = self.agent
+  local ask = self:pendingAsk()
+  if not ask then return false end
+  if a and type(a.answerAsk) == "function" then
+    pcall(a.answerAsk, a, nil)
+  end
+  self.state.ask = nil
+  if not quiet then
+    self:log(i18n.isZh() and "已取消这个问题（桥会等你下一句）" or "question cancelled", "info")
+  end
+  self:invalidate("composer")
+  return true
+end
+
+-- 按编号回答；成功返回 true
+function Workbench:answerPendingAsk(index, label)
+  local a = self.agent
+  local ask = self:pendingAsk()
+  if not ask then return false end
+  if not (a and type(a.answerAsk) == "function") then return false end
+  local ok = pcall(a.answerAsk, a, index)
+  self.state.ask = nil
+  if ok and label ~= nil then self:log(tostring(label), "user") end
+  self:invalidate("composer")
+  return ok
 end
 
 -- composer 右侧三个图标

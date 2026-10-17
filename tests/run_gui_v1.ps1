@@ -22,7 +22,7 @@ if (-not (Test-Path $probe)) { throw "probe not found: $probe" }
 $parkedNow = $false
 try {
   Get-Process aseprite -ErrorAction SilentlyContinue | Stop-Process -Force
-  Start-Sleep -Milliseconds 500
+  Start-Sleep -Milliseconds 1500
   if ((Test-Path $ext) -and -not (Test-Path $parked)) {
     Move-Item -LiteralPath $ext -Destination $parked
     $parkedNow = $true

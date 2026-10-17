@@ -181,6 +181,15 @@ class Session {
     this.send(msg);
   }
 
+  // 模型的思考过程：发独立的 thinking 帧，绝不进 say（say 会被面板当正文渲染）。
+  // 刻意不写会话回放：实时不显示、重连却冒出来，等于把用户刚赶走的那段英文思考又还给他。
+  // 面板哪天愿意按弱化样式画 thinking 帧了，再在这里补一行 pushLog('think', ...) 即可。
+  sayThinking(text) {
+    const t = String(text || '').trim();
+    if (!t) return;
+    this.send({ type: 'thinking', text: t });
+  }
+
   // 把当前对话的记录推给面板（面板收到就清屏重画）——关掉面板 / 重启 Aseprite 之后
   // "它还记得我们聊过"靠的就是这条。桥是唯一真相来源，所以是替换不是追加。
   sendReplay() {
@@ -372,6 +381,8 @@ class Session {
         dispatch,
         abortSignal: ac.signal,
         onSay: (kind, t, key) => this.say(kind, t, key),
+        // 思考单独走 thinking 帧，绝不混进 say（say 会被面板当正文渲染）
+        onThink: (t) => this.sayThinking(t),
         onStatus: (t, kind) => this.status(t, kind),
         // 这一轮新产生的消息（含被打断的半截）回写进历史
         onHistory: (msgs) => { history.messages = msgs; },

@@ -148,6 +148,37 @@ function contextToText(ctx) {
   return lines.join('\n');
 }
 
+// 保守的 reasoning 提取：只认 provider 明确给出的独立字段。
+// 没有独立字段就返回空 —— 从 content 里"猜"哪里是思考会误伤正常回答，
+// 而误伤正常回答比漏掉一段思考严重得多（任务书的硬要求：判定要保守）。
+const REASONING_KEYS = ['reasoning_content', 'reasoning', 'thinking', 'reasoning_details'];
+
+function reasoningText(value) {
+  if (typeof value === 'string') return value.trim();
+  // openrouter 系网关：reasoning_details: [{ type: 'reasoning.text', text }] 或 ['...']
+  if (Array.isArray(value)) {
+    return value
+      .map((v) => (typeof v === 'string' ? v : (v && typeof v.text === 'string' ? v.text : '')))
+      .filter(Boolean).join('\n').trim();
+  }
+  // 少数网关包成对象：{ text } / { content }
+  if (value && typeof value === 'object') {
+    for (const k of ['text', 'content']) {
+      if (typeof value[k] === 'string' && value[k].trim()) return value[k].trim();
+    }
+  }
+  return '';
+}
+
+export function pickReasoning(msg) {
+  if (!msg || typeof msg !== 'object') return '';
+  for (const key of REASONING_KEYS) {
+    const text = reasoningText(msg[key]);
+    if (text) return text;
+  }
+  return '';
+}
+
 export function buildUserMessage(userText, context) {
   return `[Current canvas state]\n${contextToText(context)}\n\n[User request]\n${userText}`;
 }
@@ -168,7 +199,7 @@ export function buildUserMessage(userText, context) {
  *   abortSignal 外部中断信号（见 chatCompletion）；中断时抛 TurnAborted
  */
 export async function runTurn(opts) {
-  const { cfg, systemPrompt, history, userText, context, tools, dispatch, onSay, onStatus, abortSignal, onHistory } = opts;
+  const { cfg, systemPrompt, history, userText, context, tools, dispatch, onSay, onStatus, onThink, abortSignal, onHistory } = opts;
 
   // 系统提示每步重取：模型可能在**同一轮**里 style_use 换了风格，
   // 那后面的作画步骤就得立刻按新风格来（否则"换个风格画个图标"要两轮才生效）。
@@ -227,10 +258,13 @@ export async function runTurn(opts) {
       if (msg.tool_calls && msg.tool_calls.length) clean.tool_calls = msg.tool_calls;
       messages.push(clean);
 
-      // 推理模型的思考过程（DeepSeek reasoner 等）→ 灰色
-      if (msg.reasoning_content && String(msg.reasoning_content).trim()) {
-        const r = String(msg.reasoning_content).trim();
-        onSay('think', r.length > 600 ? r.slice(0, 600) + ' …' : r);
+      // 推理模型的思考过程（DeepSeek reasoner 等）单独走 thinking 通道。
+      // 它绝不能走 say —— 面板把 say 当正文渲染，用户看到一大段英文思考会以为 AI 在胡说。
+      const reasoning = pickReasoning(msg);
+      if (reasoning) {
+        const clipped = reasoning.length > 600 ? reasoning.slice(0, 600) + ' …' : reasoning;
+        if (onThink) onThink(clipped);
+        else onSay('think', clipped);   // 没有 thinking 通道的调用方（旧脚本/嵌入式）保持原样
       }
 
       if (msg.content && msg.content.trim()) {

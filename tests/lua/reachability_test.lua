@@ -702,5 +702,80 @@ do
   end
 end
 
+print("== 15. 待答提问：回复必须走 answer，不能发 chat（静默死锁）==")
+do
+  local wb, agent, kernel, dlg = newWB()
+  local answers, chats = {}, {}
+  -- 照真实 agent 的契约：answerAsk 会清掉 pendingAskId/pendingAskOptions
+  function agent:answerAsk(index)
+    answers[#answers + 1] = index
+    self.pendingAskId = nil
+    self.pendingAskOptions = nil
+    return true
+  end
+  function agent:sendChat(text) chats[#chats + 1] = tostring(text); return true end
+  function agent:sendChatNow(text) chats[#chats + 1] = tostring(text); return true end
+
+  -- 模拟桥发来 ask_user
+  agent.pendingAskId = "ask-1"
+  agent.pendingAskOptions = { "64x64", "128x128", "256x256" }
+  ok(wb:hasPendingAsk(), "有待答提问时 hasPendingAsk() 为真")
+
+  -- 输入编号 → answerAsk(n)，不发 chat
+  wb:setInput("2")
+  wb:submit()
+  eq(answers[1], 2, "输入 2 → answerAsk(2)")
+  eq(#chats, 0, "答题时**不发 chat**（桥在等 answer，chat 会被丢掉）")
+
+  -- 取消词 → answerAsk(nil)
+  agent.pendingAskId = "ask-2"
+  wb:setInput("算了")
+  wb:submit()
+  eq(answers[2], nil, "取消词 → answerAsk(nil) 走 cancelled 分支")
+  eq(#chats, 0, "取消也不发 chat")
+
+  -- 自由文本 → 先取消提问，再发 chat
+  agent.pendingAskId = "ask-3"
+  wb:setInput("我要 512x512")
+  wb:submit()
+  eq(answers[3], nil, "自由文本先取消这次提问")
+  eq(chats[1], "我要 512x512", "然后再按普通消息发出")
+  eq(agent.pendingAskId, nil, "取消后 pendingAskId 清空")
+
+  -- Esc 也能取消提问
+  agent.pendingAskId = "ask-4"
+  eq(wb:escape(), "ask", "Esc 优先取消待答提问")
+  ok(wb.state.ask == nil, "取消后 workbench 的 ask 也清空")
+
+  -- agent 清掉 pendingAsk 之后，不再走答题分支
+  local chatsBefore = #chats
+  wb:setInput("正常消息")
+  wb:submit()
+  eq(#chats, chatsBefore + 1, "没有待答提问时照常发 chat")
+end
+
+print("== 16. 形态切换有视觉反馈（真机验证/误触时能确认）==")
+do
+  local wb, agent, kernel, dlg = newWB()
+  wb:setMode("panel")
+  wb:setMode("bar_side")
+  local flash = wb:modeFlashActive()
+  ok(flash ~= nil, "切形态后进入闪现态")
+  ok(tostring(flash):find("侧边栏", 1, true) ~= nil or tostring(flash):find("side", 1, true) ~= nil,
+     "闪现内容是该形态名", tostring(flash))
+  wb:invalidate()
+  local gc = fakeGC(900, 620)
+  wb:paint(gc)
+  local drew = false
+  for _, txt in ipairs(gc.texts) do
+    if txt:find("侧边栏", 1, true) or txt:find("side bar", 1, true) then drew = true end
+  end
+  ok(drew, "标题栏上真的画出了形态名")
+
+  -- 过期后自动消失
+  wb.state.modeFlash.untilT = os.clock() - 1
+  eq(wb:modeFlashActive(), nil, "超过 1.5s 后闪现自动失效")
+end
+
 print("")
 print(string.format("%d passed, %d failed", pass, fail))
