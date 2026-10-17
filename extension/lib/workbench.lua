@@ -30,14 +30,45 @@ local BUILTIN_VIEWS = {
 }
 workbench.BUILTIN_VIEWS = BUILTIN_VIEWS
 
+-- 视图模块在**本模块加载时**（= init() 作用域内）一次性 require 完。
+--
+-- 为什么不能懒加载：STATUS 约束 7 —— require 只在 init() 里可用。而视图是"打开面板"
+-- 的命令回调里才挂载的，那时全局 require 已经是 nil。懒 require 的结果是每个视图都拿不到
+-- 实现，core 包的 view.mount 只能退回占位视图 —— 界面上就是「这个视图挂载失败：mount failed」
+-- （真机实测；tests/lua/integration_wiring_test.lua 能在无头下复现并钉住）。
+local MODULES = {}
+for _, b in ipairs(BUILTIN_VIEWS) do
+  local ok, mod = pcall(require, b.module)
+  if ok and type(mod) == "table" then MODULES[b.id] = mod end
+end
+workbench.modules = MODULES
+
+-- 解析内置视图模块：先吃上面预加载的表；只有在 require 还可用时（单测/脚本）才补加载
+local function builtinModule(id)
+  local mod = MODULES[id]
+  if mod then return mod end
+  if type(require) ~= "function" then return nil end
+  for _, b in ipairs(BUILTIN_VIEWS) do
+    if b.id == id then
+      local ok, res = pcall(require, b.module)
+      if ok and type(res) == "table" then
+        MODULES[id] = res
+        return res
+      end
+    end
+  end
+  return nil
+end
+workbench.builtinModule = builtinModule
+
 -- 视图实现表：id -> function(ctx) -> view。
 -- 这是**渲染实现**的唯一出口：main.lua 把它注给 core 包，core 的 view.mount 只做转交，
 -- 注册归属仍在 registry（registry 是唯一视图权威，见与 T1 的裁决）。
 workbench.renderers = {}
 for _, b in ipairs(BUILTIN_VIEWS) do
   workbench.renderers[b.id] = function(ctx)
-    local ok, mod = pcall(require, b.module)
-    if not ok or type(mod) ~= "table" then return nil end
+    local mod = builtinModule(b.id)
+    if not mod then return nil end
     if type(mod.mount) == "function" then return mod.mount(ctx) end
     if type(mod.new) == "function" then return mod.new(ctx) end
     return nil
@@ -182,9 +213,7 @@ function Workbench:_loadSpecs()
   end
   for _, b in ipairs(BUILTIN_VIEWS) do
     if not seen[b.id] then
-      local mod
-      local ok, res = pcall(require, b.module)
-      if ok then mod = res end
+      local mod = builtinModule(b.id)
       if mod then
         specs[#specs + 1] = {
           id = b.id, title = i18n.isZh() and b.zh or b.en,
