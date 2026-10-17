@@ -78,6 +78,22 @@ end
 -- 断连时给用户一条能直接复制的起桥命令（ui §5）
 workbench.BRIDGE_CMD = "cd bridge; node src/server.mjs"
 
+-- 壳自带的命令：不依赖任何能力包，Ctrl+K 里永远找得到。
+-- 第一条是**逃生口**：新 UI 出任何问题，用户一个命令就回到证明可用的旧终端面板。
+workbench.BUILTIN_COMMANDS = {
+  {
+    id = "ui.legacy_panel",
+    title = "使用旧面板 / legacy panel",
+    keys = "legacy",
+    hint = "关掉工作台，回到旧的终端面板",
+    run = function(ctx, arg)
+      local wb = ctx and ctx.workbench
+      if wb and type(wb.useLegacyPanel) == "function" then return wb:useLegacyPanel() end
+      return false
+    end,
+  },
+}
+
 local function nowDefault() return os.clock() end
 
 -- 只对纯 ASCII 改大小写。
@@ -791,16 +807,51 @@ end
 ----------------------------------------------------------------------
 
 function Workbench:commands()
-  local out = {}
+  local out, seen = {}, {}
   if self.registry and self.registry.list then
     local ok, list = pcall(function() return self.registry:list("command") end)
     if ok and type(list) == "table" then
       for _, c in ipairs(list) do
-        if c and c.id then out[#out + 1] = c end
+        if c and c.id and not seen[c.id] then
+          seen[c.id] = true
+          out[#out + 1] = c
+        end
       end
     end
   end
+  -- 壳自带的命令永远排在最后（registry 里有同名 id 时以 registry 为准）
+  for _, c in ipairs(workbench.BUILTIN_COMMANDS) do
+    if c and c.id and not seen[c.id] then
+      seen[c.id] = true
+      out[#out + 1] = c
+    end
+  end
   return out
+end
+
+-- 逃生口：关掉工作台，把 agent 的面板换回旧终端面板并打开它。
+-- 为什么还要换回来：main.lua 的 swapAgentPanel 已经把 agent.panel 换成了适配器，
+-- 适配器的 show() 又指回工作台 —— 不换回去的话 agent:open() 会把工作台再显示一次。
+function Workbench:useLegacyPanel()
+  local a = self.agent
+  self.legacyMode = true
+  if a and type(a.panel) == "table" and a.panel.wb == self and a.panel.fallback then
+    a.panel = a.panel.fallback
+  end
+  self:hide()
+  local opened = false
+  if a and type(a.open) == "function" then
+    local ok, err = pcall(a.open, a)
+    opened = ok
+    self.lastLegacyError = (not ok) and tostring(err) or nil
+  end
+  -- 回到旧面板后给它留一句话，用户知道自己为什么换了界面
+  local target = a and a.panel or nil
+  if target and type(target.log) == "function" then
+    pcall(target.log, target, i18n.isZh() and "已切到旧面板（工作台可用 Ctrl+K → legacy 再切回）"
+                                      or "switched to the legacy panel", "info")
+  end
+  return opened
 end
 
 function Workbench:paletteMatches()
@@ -1329,8 +1380,11 @@ function Workbench:mouse(kind, x, y)
         or h.kind == "new" and "railNew"
         or h.kind == "retry" and "retry"
     end
-    if tag ~= self.state.hover then
+    -- 视图内部的行也要有悬浮反馈：没有反馈用户就以为"点不了"（设置页/记忆页这类）
+    local rowIdx = h and h.index or nil
+    if tag ~= self.state.hover or rowIdx ~= self.state.hoverRow then
       self.state.hover = tag
+      self.state.hoverRow = rowIdx
       self:invalidate("titlebar")
       self:invalidate("rail")
       self:invalidate("main")
@@ -1462,14 +1516,20 @@ function Workbench:onEntryChange()
   local raw = tostring((self.dlg.data and self.dlg.data.input) or "")
   if raw == workbench.SENTINEL then return end           -- 只是移动光标
   if raw == "" then
+    -- 哨兵被删掉 = 用户按了退格
     local s = self.input or ""
     local i = utf8.offset(s, -1)
     self:setInput(i and s:sub(1, i - 1) or "")
+    -- **必须复位光标**：Entry::onSetText 只把 caret 往下 clamp 不挪到末尾（entry.cpp:506），
+    -- 退格后文本被清空 → caret 停在 0 → 下一次退格前面没有字符 → onchange 不触发
+    -- → self.input 再也不删。真机表现就是"打了字删不掉"。
+    self:_resetEntry(true)
   else
     local inserted = raw:gsub(workbench.SENTINEL, "", 1) -- 只吃一个哨兵（用户输入的空格要留住）
     if inserted ~= "" then self:setInput((self.input or "") .. inserted) end
+    -- 追加时 caret 已在末尾（打字是往后插），不需要那圈焦点舞；省掉能少一次重新布局
+    self:_resetEntry(false)
   end
-  self:_resetEntry()
   self:invalidate("composer")
 end
 
@@ -1547,15 +1607,23 @@ end
 -- 把 Entry 恢复成"只有一个哨兵"，并可选把光标送回末尾
 function Workbench:_resetEntry(restoreCaret)
   if not self.dlg then return end
+  -- entrySyncing 挡住复位本身触发的 onchange（它不该再跑一遍插入/退格逻辑）
   self.entrySyncing = true
-  pcall(function()
-    self.dlg:modify{ id = "input", text = workbench.SENTINEL }
-    if restoreCaret then
-      self.dlg:modify{ id = "send", focus = true }
-      self.dlg:modify{ id = "input", focus = true }
-    end
+  -- 复位是 1~3 次 modify，而 modify 会触发重新布局、可能把窗口撑回自然尺寸 ——
+  -- 每敲一键都跳一次窗口，所以整段必须包在 _preserveBounds 里。
+  local ok, err = pcall(function()
+    self:_preserveBounds(function()
+      self.dlg:modify{ id = "input", text = workbench.SENTINEL }
+      if restoreCaret then
+        -- 送光标到末尾的唯一 Lua 途径是让焦点绕一圈：先给 send 再给 input，
+        -- 触发 kFocusEnterMessage → selectAllText → setCaretPos(末尾)（entry.cpp:283-295）。
+        self.dlg:modify{ id = "send", focus = true }
+        self.dlg:modify{ id = "input", focus = true }
+      end
+    end)
   end)
   self.entrySyncing = false
+  if not ok then self.lastEntryError = tostring(err) end
 end
 
 ----------------------------------------------------------------------

@@ -56,6 +56,7 @@ function View:render(kit, r, state)
   for i = 1, 6 do
     local row = rows[i]
     local fr = { x = x, y = y, w = innerW, h = m.rowH }
+    if state.hoverRow == i then kit:fill(fr, "surface2") end
     kit:field(fr, row.label, row.value)
     self.hits[#self.hits + 1] = { rect = fr, kind = "field", index = i }
     y = y + m.rowH
@@ -68,11 +69,33 @@ function View:render(kit, r, state)
   for i = 7, #rows do
     local row = rows[i]
     local fr = { x = x, y = y, w = innerW, h = m.rowH }
+    if state.hoverRow == i then kit:fill(fr, "surface2") end
     kit:field(fr, row.label, row.value)
     self.hits[#self.hits + 1] = { rect = fr, kind = "field", index = i }
     y = y + m.rowH
   end
+
+  -- 末尾一行提示：告诉用户点任意一项会发生什么（骨架页也得说清楚）
+  y = y + m.gap
+  kit:text({ x = x, y = y }, kit:pick("点任意一项打开原生设置窗（端点/密钥/模型/温度/超时/语言）",
+                                     "click any row to open the native settings dialog"),
+           { tone = "faint" })
   return self
+end
+
+-- 设置页不自己造表单控件：点行 → 走 agent 打开**原生设置窗**（旧面板那套还在），
+-- API Key / 模型 / 语言 / 超时立刻全部可用，比在 canvas 上重画一套控件省得多也稳得多。
+function View:click(hit)
+  if not hit then return false end
+  if hit.kind == "field" then
+    local a = self.ctx and self.ctx.agent
+    if a and type(a.action) == "function" then
+      local ok = pcall(a.action, a, "settings")
+      return ok
+    end
+    return false
+  end
+  return false
 end
 
 function View:hitAt(x, y)

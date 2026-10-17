@@ -218,6 +218,15 @@ end
 print("== 5b. 真机约束：init() 之后 require 就没了（STATUS 约束 7）==")
 ok(true, "本测试在挂载阶段摘掉了全局 require，模拟真机（见下方 require = nil）")
 
+print("== 5c. 真链路下逃生口必须在（用户永远有一条退路）==")
+do
+  local found = nil
+  for _, c in ipairs(wb:commands()) do if c.id == "ui.legacy_panel" then found = c end end
+  ok(found ~= nil, "真链路里命令面板仍有 ui.legacy_panel")
+  ok(found ~= nil and type(found.run) == "function", "它有可执行的 run")
+  ok(type(wb.useLegacyPanel) == "function", "工作台提供了 useLegacyPanel 入口")
+end
+
 print("== 6. 真链路下 agent 的日志进得了会话视图（panel_adapter 已接上）==")
 do
   -- main.lua 的 swapAgentPanel 会把 agent.panel 换成适配器；这里从命令回调拿不到 agent，

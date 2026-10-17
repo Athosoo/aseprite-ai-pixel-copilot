@@ -370,5 +370,85 @@ do
   eq(w4:getInput(), "", "输入行已展开时 canvas 不再重复收集字符（避免双份）")
 end
 
+print("== 11. 逃生口：命令面板里有一条「使用旧面板」 ==")
+do
+  local oldPanel = { log = function() end, show = function() end }
+  local openCalls = 0
+  local agentStub = { panel = oldPanel, docName = function() return "001.ase" end }
+  function agentStub:open() openCalls = openCalls + 1; self.panel:show() end
+  function agentStub:send() return true end
+
+  local w = workbench.new({ width = 900, height = 620 })
+  w:mount(nil, agentStub)
+  w:setSize(900, 620)
+  -- 模拟 main.lua 的 swapAgentPanel：agent.panel 变成适配器，适配器记着自己包的是谁
+  local ad = { wb = w, fallback = oldPanel, log = function() end }
+  agentStub.panel = ad
+  -- 极简假 Dialog（第 10 节那个 fakeDialog 是块内 local，这里够用就行）
+  local dlg = { data = {}, widgets = {} }
+  function dlg:canvas(s) self.widgets.screen = s end
+  function dlg:entry(s) self.widgets.input = s end
+  function dlg:button(s) self.widgets[s.id] = s end
+  function dlg:newrow() end
+  function dlg:samerow() end
+  function dlg:show() end
+  function dlg:close() end
+  function dlg:repaint() end
+  function dlg:modify() end
+  w:build(dlg)
+  w.shown = true
+
+  local found = nil
+  for _, c in ipairs(w:commands()) do if c.id == "ui.legacy_panel" then found = c end end
+  ok(found ~= nil, "命令列表内置了 ui.legacy_panel（不依赖任何能力包）")
+  ok(found ~= nil and tostring(found.title):find("legacy", 1, true) ~= nil, "标题里带 legacy，Ctrl+K 搜得到")
+
+  local okRun = w:runCommand(found, "")
+  ok(okRun, "命令执行成功")
+  eq(openCalls, 1, "agent:open() 被调用了一次（旧面板被打开）")
+  ok(agentStub.panel == oldPanel, "agent.panel 已换回旧面板（否则 open 又会把工作台显示回来）")
+  eq(w.shown, false, "工作台已隐藏")
+  eq(w.legacyMode, true, "记下了 legacyMode")
+end
+
+print("== 12. 设置页：点任意一项 → 打开原生设置窗 ==")
+do
+  local actions = {}
+  local a = { docName = function() return "001.ase" end,
+              action = function(self, name) actions[#actions + 1] = name; return true end }
+  local w = workbench.new({ width = 900, height = 620, viewId = "settings" })
+  w:mount(nil, a)
+  w:setSize(900, 620)
+  w:paint(fakeGC(900, 620))
+
+  local v = w:currentView()
+  local fieldHit = nil
+  for _, hit in ipairs(v.hits or {}) do if hit.kind == "field" then fieldHit = hit end end
+  ok(fieldHit ~= nil, "设置页登记了行命中区")
+
+  if fieldHit then
+    local hh = w:handlers()
+    local x = fieldHit.rect.x + 20
+    local y = fieldHit.rect.y + 5
+
+    -- 悬浮要有反馈（不然用户以为点不了）
+    local gcHover = fakeGC(900, 620)
+    w:invalidate()
+    hh.onmousemove({ x = x, y = y })
+    w:paint(gcHover)
+    local hovered = false
+    for _, c in ipairs(w.kit.calls) do
+      if c.region == "main" and c.op == "fill" and c.tone == "surface2"
+         and c.x == fieldHit.rect.x and c.y == fieldHit.rect.y then hovered = true end
+    end
+    ok(hovered, "悬浮到设置行时有高亮反馈")
+
+    hh.onmousedown({ x = x, y = y, button = LEFT })
+    hh.onmouseup({ x = x, y = y, button = LEFT })
+    eq(actions[1], "settings", "点行调用了 agent:action('settings')（打开原生设置窗）")
+    ok(w.lastInputError == nil, "设置页点击不抛错", w.lastInputError)
+  end
+end
+
 print("")
 print(string.format("%d passed, %d failed", pass, fail))

@@ -1,0 +1,16 @@
+fix(ui): backspace, clickable settings, legacy-panel escape hatch
+
+backspace: _resetEntry() was called without restoreCaret, so the caret sat before
+the sentinel space and Backspace produced no change event. The removal branch now
+passes true and the whole reset is wrapped in _preserveBounds.
+
+settings: rows get hover highlight and a click opens the native settings dialog
+through agent:action("settings"), so API key / model / language / timeouts work
+immediately without redrawing a form on canvas.
+
+escape hatch: BUILTIN_COMMANDS ui.legacy_panel swaps agent.panel back to the old
+panel, hides the workbench and opens the terminal UI. One Ctrl+K command, always
+available, so the user is never stranded on the new UI.
+
+Tests: click 59->70, wiring 31->34, entry_input 19 new.
+Lua 1764/0, bridge 636/3.
