@@ -1099,6 +1099,10 @@ function Agent:onMessage(msg)
     -- 带 %d 的还配一份 i18nArgs，格式化成中文也一样把数字填回去
     self.panel:log(i18n.render(msg.i18n, msg.i18nArgs, msg.text or ""), msg.kind or "ai")
 
+  elseif t == "thinking" then
+    -- 模型的思考是独立帧：用弱化色（think→dim）显示，既不混进正文、也不再被丢掉
+    self.panel:log(msg.text or "", "think")
+
   elseif t == "clear" then
     self.panel:clear()
 

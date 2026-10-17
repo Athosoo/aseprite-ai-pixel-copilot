@@ -1,9 +1,9 @@
 {
-    "when":  "2026-10-17T22:46:08",
-    "luaPass":  1970,
+    "when":  "2026-10-17T22:49:48",
+    "luaPass":  1991,
     "luaFail":  0,
-    "bridgePass":  484,
-    "bridgeFail":  1,
+    "bridgePass":  636,
+    "bridgeFail":  3,
     "lua":  [
                 {
                     "suite":  "tests\\lua\\ops_test.lua",
@@ -19,7 +19,7 @@
                 },
                 {
                     "suite":  "tests\\lua\\workspace_test.lua",
-                    "pass":  481,
+                    "pass":  495,
                     "fail":  0,
                     "note":  ""
                 },
@@ -124,14 +124,20 @@
                     "pass":  33,
                     "fail":  0,
                     "note":  ""
+                },
+                {
+                    "suite":  "tests\\lua\\thinking_frame_test.lua",
+                    "pass":  7,
+                    "fail":  0,
+                    "note":  ""
                 }
             ],
     "bridge":  [
                    {
                        "suite":  "test/selftest.mjs",
-                       "pass":  0,
-                       "fail":  1,
-                       "note":  "exit1"
+                       "pass":  152,
+                       "fail":  3,
+                       "note":  ""
                    },
                    {
                        "suite":  "test/memory_test.mjs",
