@@ -8,7 +8,8 @@
     "start": "node src/server.mjs",
     "selftest": "node test/selftest.mjs",
     "build:pp": "node scripts/build-pp.mjs",
-    "test": "node test/selftest.mjs && node test/memory_test.mjs && node test/styles_test.mjs && node test/tools_test.mjs && node test/history_test.mjs && node test/conversations_test.mjs && node test/gaps_test.mjs"
+    "test": "node test/selftest.mjs && node test/memory_test.mjs && node test/styles_test.mjs && node test/tools_test.mjs && node test/registry_test.mjs && node test/packs_test.mjs && node test/evolution_test.mjs && node test/history_test.mjs && node test/conversations_test.mjs && node test/gaps_test.mjs",
+    "bench": "node ../tests/bench/local-tool-latency.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"

@@ -1,0 +1,35 @@
+{
+  "id": "builtin-evolution",
+  "name": "自扩展闭环",
+  "version": "1.0.0",
+  "api": 1,
+  "permissions": [
+    "io",
+    "os"
+  ],
+  "views": [],
+  "commands": [],
+  "ops": [
+    {
+      "name": "list_capabilities"
+    },
+    {
+      "name": "propose_pack"
+    },
+    {
+      "name": "verify_pack"
+    },
+    {
+      "name": "activate_pack"
+    },
+    {
+      "name": "rollback_pack"
+    },
+    {
+      "name": "pack_health"
+    }
+  ],
+  "requires": [
+    "core"
+  ]
+}

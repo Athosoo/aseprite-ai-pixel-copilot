@@ -1,0 +1,23 @@
+{
+  "id": "builtin-assist",
+  "name": "对话与自省",
+  "version": "1.0.0",
+  "api": 1,
+  "permissions": [],
+  "views": [],
+  "commands": [],
+  "ops": [
+    {
+      "name": "ask_user"
+    },
+    {
+      "name": "log_gap"
+    },
+    {
+      "name": "capabilities"
+    }
+  ],
+  "requires": [
+    "core"
+  ]
+}

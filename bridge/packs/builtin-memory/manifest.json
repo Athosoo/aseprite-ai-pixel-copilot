@@ -1,0 +1,29 @@
+{
+  "id": "builtin-memory",
+  "name": "记忆与色库",
+  "version": "1.0.0",
+  "api": 1,
+  "permissions": [],
+  "views": [],
+  "commands": [],
+  "ops": [
+    {
+      "name": "remember"
+    },
+    {
+      "name": "recall"
+    },
+    {
+      "name": "forget"
+    },
+    {
+      "name": "remember_color"
+    },
+    {
+      "name": "search_colors"
+    }
+  ],
+  "requires": [
+    "core"
+  ]
+}

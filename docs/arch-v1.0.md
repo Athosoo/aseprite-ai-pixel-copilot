@@ -12,7 +12,7 @@ v0.5.x 的能力是真的，但结构是**长出来的**，不是**设计出来�
 
 | 症状 | 证据 | 后果 |
 |---|---|---|
-| 算子名单硬编码两处 | `ops.lua` 的 OPS 表 8 项、`tools.mjs` 的 enum 8 项 | STATUS.md 自证：模型"连能锐化这件事都看不见"，只能回"做不到" |
+| 算子名单硬编码两处 | `ops.lua` 的 OPS 表 10 项、`tools.mjs` 的 enum 10 项 | STATUS.md 自证：模型"连能锐化这件事都看不见"，只能回"做不到" |
 | 工具箱是一个静态数组 | `tools.mjs` 的 `TOOLS = [...]` + 单 `makeDispatcher` | 加一个工具要改桥源码、重新打包、重启 |
 | 视图是手绘的一整块 | `panel.lua` 1700 行单体 | 换布局=重写；加一屏=在一千七百行里找位置 |
 | 缺陷只记不修 | `gaps.md` 有账本，无闭环 | 同一个坑会再踩一次 |
@@ -123,6 +123,10 @@ kit:theme()                    -> theme
 `kit` **不做布局决策**（没有 flex）；布局归视图。这样样式可测：给定 rect 集合与状态，
 输出绘制调用序列 —— 单测断言调用序列即可。
 
+> **视图权威规则（与 UI 文档共同遵守）**：`registry` 是唯一的视图权威。workbench 必须在渲染时
+> 先查 `registry:get("view", id)`，查不到才回落到自己的 `BUILTIN_VIEWS`。两处都注册同一个 id 时，
+> registry 胜。这样能力包既能新增视图，也能覆盖内置视图，而 workbench 永远不需要认识具体视图。
+
 ### 3.5 `kernel/dsl.lua`
 ```lua
 Dsl.load(src, name, perms)     -> fn | nil, err
@@ -132,6 +136,10 @@ Dsl.env(perms)                 -> env        -- 白名单：io / os / net（debu
 `Dsl.load` = `load(src, "@"..name, "t", env)`。已验证：Aseprite 1.3.18.6-dev 的 Lua 5.4
 支持该调用且 env 隔离生效（`tests/lua/_kernel_probe.lua`）。
 无 `perms` 时 `io/os/net` 全部不可见；**沙箱抛错一律转成 `nil, err`，绝不冒泡到 UI**。
+
+**必须有超时护栏**：`Dsl.runBounded(fn, ms, ...)` 用 `debug.sethook` 限步数执行，超时返回
+`nil, "sandbox timeout after N ms"`。理由很硬：v1.0 允许模型写能力包，一个死循环包会卡死
+Aseprite 的 UI 线程 —— 没有这条护栏，自扩展能力就等于自毁能力。`debug` 只给宿主，永不进沙箱 env。
 
 ### 3.6 `kernel/ledger.lua`
 ```lua
@@ -150,7 +158,7 @@ l:journal(event)               -- 追加 JSONL，环形上限 2000 行
 ```
 packs/<id>/
   manifest.json     # 必填，声明式，模型唯一必须写对的文件
-  main.lua          # 必填：return function(ctx) end，ctx = {registry, host, kit, dsl, log}
+  main.lua          # 必填：return function(ctx) end，ctx = {registry, host, kit, dsl, log, shared}
   tests.lua         # 建议：return { {name=..., run=function(t) end} }
   bridge/
     tools.mjs       # 可选：export default { tools: [ {name,description,inputSchema,run} ] }
@@ -171,6 +179,9 @@ packs/<id>/
   "requires": ["core"]
 }
 ```
+`ctx.shared` 是 main.lua 注入的宿主对象（例如 `{ ops = lib.ops }`）—— 能力包跑在沙箱里，
+没有 `require` / `package`，要复用现有实现只能从 shared 取。追加注入项不算破坏冻结形状。
+
 约束：
 - `api` 必须等于内核支持的版本（当前 `1`），不等则**拒装并给出可读理由**。
 - `permissions` 是闭集 `["io","os"]`；声明 `io` 才能读写工作区。
@@ -254,7 +265,7 @@ journal/gaps  ──▶  propose_pack(files)  ──▶  verify_pack  ──▶ 
 |---|---|
 | `bridge/config.json` | 原键全读；新增键一律有默认值 |
 | `bridge/data/*`（conversations/styles/memory/gaps/colors） | 格式不变，直接读 |
-| 8 个算子 | 全部保留，签名不变；sharpen / contrast 平移入 builtin 包 |
+| 10 个算子 | 全部保留，签名不变；sharpen / contrast 已由 v0.5.9 提供，一并平移入 builtin 包 |
 | 快捷键 Ctrl+Shift+A / +M / +P | 不变；keys.aseprite-keys 不改 |
 | main.lua 的 6 个命令 id | 全部保留（菜单仍只挂 1 条） |
 | 旧 WS 帧 | 一个不改，只增新 type |

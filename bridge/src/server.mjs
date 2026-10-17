@@ -14,7 +14,8 @@ import { dirname, join } from 'node:path';
 import { ColorBank } from './colorbank.mjs';
 import { Memory } from './memory.mjs';
 import { Styles } from './styles.mjs';
-import { TOOLS, makeDispatcher } from './tools.mjs';
+import { MODEL_TOOLS, makeDispatcher, registry, evolution, journal, PACK_DIRS } from './tools.mjs';
+import { loadPacks } from './packs.mjs';
 import { runTurn, chatCompletion } from './llm.mjs';
 import { clampBudget } from './history.mjs';
 import { ConversationStore } from './conversations.mjs';
@@ -315,6 +316,9 @@ class Session {
 
     // 轮级中断（P3）：面板「停止」/ Esc 发 {type:'abort'}，超时也走同一个控制器。
     // 单次 HTTP 超时（chatCompletion 内部）< 整轮超时（这里），层级不同。
+    // 每轮重新给 3 次 propose 预算（arch §6 预算护栏是「单轮会话」粒度）
+    evolution.resetTurn();
+
     const ac = new AbortController();
     this.turnAbort = ac;
     this.turnProcessed = new Set();
@@ -364,7 +368,7 @@ class Session {
         history: history.messages,          // runTurn 会就地追加（同一个数组引用）
         userText: text,
         context,
-        tools: TOOLS,
+        tools: MODEL_TOOLS,
         dispatch,
         abortSignal: ac.signal,
         onSay: (kind, t, key) => this.say(kind, t, key),
@@ -450,7 +454,7 @@ class Session {
     this.status('ready', 'ok');
   }
 
-  onText(msg) {
+  async onText(msg) {
     switch (msg.type) {
       case 'hello': {
         this.info = msg;
@@ -691,6 +695,57 @@ class Session {
           ? { cancelled: true }
           : { ok: true, choice: msg.choice, index: msg.index });
         break;
+      // ---- 能力清单 / 自扩展（arch §5.4：旧 type 一个不动，这里只加新的）----
+      case 'cap.list': {
+        // 能力清单不进常驻 prompt（D5），模型/面板按 query 来查
+        const q = String(msg.query || '').trim().toLowerCase();
+        const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? Math.min(msg.limit, 200) : 60;
+        const all = registry.list().filter((s) => s.expose !== false).map((s) => ({
+          name: s.name,
+          pack: s.pack,
+          evolved: !!s.meta?.evolved,
+          description: String(s.description || '').split(/(?<=[.。])\s/)[0],
+        }));
+        const caps = q ? all.filter((c) => (c.name + ' ' + c.pack + ' ' + c.description).toLowerCase().includes(q)) : all;
+        this.send({ type: 'cap.result', id: msg.id, ok: true, query: q, total: all.length, caps: caps.slice(0, limit) });
+        break;
+      }
+
+      // packId 是包 id（msg.id 是请求关联号，两者不能混用）
+      case 'pack.propose': {
+        const rep = evolution.propose({ id: String(msg.packId || ''), files: msg.files, rationale: msg.rationale });
+        // id 一定要放最后：rep 里的 pack id 会覆盖关联号（踩过一次）
+        this.send({ type: 'pack.propose_result', ok: !rep.error, ...rep, id: msg.id });
+        break;
+      }
+
+      case 'pack.verify': {
+        const rep = await evolution.verify({ staged: String(msg.staged || '') });
+        this.send({ type: 'pack.verify_result', ...rep, id: msg.id });
+        break;
+      }
+
+      case 'pack.activate': {
+        const rep = await evolution.activate({ staged: String(msg.staged || '') });
+        this.send({ type: 'pack.activate_result', ok: !rep.error, packId: rep.id, ...rep, id: msg.id });
+        break;
+      }
+
+      case 'pack.rollback': {
+        const rep = await evolution.rollback({ id: String(msg.packId || '') });
+        this.send({ type: 'pack.rollback_result', packId: msg.packId, ...rep, id: msg.id });
+        break;
+      }
+
+      case 'view.invalidate': {
+        // 双向帧：Lua 侧报脏，桥广播给其它在线端；桥自己发的时候带 view 名
+        for (const s of sessions) {
+          if (s === this) continue;
+          s.send({ type: 'view.invalidate', view: msg.view, rect: msg.rect });
+        }
+        break;
+      }
+
       default:
         console.log('[bridge] unhandled message', msg.type);
     }
@@ -727,6 +782,22 @@ const httpServer = createServer((req, res) => {
 const wss = new WebSocketServer({ server: httpServer });
 const sessions = new Set();
 
+// ---------------------------------------------------------------- 能力包
+// 用户包（模型写的那一层）启动时装一次；之后每次 activate/rollback 由 evolution
+// 自己重载 —— 不重启桥就能换实现，这是「模型能修改自己」的前提。
+const bootPacks = await loadPacks({ dirs: [PACK_DIRS.user], registry, journal: journal.log });
+if (bootPacks.loaded.length) console.log('[bridge] packs loaded: ' + bootPacks.loaded.map((p) => p.id).join(', '));
+for (const e of bootPacks.errors) console.log('[bridge] pack failed: ' + e.id + ' -- ' + e.err);
+
+// pack.changed 推给每个在线面板：Lua 侧收到就热装载，UI 的「扩展」页据此标红/标绿。
+// 顺带发一条 view.invalidate，让面板只重画「扩展」那一块（arch §6 脏区重绘）。
+evolution.setChangedHandler(({ id, action }) => {
+  for (const s of sessions) {
+    s.send({ type: 'pack.changed', id, action });
+    s.send({ type: 'view.invalidate', view: 'packs' });
+  }
+});
+
 wss.on('connection', (ws) => {
   const session = new Session(ws);
   sessions.add(session);
@@ -745,7 +816,7 @@ wss.on('connection', (ws) => {
       console.log('[bridge] unparseable text frame');
       return;
     }
-    session.onText(msg);
+    session.onText(msg).catch((e) => console.log('[bridge] handler error:', e?.message || e));
   });
 
   ws.on('close', () => {

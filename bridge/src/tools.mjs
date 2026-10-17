@@ -1,12 +1,36 @@
-// Tool registry: the capabilities exposed to the LLM.
-//
-// Key design: the model NEVER emits pixels, only structured ops which
-// deterministic Lua code executes. Image-wide work goes through Perfect
-// Pixel Studio's core algorithm instead of asking the model to guess.
+// 工具注册表 —— 模型能看见、能调用的能力全部来自 registry，这个文件只剩三件事：
+// 聚合内置包、把注册项翻成 OpenAI function 描述、派发。
+// 判据（arch §1）：新增一项能力要不要改这里？不要，才算分层对了。
 
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { perfectPixel } from './perfectpixel.mjs';
 import { isAsciiName } from './styles.mjs';
 import { looksLikeCapabilityGap } from './gaps.mjs';
+import { createJournal } from './journal.mjs';
+import { createRegistry } from './registry.mjs';
+import { createEvolution } from './evolution.mjs';
+
+import canvasPack from '../packs/builtin-canvas/bridge/tools.mjs';
+import stylePack from '../packs/builtin-style/bridge/tools.mjs';
+import assistPack from '../packs/builtin-assist/bridge/tools.mjs';
+import workspacePack from '../packs/builtin-workspace/bridge/tools.mjs';
+import drawPack from '../packs/builtin-draw/bridge/tools.mjs';
+import pixelPack from '../packs/builtin-pixel/bridge/tools.mjs';
+import versionsPack from '../packs/builtin-versions/bridge/tools.mjs';
+import memoryPack from '../packs/builtin-memory/bridge/tools.mjs';
+import evolutionPack from '../packs/builtin-evolution/bridge/tools.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PACKS_ROOT = join(HERE, '..', 'packs');
+
+export const PACK_DIRS = {
+  root: PACKS_ROOT,
+  user: join(PACKS_ROOT, 'user'),
+  staging: join(PACKS_ROOT, '.staging'),
+  snapshots: join(PACKS_ROOT, '.snapshots'),
+  journal: join(PACKS_ROOT, '.journal.jsonl'),
+};
 
 // RGBA 里有多少种不同的颜色（忽略全透明像素）。
 // 给 perfect_pixel 当诊断数据：像素画通常几十色以内，照片则成千上万。
@@ -21,567 +45,49 @@ function countDistinctColors(rgba, cap = 4096) {
   return seen.size;
 }
 
-const REGION_SCHEMA = {
-  type: 'object',
-  description: 'Rectangular region in pixel coordinates (origin at top-left). Omit = whole canvas.',
-  properties: {
-    x: { type: 'integer' },
-    y: { type: 'integer' },
-    w: { type: 'integer' },
-    h: { type: 'integer' },
-  },
-};
-
-export const TOOLS = [
-  {
-    type: 'function',
-    function: {
-      name: 'canvas_info',
-      description: 'Re-read the current Aseprite canvas state (size, layers, selection, colour usage, snapshot count). Call it when unsure about the current state.',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'apply_ops',
-      description:
-        'Run a list of canvas ops. By default they apply to the ACTIVE LAYER only; pass layers:"all" to hit every ' +
-        'layer of the current frame, or layers:["base","detail"] to pick specific ones. ' +
-        'Image-wide requests (more contrast, sharpen, reduce the colours, swap a colour everywhere) almost always ' +
-        'want layers:"all" on a multi-layer sprite -- an active-layer-only edit looks like "nothing happened" to the ' +
-        'user, because the pixels they are looking at live on another layer. ' +
-        'One transaction = one undo step for the whole batch, across all layers. ' +
-        'The report gives changed pixels per op (and per layer when several were hit); if 0 pixels changed you also ' +
-        'get a hint listing the layers that DO have content -- retarget with it instead of guessing. ' +
-        'Ops: ' +
-        'replace_color(from,to,tolerance) swaps one colour for another; ' +
-        'erase_color(color) makes a colour transparent; ' +
-        'erase_region(region) clears a rectangle; ' +
-        'fill_region(region,color) fills a rectangle; ' +
-        'outline(color) draws a 1px outline around opaque pixels; ' +
-        'despeckle(maxCluster) deletes isolated blobs; ' +
-        'palette_map(map) remaps colours and updates the palette; ' +
-        'quantize(colors,updatePalette) reduces the image to at most N colours by median cut — ' +
-        'use this whenever the user says the palette is too messy / too many colours / reduce to 32 or 64 colours / simplify, ' +
-        'i.e. you do NOT need an explicit map for that; ' +
-        'sharpen(amount,threshold) crisps up edges with a 3x3 unsharp mask (amount 1 = standard, 2+ = aggressive); ' +
-        'contrast(amount,pivot) pushes every channel away from the mid tone, so darks get darker and lights lighter ' +
-        '(amount 1.3 = +30%, 1 = unchanged). ' +
-        'sharpen and contrast are the right answer for "sharpen the edges / make it crisper / more contrast / ' +
-        'darker shadows and brighter highlights / it looks flat" — they are per-pixel, alpha is never touched.',
-      parameters: {
-        type: 'object',
-        properties: {
-          label: {
-            type: 'string',
-            description: 'Short description of this edit; becomes the undo step name, e.g. "background to blue"',
-          },
-          layer: {
-            type: 'string',
-            description: 'Optional: name of ONE layer to apply to (default: the active layer)',
-          },
-          layers: {
-            type: 'array',
-            items: { type: 'string' },
-            description:
-              'Optional: which layers to apply to. ["all"] = every layer of the current frame; ' +
-              'otherwise a list of layer names (e.g. ["base","highlight"]). ' +
-              'Use "all" for any image-wide effect. Takes precedence over layer.',
-          },
-          ops: {
-            type: 'array',
-            description: 'Ops to run in order',
-            items: {
-              type: 'object',
-              properties: {
-                op: {
-                  type: 'string',
-                  enum: [
-                    'replace_color',
-                    'erase_color',
-                    'erase_region',
-                    'fill_region',
-                    'outline',
-                    'despeckle',
-                    'palette_map',
-                    'quantize',
-                    'sharpen',
-                    'contrast',
-                  ],
-                },
-                from: { type: 'string', description: 'replace_color: source colour #RRGGBB' },
-                to: { type: 'string', description: 'replace_color: target colour #RRGGBB (8 digits also sets alpha)' },
-                color: { type: 'string', description: 'erase_color / fill_region / outline: colour #RRGGBB' },
-                region: REGION_SCHEMA,
-                tolerance: { type: 'integer', description: 'per-channel RGB tolerance, default 0 (exact match)' },
-                maxCluster: { type: 'integer', description: 'despeckle: blob size to remove, default 1' },
-                colors: {
-                  type: 'integer',
-                  description: 'quantize: target number of colours (2-256), e.g. 64 to merge a messy palette down to 64 colours',
-                },
-                map: {
-                  type: 'object',
-                  description: 'palette_map: { "#old": "#new" } colour map',
-                  additionalProperties: { type: 'string' },
-                },
-                updatePalette: {
-                  type: 'boolean',
-                  description: 'palette_map: also update palette entries, default true',
-                },
-                amount: {
-                  type: 'number',
-                  description:
-                    'sharpen: edge strength, default 1 (2-3 is aggressive, use it only if the user asks for "much sharper"); ' +
-                    'contrast: contrast multiplier, default 1.3 (1 = unchanged, 0.5 = flatter, 2 = very strong)',
-                },
-                threshold: {
-                  type: 'integer',
-                  description:
-                    'sharpen: leave pixels alone when their local difference is within this (0-255), default 0. ' +
-                    'Raise to 8-24 to keep flat areas and dither noise untouched.',
-                },
-                pivot: {
-                  type: 'integer',
-                  description: 'contrast: the mid tone to expand around, default 128 (0-255). Lower it to keep highlights, raise it to keep shadows.',
-                },
-              },
-              required: ['op'],
-            },
-          },
-        },
-        required: ['label', 'ops'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'crop',
-      description:
-        'Crop the canvas down to a rectangular region. Pixels are kept EXACTLY as they are (no resampling). ' +
-        'Use it to remove empty margins or cut out part of the image. ' +
-        'Rule of thumb: if the user says "shrink to NxN" and canvas_info shows a lot of padding around the content, ' +
-        'they usually mean crop, not scale. The region must lie inside the current canvas.',
-      parameters: {
-        type: 'object',
-        properties: {
-          x: { type: 'integer', description: 'left edge, 0-based' },
-          y: { type: 'integer', description: 'top edge, 0-based' },
-          w: { type: 'integer', description: 'width in pixels' },
-          h: { type: 'integer', description: 'height in pixels' },
-          label: { type: 'string', description: 'short description; becomes the undo step name' },
-        },
-        required: ['x', 'y', 'w', 'h'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'scale',
-      description:
-        'Resize the WHOLE image — canvas and artwork together — by resampling. ' +
-        'Use it when the user wants the same picture at a different size (e.g. "make this 64x64 into 32x32"). ' +
-        'Shrinking loses fine detail, so for pixel art keep method=nearest. ' +
-        'If the goal is really to trim empty margins, use crop instead — that keeps pixels untouched.',
-      parameters: {
-        type: 'object',
-        properties: {
-          width: { type: 'integer' },
-          height: { type: 'integer' },
-          method: {
-            type: 'string',
-            enum: ['nearest', 'bilinear'],
-            description: 'default nearest (keeps pixel art crisp); bilinear smooths, rarely what pixel artists want',
-          },
-          label: { type: 'string' },
-        },
-        required: ['width', 'height'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'canvas_size',
-      description:
-        'Change the canvas size WITHOUT scaling the artwork — content keeps its original pixel size and is placed by anchor. ' +
-        'Use when the user wants more room around the art or less, e.g. "add a 4px border" or "make the canvas 32x32 but keep the sprite as is".',
-      parameters: {
-        type: 'object',
-        properties: {
-          width: { type: 'integer' },
-          height: { type: 'integer' },
-          anchor: {
-            type: 'string',
-            enum: ['center', 'top-left', 'top-right', 'bottom-left', 'bottom-right'],
-            description: 'where the existing content sits inside the new canvas; default center',
-          },
-          label: { type: 'string' },
-        },
-        required: ['width', 'height'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'style_list',
-      description: 'List the available art styles (palette + layer structure + drawing rules). Call this before guessing what style the user means.',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'style_use',
-      description:
-        'Switch to an art style. From then on its palette, layer structure and rules are part of your instructions, ' +
-        'and you should follow them for anything you draw. Pass an empty name to clear the style. ' +
-        'Call style_list first if you are not sure of the exact name.',
-      parameters: {
-        type: 'object',
-        properties: { name: { type: 'string', description: 'style name; empty string clears it' } },
-        required: ['name'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'style_save',
-      description:
-        'Save a reusable art style. Use when the user describes a style they want to keep, or after you have settled on a palette and rules together.',
-      parameters: {
-        type: 'object',
-        properties: {
-          name: { type: 'string', description: 'short id, letters/digits/hyphen/CJK' },
-          label: { type: 'string', description: 'human-readable name' },
-          size: { type: 'array', items: { type: 'integer' }, description: '[width, height] the style is drawn at' },
-          palette: { type: 'array', items: { type: 'string' }, description: 'colours as #RRGGBB' },
-          layers: { type: 'array', items: { type: 'string' }, description: 'layer names, bottom to top' },
-          rules: { type: 'array', items: { type: 'string' }, description: 'short drawing rules, one per entry' },
-          notes: { type: 'string' },
-        },
-        required: ['name'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'ask_user',
-      description:
-        'Ask the user to pick one of a few options. The panel turns this into clickable buttons, so it is ' +
-        'much better than asking in prose when you genuinely need the user to decide something ' +
-        '(overwrite the original or keep the copy, which of two looks, which file, which size). ' +
-        'Do NOT use it for small talk or for things you can figure out yourself. ' +
-        'Returns the chosen option text, or { cancelled: true } if the user dismissed it.',
-      parameters: {
-        type: 'object',
-        properties: {
-          question: { type: 'string', description: 'One short question, in the user\'s language' },
-          options: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '2 to 4 options, each under 30 characters, in the user\'s language',
-          },
-        },
-        required: ['question', 'options'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'log_gap',
-      description:
-        'Record a request you could NOT fulfil, into the project backlog file the developer reads. ' +
-        'Call this EVERY time the user asks for something your tools cannot do (after you have checked ' +
-        'capabilities), or when you had to refuse/limit a request. Say what they asked for and why it is ' +
-        'not possible right now. Then still answer the user honestly -- logging is not a substitute for it.',
-      parameters: {
-        type: 'object',
-        properties: {
-          request: { type: 'string', description: "what the user asked for, in their words (short)" },
-          why: { type: 'string', description: 'why it cannot be done with the current tools' },
-          workaround: { type: 'string', description: 'what you offered instead, if anything' },
-        },
-        required: ['request', 'why'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'capabilities',
-      description:
-        'Read your own capability list: which tools you actually have, and what you explicitly cannot do. ' +
-        'Call it before answering "can you do X?" style questions, and whenever the user asks what you are ' +
-        'able to do. Never promise anything that is not in this list.',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'open_document',
-      description:
-        'Open an image or Aseprite document in Aseprite, by path. Relative paths resolve against the ' +
-        'workspace root, then against the folder of the current document. Use it when the user says ' +
-        '"open X" or wants to work on another file. Returns the document name and size.',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'absolute path, or a path relative to the workspace root' },
-        },
-        required: ['path'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'list_workspace',
-      description:
-        'List the files the assistant has put in the workspace (uploads/ and backups/). ' +
-        'Use it to answer "where is the file you made?" or to find the right name for open_document. ' +
-        'Returns { root, files: [{name, path, dir}] }.',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'new_sprite',
-      description:
-        'Create a new empty document. Use it before drawing from scratch. ' +
-        'If an art style is active, prefer the size that style recommends unless the user asked for something else.',
-      parameters: {
-        type: 'object',
-        properties: {
-          width: { type: 'integer' },
-          height: { type: 'integer' },
-          colorMode: { type: 'string', enum: ['rgb', 'indexed', 'grayscale'], description: 'default rgb' },
-        },
-        required: ['width', 'height'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'add_layer',
-      description:
-        'Add a layer to the current document (placed above the active one). ' +
-        'When a style defines a layer structure, create those layers so later edits can target them by name. ' +
-        'draw_art also creates the layer if it does not exist, so this is only needed when you want an empty layer up front.',
-      parameters: {
-        type: 'object',
-        properties: {
-          name: { type: 'string' },
-          opacity: { type: 'integer', description: '0-255, default 255' },
-          blendMode: { type: 'string', enum: ['normal', 'multiply', 'screen', 'overlay', 'addition'] },
-        },
-        required: [],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'draw_art',
-      description:
-        'Draw pixels from a character grid — this is how you draw, do NOT emit pixel coordinate lists. ' +
-        'Each character in rows is one pixel, mapped through palette. Example: ' +
-        'palette {".": "", "X": "#2E86DE", "o": "#7EE2A8"}, rows ["..XX..", ".XooX.", "XooooX"] ' +
-        '(a "." or empty colour means transparent). Every row must be the same length. ' +
-        'The whole grid becomes one undo step. The layer is created if it does not exist. ' +
-        'Keep grids modest: up to about 32x32 is reliable. For bigger pieces, draw in passes — ' +
-        'one draw_art per layer (base colours, then shading, then highlights).',
-      parameters: {
-        type: 'object',
-        properties: {
-          rows: {
-            type: 'array',
-            items: { type: 'string' },
-            description: 'one string per pixel row, all the same length',
-          },
-          palette: {
-            type: 'object',
-            description: '{ character: "#RRGGBB" }; map a character to "" for transparent',
-            additionalProperties: { type: 'string' },
-          },
-          layer: { type: 'string', description: 'target layer name; created if missing' },
-          x: { type: 'integer', description: 'left offset in the canvas, default 0' },
-          y: { type: 'integer', description: 'top offset in the canvas, default 0' },
-          label: { type: 'string', description: 'short description for the undo step' },
-        },
-        required: ['rows', 'palette'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'perfect_pixel',
-      description:
-        'Run Perfect Pixel Studio\'s core algorithm: detect the pixel grid of an image that only looks like pixel art (skewed cells, blurry edges) and resample it into true pixel art. ' +
-        'source="active_canvas" applies the result IN PLACE: the current document gains one new layer (named "PP <w>x<h>") holding the fixed image at (0,0); no existing pixel is touched, and if the result is larger than the canvas the canvas is grown (never cropped). ' +
-        'The whole apply is one undo step and is snapshotted first, so rollback also works. ' +
-        'source="uploaded" (fixing a picture the user dropped in) opens the result as a NEW preview document and also leaves an "Apply this result" button in the panel for the user to drop it onto whatever document is active later. ' +
-        'If automatic detection fails, retry with an explicit gridSize such as [32,32]. ' +
-        'Read the returned "applied" / "openedDoc" fields to describe what really happened instead of guessing.',
-      parameters: {
-        type: 'object',
-        properties: {
-          source: {
-            type: 'string',
-            enum: ['uploaded', 'active_canvas'],
-            description: 'which image to fix, default uploaded',
-          },
-          gridSize: {
-            type: 'array',
-            description: 'explicit grid size [w,h], e.g. [32,32]; omit for automatic detection',
-            items: { type: 'integer' },
-          },
-          sampleMethod: {
-            type: 'string',
-            enum: ['center', 'median', 'majority'],
-            description: 'sampling method, default center (highest fidelity, byte-identical to the official Python port)',
-          },
-          fixSquare: { type: 'boolean', description: 'force square output when nearly square, default true' },
-        },
-        required: [],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'snapshot',
-      description: 'Store a named snapshot (temp version) of the current canvas. Edits are already auto-backed-up; use this when the user explicitly asks to save a version.',
-      parameters: {
-        type: 'object',
-        properties: { label: { type: 'string', description: 'snapshot name, e.g. "before outline"' } },
-        required: ['label'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'rollback',
-      description: 'Roll back to a snapshot version. Pass the version number, or "last" for the most recent snapshot.',
-      parameters: {
-        type: 'object',
-        properties: {
-          to: { type: 'string', description: 'version number (e.g. "3") or "last"' },
-        },
-        required: ['to'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'list_versions',
-      description: 'List all snapshot versions of the current canvas (number, time, label, cel count).',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'remember',
-      description:
-        'Store something worth keeping long-term: a palette the user settled on, a style rule, a project convention, a preference. ' +
-        'Call this when the user explicitly asks you to remember something, or when they state a durable preference. ' +
-        'Do NOT use it for routine edits or transient state. Keep text short — one fact per call. ' +
-        'What you store is NOT injected into every request; it is retrieved on demand with recall.',
-      parameters: {
-        type: 'object',
-        properties: {
-          kind: {
-            type: 'string',
-            enum: ['color', 'style', 'preference', 'project', 'note'],
-            description: 'category; default note',
-          },
-          text: { type: 'string', description: 'the fact itself, short and self-contained' },
-          tags: { type: 'array', items: { type: 'string' }, description: 'keywords for later retrieval' },
-          note: { type: 'string', description: 'optional extra context' },
-        },
-        required: ['text'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'recall',
-      description:
-        'Search what has been remembered before. Call this BEFORE guessing what the user preferred earlier, ' +
-        'or when they refer to something established previously. Returns only the few best matches.',
-      parameters: {
-        type: 'object',
-        properties: {
-          query: { type: 'string', description: 'keyword to match against text / tags / note' },
-          kind: { type: 'string', enum: ['color', 'style', 'preference', 'project', 'note'], description: 'restrict to one category' },
-          tags: { type: 'array', items: { type: 'string' }, description: 'require these tags' },
-          limit: { type: 'integer', description: 'max entries to return, default 6' },
-        },
-        required: [],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'forget',
-      description: 'Delete one stored memory by its id (ids come from recall). Use when the user says something is no longer true.',
-      parameters: {
-        type: 'object',
-        properties: { id: { type: 'string' } },
-        required: ['id'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'remember_color',
-      description: 'Remember a colour and the context it is used in, so it can be found later with search_colors.',
-      parameters: {
-        type: 'object',
-        properties: {
-          hex: { type: 'string', description: '#RRGGBB' },
-          scene: { type: 'string', description: 'where it is used, e.g. "blue shell body" or "skin highlight"' },
-          tags: { type: 'array', items: { type: 'string' }, description: 'tags for retrieval' },
-          note: { type: 'string', description: 'free-form note' },
-        },
-        required: ['hex', 'scene'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'search_colors',
-      description: 'Search previously remembered colours and their contexts. Query by keyword, colour, or tag.',
-      parameters: {
-        type: 'object',
-        properties: {
-          query: { type: 'string', description: 'keyword (matches scene / note / tags / hex)' },
-          hex: { type: 'string', description: 'look up a specific colour' },
-          tag: { type: 'string', description: 'look up by tag' },
-          limit: { type: 'integer', description: 'max entries to return, default 12' },
-        },
-        required: [],
-      },
-    },
-  },
+// 内置包清单：这里的顺序就是发给模型的工具顺序，和 v0.5.x 的 TOOLS 逐项一致，别随手重排。
+// 显式写 id 而不是扫目录，是为了让启动顺序不依赖文件系统的枚举顺序。
+const BUILTIN_PACKS = [
+  ['builtin-canvas', canvasPack],
+  ['builtin-style', stylePack],
+  ['builtin-assist', assistPack],
+  ['builtin-workspace', workspacePack],
+  ['builtin-draw', drawPack],
+  ['builtin-pixel', pixelPack],
+  ['builtin-versions', versionsPack],
+  ['builtin-memory', memoryPack],
+  ['builtin-evolution', evolutionPack],
 ];
+
+export const journal = createJournal({ file: PACK_DIRS.journal });
+export const registry = createRegistry({ journal: journal.log });
+
+for (const [id, pack] of BUILTIN_PACKS) {
+  for (const spec of pack.tools || []) registry.define({ ...spec, pack: id });
+}
+
+// 自扩展闭环的操作手柄：一个实例，注册表 / 账本 / 快照目录都和内核共用
+export const evolution = createEvolution({
+  registry,
+  journal: journal.log,
+  packsDir: PACK_DIRS.user,
+  stagingDir: PACK_DIRS.staging,
+  snapDir: PACK_DIRS.snapshots,
+});
+
+function toOpenAI(spec) {
+  return { type: 'function', function: { name: spec.name, description: spec.description, parameters: spec.inputSchema } };
+}
+
+// TOOLS = 内置包的聚合结果，形状与字段和 v0.5.x 完全一致 ——
+// 旧测试（tools_test 的注册段、selftest 的能力交叉核对）就钉在这一层。
+// 自扩展手柄不在其中：它们走 MODEL_TOOLS，不算"内置能力"。
+const LEGACY_PACKS = new Set(BUILTIN_PACKS.map((p) => p[0]).filter((id) => id !== 'builtin-evolution'));
+export const TOOLS = registry.list().filter((s) => LEGACY_PACKS.has(s.pack) && s.expose !== false).map(toOpenAI);
+
+// 真正发给模型的清单：内置 + 自扩展手柄（arch §5.5 只增不减）。
+// expose:false 的条目（如 gaps_info）只给内核用，绝不进 prompt —— 那是 D5 保持快速的一部分。
+export const MODEL_TOOLS = registry.list().filter((s) => s.expose !== false).map(toOpenAI);
 
 // 明确做不到的事（P14）。这份清单必须诚实 —— 用户就是要求"做不到的时候要诚实"，
 // 所以宁可写得保守，也不要吹。
@@ -595,6 +101,18 @@ const CANNOT = [
   "You cannot dock the panel into the Aseprite layout, and you cannot change Aseprite's own script-permission dialogs (those follow Aseprite's language setting).",
   "You cannot run other Aseprite commands or scripts on the user's behalf beyond the tools listed here.",
 ];
+
+// 自扩展手柄必须单独列出一组：模型得先知道自己能改自己，才会去用 propose_pack。
+// 但绝不并进 can.tools —— 那是"内置能力"这条线，长度被旧测试钉在 25（arch §5.1）。
+function evolveHandles() {
+  const builtinNames = new Set(TOOLS.map((t) => t.function.name));
+  return MODEL_TOOLS
+    .filter((t) => !builtinNames.has(t.function.name))
+    .map((t) => ({
+      name: t.function.name,
+      description: String(t.function.description || '').split(/(?<=[.。])\s/)[0],
+    }));
+}
 
 // 能力清单从【真实注册表】生成，不手写 —— 手写的清单会随代码漂移，那就等于骗人。
 // 测试里会和 TOOLS 交叉核对（tools_test.mjs 的 P14 段）。
@@ -616,6 +134,7 @@ export function buildCapabilities(session, cfg = {}) {
     ui_mode: cfg.ui?.mode || 'panel',
     openable_extensions: OPENABLE,
     tools: toolList,
+    evolve: evolveHandles(),
     drawing: 'Character-grid drawing (one character per pixel + a char->colour palette), new documents, layers with opacity and blend modes, reusable art styles.',
     images: 'Open an image/aseprite document, run Perfect Pixel grid correction, and (when a workspace is configured) list and open the files in it.',
     memory: 'Remember colours and free-form notes across sessions, and search them back.',
@@ -628,7 +147,19 @@ export function buildCapabilities(session, cfg = {}) {
   };
 }
 
+// 能力清单从注册表生成，不手写 —— 手写的清单会随代码漂移，那就等于骗人。
+// 测试里会和 TOOLS 交叉核对（tools_test.mjs 的 P14 段）。
 export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath, getActiveStyle, setActiveStyle, gaps }) {
+  // 包的 run(ctx, input) 只认这个 ctx：包不 import 内核，所有服务靠注入拿到
+  // （包激活时会被复制到别处，相对 import 会断；注入天生免疫这点）。
+  const ctx = {
+    session, bank, memory, styles, cfg, bundlePath, gaps,
+    getActiveStyle, setActiveStyle,
+    perfectPixel, countDistinctColors, isAsciiName,
+    buildCapabilities: () => buildCapabilities(session, cfg),
+    registry, evolution, journal,
+  };
+
   // 每个工具的结果都过一道：出现"做不到"类错误就自动记一笔（模型可能忘了调 log_gap）
   const autoLog = (tool, args, result) => {
     if (!gaps || !result || typeof result !== 'object') return result;
@@ -637,7 +168,7 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
     if (!text || !looksLikeCapabilityGap(text)) return result;
     try {
       gaps.add({
-        request: session?.lastUserText || `(tool ${tool} failed)`,
+        request: session?.lastUserText || ('(tool ' + tool + ' failed)'),
         why: String(text),
         tool,
         model: cfg?.llm?.model || '',
@@ -650,354 +181,23 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
   };
 
   return async function dispatch(name, args) {
-    const out = await dispatchInner(name, args);
-    return autoLog(name, args, out);
-  };
+    const spec = registry.get(name);
+    // 未注册工具的文案保持 v0.5.x 原样：面板提示与模型行为都依赖它
+    if (!spec) return autoLog(name, args, { error: 'unknown tool: ' + name, hint: 'not supported by this build' });
 
-  async function dispatchInner(name, args) {
-    switch (name) {
-      case 'canvas_info':
-        return await session.request('canvas_info');
-
-      case 'crop':
-        return await session.request('crop', {
-          label: args.label || `crop to ${args.w}x${args.h}`,
-          x: args.x, y: args.y, w: args.w, h: args.h,
-        });
-
-      case 'scale':
-        return await session.request('scale', {
-          label: args.label || `scale to ${args.width}x${args.height}`,
-          width: args.width, height: args.height, method: args.method,
-        });
-
-      case 'canvas_size':
-        return await session.request('canvas_size', {
-          label: args.label || `canvas ${args.width}x${args.height}`,
-          width: args.width, height: args.height, anchor: args.anchor,
-        });
-
-      case 'apply_ops': {
-        if (!Array.isArray(args.ops) || args.ops.length === 0) {
-          return { error: 'ops is empty' };
-        }
-        // 目标层归一化：接受 layers:"all" / layers:["base"] / layer:"base" / 都不给（活动层）
-        let targets;
-        if (args.layers != null) targets = Array.isArray(args.layers) ? args.layers : [args.layers];
-        else if (args.layer != null && String(args.layer).trim() !== '') targets = [String(args.layer)];
-        if (Array.isArray(targets)) {
-          targets = targets.map((t) => String(t).trim()).filter((t) => t !== '');
-          if (targets.length === 0) targets = undefined;
-          else if (targets.length === 1) targets = targets[0];
-        }
-        return await session.request('run_ops', {
-          label: args.label || 'AI edit',
-          ops: args.ops,
-          layers: targets,
-        });
-      }
-
-      case 'perfect_pixel': {
-        const source = args.source || 'uploaded';
-        // 落地方式：active = 就地贴进当前文档的新图层（只可能来自 active_canvas）；
-        // preview = 开预览文档（上传图，或扩展侧发现没有可用文档时自己退回这一档）
-        let buf, w, h, note, sourceKey, target, label;
-        if (source === 'uploaded') {
-          if (!session.upload) {
-            return { error: 'No image has been uploaded yet. Pick a file in the panel and click "Fix Image".' };
-          }
-          ({ buf, w, h } = session.upload);
-          note = `from upload ${session.upload.name}`;
-          sourceKey = `upload:${session.upload.name}`;
-          target = 'preview';
-          label = `PP ${session.upload.name}`;
-        } else {
-          const got = await session.request('get_canvas');
-          if (got.error) return got;
-          buf = got.buf;
-          w = got.width;
-          h = got.height;
-          note = 'from the active canvas';
-          sourceKey = `canvas:${w}x${h}`;
-          target = 'active';
-          label = 'fixed image';
-        }
-
-        // 同一轮里已经矫正过这个来源了 —— 模型在复读，别再开一个文档（P8）
-        if (session.turnProcessed?.has(sourceKey)) {
-          return {
-            alreadyProcessed: true,
-            note: 'This source was already corrected in this turn. Do not run perfect_pixel again -- report the result you already have.',
-          };
-        }
-
-        const res = await perfectPixel(bundlePath, buf, w, h, {
-          sampleMethod: args.sampleMethod,
-          gridSize: args.gridSize,
-          fixSquare: args.fixSquare,
-        });
-
-        // 不同颜色数：既是 P9 的诊断数据，也是判断"是不是像素画"的便宜信号
-        const distinctColors = countDistinctColors(buf);
-
-        if (!res.detected) {
-          // 检测不出来最常见的原因不是"图坏了"，而是**它本来就是 1:1 的像素画**：
-          // detectGridScale 只找 >=4 倍的上采样因子（minSize=4），1px 一格时
-          // 梯度峰值间距太小，直接判定"无网格"。这正是用户反馈的
-          // 「已经处理过的图还会被再次处理」的根源 —— 模型看到 hint 就盲目重试 gridSize，
-          // 结果开出一个和输入一模一样的文档。
-          // 所以这里改成：**明确告诉模型别盲目重试**，只有用户点了逻辑尺寸才重试。
-          session.turnProcessed?.add(sourceKey);
-          return {
-            detected: false,
-            noGridDetected: true,
-            input: `${w}x${h}`,
-            distinctColors,
-            reason: res.message,
-            note: 'No pixel grid detected. Detection only finds upscale factors of 4x or more, so an image that is ALREADY at 1:1 pixel size (typical for anything previously corrected) reports no grid here. Unless the user asked for a specific logical size, tell them it needs no processing and stop -- do NOT retry with gridSize. Retry with gridSize ONLY when the user names the size they want.',
-          };
-        }
-
-        // 幂等（P8）：网格 == 图片尺寸 => 每格恰好 1px => 输出和输入逐字节相同。
-        // 这时"矫正"是恒等变换，导入只会开出一个一模一样的文档，所以**不导入**。
-        if (res.gridW === w && res.gridH === h) {
-          session.turnProcessed?.add(sourceKey);
-          return {
-            detected: true,
-            alreadyPerfect: true,
-            input: `${w}x${h}`,
-            grid: `${w}x${h}`,
-            distinctColors,
-            note: 'This image is already true pixel art (every grid cell is exactly 1px), so the correction would be a no-op. Tell the user it needs no processing and move on -- do NOT retry with gridSize.',
-          };
-        }
-
-        session.turnProcessed?.add(sourceKey);
-        const placed = await session.sendImport(res.data, res.outWidth, res.outHeight, note, { target, label });
-
-        // 诊断（P9）：把四组尺寸推到面板，用户觉得结果不对时可以直接截图
-        session.say?.('info', `perfect_pixel: input=${res.inputWidth}x${res.inputHeight} grid=${res.gridW}x${res.gridH} refined=${res.refinedW}x${res.refinedH} output=${res.outWidth}x${res.outHeight} sample=${args.sampleMethod || 'center'} colors=${distinctColors}`);
-
-        const out = {
-          detected: true,
-          input: `${res.inputWidth}x${res.inputHeight}`,
-          grid: `${res.gridW}x${res.gridH}`,
-          refined: `${res.refinedW}x${res.refinedH}`,
-          output: `${res.outWidth}x${res.outHeight}`,
-          distinctColors,
-        };
-
-        // 落地结果：note 必须如实描述发生了什么，别让模型猜（也别再一律说"开了新文档"）
-        if (placed && placed.applied) {
-          out.applied = true;
-          out.layer = placed.layer || null;
-          out.canvas = placed.canvas || null;
-          out.expanded = !!placed.expanded;
-          if (placed.expanded) out.canvasWas = placed.canvasFrom || null;
-          out.note =
-            `Applied in place: added layer "${placed.layer}" with the ${res.outWidth}x${res.outHeight} fixed image at (0,0) ` +
-            `of the active document` +
-            (placed.expanded
-              ? `, growing its canvas from ${placed.canvasFrom} to ${placed.canvas} after EXTENDING the canvas` +
-                ` (nothing was cropped).`
-              : ` (canvas stayed ${placed.canvas}).`) +
-            ` No existing pixel changed, the apply is one undo step, and a snapshot was taken first so rollback works. ` +
-            `Report this to the user as done in their current document -- do NOT tell them to open or copy from another document.`;
-        } else if (placed && placed.applied === false && placed.reason === 'no-document') {
-          out.applied = false;
-          out.openedDoc = true;
-          out.pendingApply = true;
-          out.note =
-            `No document was open, so the ${res.outWidth}x${res.outHeight} result was opened as a new document instead. ` +
-            `It is also held as a pending result: once the user has a document open, the panel shows an "Apply this result" button that drops it in as a new layer. ` +
-            `Tell the user to open their artwork and click that button -- do not tell them to copy pixels by hand.`;
-        } else {
-          out.applied = false;
-          out.openedDoc = true;
-          out.pendingApply = !!(placed && placed.pending);
-          out.note =
-            `Opened as a new ${res.outWidth}x${res.outHeight} document so the user can copy from it. ` +
-            `It is also held as a pending result: the panel's "Apply this result" button drops it into the active document as a new layer ` +
-            `(canvas grown if needed, existing pixels untouched). ` +
-            `Say that the result is ready to be applied -- do not claim the user's canvas was already changed.`;
-        }
-        if (placed && placed.error) out.applyError = String(placed.error);
-        return out;
-      }
-
-      case 'ask_user': {
-        const question = String(args.question ?? '').trim();
-        if (!question) return { error: 'ask_user needs a question' };
-        const options = (Array.isArray(args.options) ? args.options : [])
-          .map((s) => String(s).trim()).filter((s) => s !== '').slice(0, 4);
-        if (options.length < 2) {
-          return { error: 'ask_user needs 2 to 4 non-empty options' };
-        }
-        // 5 分钟：用户可能正在看图，别急着超时（request 的第三参就是超时）
-        return await session.request('ask', { question, options }, 300000);
-      }
-
-      case 'capabilities':
-        return buildCapabilities(session, cfg);
-
-      case 'open_document': {
-        const path = String(args.path ?? '').trim();
-        if (!path) return { error: 'path is required' };
-        return await session.request('open_doc', { path }, 30000);
-      }
-
-      case 'list_workspace':
-        return await session.request('list_workspace', {}, 20000);
-
-      case 'snapshot':
-        return await session.request('snapshot', { label: args.label || 'AI snapshot' });
-
-      case 'rollback':
-        return await session.request('rollback', { to: String(args.to ?? 'last') });
-
-      case 'list_versions':
-        return await session.request('list_versions');
-
-      case 'remember':
-        return memory.remember(args);
-
-      // ---- 风格 ----------------------------------------------------------
-      case 'style_list': {
-        const cur = getActiveStyle ? getActiveStyle() : '';
-        return {
-          active: cur || null,
-          styles: styles.names().map((n) => {
-            const s = styles.get(n);
-            return {
-              name: n,
-              label: s.label || n,
-              size: s.size ? `${s.size[0]}x${s.size[1]}` : null,
-              colors: s.palette?.length || 0,
-              layers: s.layers || [],
-            };
-          }),
-        };
-      }
-
-      case 'style_use': {
-        const want = String(args.name ?? '').trim();
-        if (want === '') {
-          setActiveStyle('');
-          return { ok: true, active: null, note: 'style cleared' };
-        }
-        const s = styles.get(want);
-        if (!s) {
-          return { error: `no style named "${want}"`, available: styles.names() };
-        }
-        setActiveStyle(s.name);
-        return {
-          ok: true,
-          active: s.name,
-          label: s.label || s.name,
-          note: 'This style is now part of your instructions for the rest of the session.',
-        };
-      }
-
-      case 'style_save':
-        return styles.save(args.name, args);
-
-      // ---- 作画 ----------------------------------------------------------
-      case 'new_sprite':
-        return await session.request('new_sprite', {
-          width: args.width, height: args.height, colorMode: args.colorMode,
-        });
-
-      case 'add_layer':
-        // 和 draw_art 同一条规矩：图层名必须 ASCII（见 isAsciiName 的注释）
-        if (args.name != null && String(args.name).trim() !== '' && !isAsciiName(args.name)) {
-          return {
-            error: `layer name must be ASCII: ${args.name}`,
-            hint: 'use english layer names like base / shadow / highlight / outline / detail',
-          };
-        }
-        return await session.request('add_layer', {
-          name: args.name, opacity: args.opacity, blendMode: args.blendMode,
-        });
-
-      case 'draw_art': {
-        if (!Array.isArray(args.rows) || args.rows.length === 0) {
-          return { error: 'rows is empty: pass an array of strings, one per pixel row' };
-        }
-        // 先把"行宽不一致"挡在桥这一侧：模型写歪一行，报错要比让 Lua 抛更早、更好懂。
-        // 宽度按【码点】算 —— JS 的 .length 是 UTF-16 单元数（emoji 算 2），
-        // 而 Lua 侧用 utf8.codes 按码点数。两边不一致会让校验放过、Lua 再报错。
-        // 图层名统一英文（用户要求：无论界面语言，名字一律 ASCII —— 它们会进
-        // .aseprite 文件，也会出现在用户要手打的路径里）
-        if (args.layer != null && String(args.layer).trim() !== '' && !isAsciiName(args.layer)) {
-          return {
-            error: `layer name must be ASCII: ${args.layer}`,
-            hint: 'use english layer names like base / shadow / highlight / outline / detail',
-          };
-        }
-        const cps = (s2) => [...String(s2)].length;
-        const w = cps(args.rows[0]);
-        const badRow = args.rows.findIndex((r) => cps(r) !== w);
-        if (badRow >= 0) {
-          return {
-            error: `row ${badRow + 1} has ${cps(args.rows[badRow])} characters but row 1 has ${w}; every row must be the same length`,
-          };
-        }
-        const chars = new Set(args.rows.join('').split(''));
-        const pal = args.palette || {};
-        const unmapped = [...chars].filter((c) => !(c in pal) && c !== ' ' && c !== '.');
-        if (unmapped.length) {
-          return {
-            error: `these characters appear in rows but have no palette entry: ${unmapped.join(' ')}`,
-            hint: 'add them to palette, or use "." for transparent',
-          };
-        }
-        // "." 和 " " 永远是透明的，给它们配颜色不会生效。与其让模型画出 0 像素
-        // 再反复重试，不如在这里就说清楚（这个坑真的踩过：见 artlib 的 UTF-8 那段）。
-        const dotPainted = ['.', ' '].filter((c) => typeof pal[c] === 'string' && pal[c].trim() !== '');
-        if (dotPainted.length && [...chars].every((c) => c === '.' || c === ' ')) {
-          return {
-            error: `every character in the grid is ${dotPainted.map((c) => `"${c}"`).join(' or ')}, which are always transparent; palette entries for them are ignored`,
-            hint: 'use a real character (a letter or digit) for pixels that should be painted, and keep "." for the background',
-          };
-        }
-        return await session.request('draw_art', {
-          label: args.label || `draw ${w}x${args.rows.length}`,
-          layer: args.layer, palette: pal, rows: args.rows, x: args.x, y: args.y,
-        });
-      }
-
-      case 'log_gap': {
-        if (!gaps) return { error: 'gap log is not available' };
-        return gaps.add({
-          request: args.request,
-          why: args.why,
-          workaround: args.workaround,
-          tool: session?.lastTool || '',
-          model: cfg?.llm?.model || '',
-          context: session?.lastUserText || '',
-          source: 'model',
-        });
-      }
-
-      case 'gaps_info': {
-        if (!gaps) return { error: 'gap log is not available' };
-        return { ...gaps.stats(), recent: gaps.recent(5) };
-      }
-
-      case 'recall':
-        return memory.recall(args);
-
-      case 'forget':
-        return memory.forget(args);
-
-      case 'remember_color':
-        return bank.remember(args);
-
-      case 'search_colors':
-        return bank.search(args);
-
-      default:
-        return { error: `unknown tool: ${name}`, hint: 'not supported by this build' };
+    const t0 = Date.now();
+    let ok = true;
+    let out;
+    try {
+      out = await spec.run(ctx, args || {});
+      if (out && typeof out === 'object' && out.error) ok = false;
+    } catch (e) {
+      ok = false;
+      throw e;              // 抛错照旧往上走（llm.mjs 会把它变成一条 tool 结果）
+    } finally {
+      // 成功/失败都要记：pack_health 的失败率靠这一行，否则自动回滚永远不触发
+      evolution.record(spec.pack, Date.now() - t0, ok);
     }
+    return autoLog(name, args, out);
   };
 }

@@ -37,6 +37,140 @@ local agent = {}
 local Agent = {}
 Agent.__index = Agent
 
+----------------------------------------------------------------------
+-- 算子的两个来源：lib.ops（内建实现）+ registry 的 op（能力包注册的）
+--
+-- 为什么要并：能力包注册的算子若既不上报给桥、也不被执行，"模型能给自己加能力"
+-- 就只成立一半 —— 它写得出来，自己却看不见、也跑不了。
+-- 分工：lib.ops 仍是内建算子的唯一实现；registry 只负责"还有哪些算子存在"。
+----------------------------------------------------------------------
+
+local LEGACY_OP = {}
+for _, n in ipairs(ops.names) do LEGACY_OP[n] = true end
+
+-- 名字 -> spec：registry 里没有 op 时返回 nil（老路径、无内核时都走这里）
+function agent.packOp(kernel, name)
+  if not (kernel and kernel.registry and kernel.registry.get) then return nil end
+  local ok, spec = pcall(function() return kernel.registry:get("op", tostring(name)) end)
+  if ok and type(spec) == "table" then return spec end
+  return nil
+end
+
+-- 这个算子是"能力包注册的"吗？判据是「registry 有、且 lib.ops 不能跑」
+-- —— 两边都有的名字仍归 lib.ops，这样内建算子的批量事务语义不会被打散。
+function agent.isPackOp(kernel, name)
+  name = tostring(name or "")
+  if name == "" or LEGACY_OP[name] then return false end
+  return agent.packOp(kernel, name) ~= nil
+end
+
+function agent.opNames(kernel)
+  local seen, out = {}, {}
+  if kernel and kernel.registry and kernel.registry.list then
+    local ok, list = pcall(function() return kernel.registry:list("op") end)
+    if ok and type(list) == "table" then
+      for _, spec in ipairs(list) do
+        local name = spec and (spec.name or spec.id) or nil
+        if name ~= nil then
+          name = tostring(name)
+          if name ~= "" and not seen[name] then seen[name] = true; out[#out + 1] = name end
+        end
+      end
+    end
+  end
+  for _, name in ipairs(ops.names) do
+    if not seen[name] then seen[name] = true; out[#out + 1] = name end
+  end
+  table.sort(out)
+  return out
+end
+
+-- 给模型看的能力说明：内建那 10 条的原文不动，包算子追加在后面
+function agent.opsHelp(kernel)
+  local parts = { ops.describe() }
+  local line = {}
+  if kernel and kernel.registry and kernel.registry.list then
+    local ok, list = pcall(function() return kernel.registry:list("op") end)
+    if ok and type(list) == "table" then
+      for _, spec in ipairs(list) do
+        local name = tostring(spec and (spec.name or spec.id) or "")
+        if name ~= "" and not LEGACY_OP[name] then
+          line[#line + 1] = string.format("- %s：%s（能力包注册）", name, tostring(spec.label or name))
+        end
+      end
+    end
+  end
+  if #line > 0 then parts[#parts + 1] = table.concat(line, "\n") end
+  return table.concat(parts, "\n")
+end
+
+-- 执行一串算子请求：能力包注册的走 kernel:invoke（带沙箱预算），其余仍走 lib.ops。
+-- 顺序按请求原序；**连续的内建算子合并成一个事务**，所以纯内建请求的撤销粒度
+-- 与 v0.5.x 一字不差（一个请求一步撤销）。
+-- 返回值形状与 lib.ops.run 相同：{ sprite, frame, ops = {...}, layer | layers, hint }
+function agent.execOps(list, label, cels, kernel)
+  if type(list) ~= "table" or #list == 0 then error("nothing to execute") end
+
+  local out = { ops = {} }
+  local firstCel = type(cels) == "table" and cels[1] or cels
+  if firstCel then
+    out.layer = firstCel.layer and firstCel.layer.name or nil
+    out.frame = firstCel.frameNumber
+    local okName, base = pcall(function()
+      local sp = firstCel.sprite
+      if not sp or sp.filename == "" then return nil end
+      return app.fs.fileName(sp.filename)
+    end)
+    out.sprite = (okName and base) or "(未命名)"
+  end
+
+  local i = 1
+  while i <= #list do
+    local one = list[i]
+    local name = tostring(one.op or one.type or "")
+    if agent.isPackOp(kernel, name) then
+      local params = {}
+      for k, v in pairs(one) do
+        if k ~= "op" and k ~= "type" then params[k] = v end
+      end
+      local ok, res = kernel:invoke("op", name, kernel.host, params)
+      if not ok then
+        -- 超时/抛错都折成可读错误，交给上层的 pcall 回给模型自愈
+        error(string.format("op %s: %s", name, tostring(res)), 0)
+      end
+      res = type(res) == "table" and res or {}
+      out.ops[#out.ops + 1] = {
+        op = name,
+        changed = tonumber(res.changed) or 0,
+        elided = res.elided == true,
+        detail = res.detail,
+      }
+      i = i + 1
+    else
+      local batch = {}
+      while i <= #list do
+        local n = tostring(list[i].op or list[i].type or "")
+        if agent.isPackOp(kernel, n) then break end
+        batch[#batch + 1] = list[i]
+        i = i + 1
+      end
+      local rep = ops.run(batch, label, cels)
+      for _, r in ipairs(rep.ops or {}) do out.ops[#out.ops + 1] = r end
+      if out.layers == nil and rep.layers ~= nil then out.layers = rep.layers; out.scope = rep.scope end
+      if out.layer == nil and rep.layer ~= nil then out.layer = rep.layer end
+      if out.hint == nil and rep.hint ~= nil then out.hint = rep.hint end
+      if out.sprite == nil then out.sprite = rep.sprite end
+      if out.frame == nil then out.frame = rep.frame end
+    end
+  end
+
+  -- "一个像素都没改"的提示只在真的全局没改时才成立
+  local changed = 0
+  for _, r in ipairs(out.ops) do changed = changed + (tonumber(r.changed) or 0) end
+  if changed > 0 then out.hint = nil end
+  return out
+end
+
 -- HINT 已并入 i18n.helpText()
 
 function agent.new(cfg)
@@ -170,8 +304,9 @@ function Agent:connect(quiet)
         type = "hello",
         aseprite = tostring(app.version),
         apiVersion = app.apiVersion,
-        ops = ops.names,
-        opsHelp = ops.describe(),
+        -- 并集：registry（含能力包注册的）+ lib.ops。少了这一半，模型看不见自己的新算子
+        ops = agent.opNames(self:kernel()),
+        opsHelp = agent.opsHelp(self:kernel()),
       }
       self:flushPendingChats()
       self:flushPendingFixes()
@@ -926,6 +1061,48 @@ function Agent:onBinary(header, data)
   end
 end
 
+----------------------------------------------------------------------
+-- 内核句柄：能力包的 op 在 registry 里，执行要经 kernel:invoke 才有限时保护
+--
+-- 为什么是"注入 + 兜底"：agent 由 main.lua 在 loadKernel() 之后构造，但那条线
+-- 目前没把 kernel 传进来。拿不到内核时这里返回 nil，名单退回 lib.ops、执行退回
+-- 老路径 —— 也就是"装了内核就多一半能力，没装内核一切照旧"，绝不因为缺它而崩。
+----------------------------------------------------------------------
+
+function Agent:setKernel(kernel)
+  if kernel then self._kernel = kernel end
+  return self._kernel
+end
+
+function Agent:kernel()
+  if self._kernel then return self._kernel end
+  local k = self.cfg and self.cfg.kernel or nil
+  if k then self._kernel = k; return k end
+  return nil
+end
+
+-- 卸载一个能力包注册的算子（ledger 只管启停，registry 里的规格得有人撤，
+-- 否则名单里会留 ghost 名字：模型看得见、一点就报 unknown op）。
+-- 只撤 manifest 里声明过的；包里偷偷注册的不在账上，撤不到。
+function agent.dropPackOps(kernel, packId)
+  if not (kernel and kernel.registry) then return 0 end
+  local ctx = kernel.packContexts and kernel.packContexts[packId]
+  local declared = ctx and ctx.pack and ctx.pack.ops or nil
+  local removed = 0
+  for _, o in ipairs(declared or {}) do
+    local name = tostring(o.name or o or "")
+    if name ~= "" and kernel.registry:get("op", name) then
+      kernel.registry:remove("op", name)
+      removed = removed + 1
+    end
+  end
+  return removed
+end
+
+function Agent:dropPackOps(packId)
+  return agent.dropPackOps(self:kernel(), packId)
+end
+
 -- Execute the ops the model asked for. Auto-backup first.
 function Agent:runOps(msg)
   local list = msg.ops or {}
@@ -946,7 +1123,9 @@ function Agent:runOps(msg)
     self.panel:log(string.format(i18n.t("autoBacked"), meta.id, meta.label), "tool")
   end
 
-  local ok, res = pcall(ops.run, list, label, cels)
+  -- 分流在 execOps 里：能力包注册的算子走 kernel:invoke（带沙箱预算），
+  -- 内建算子仍走 lib.ops 的批量事务 —— 旧路径一行没变
+  local ok, res = pcall(agent.execOps, list, label, cels, self:kernel())
   if ok then
     local parts = {}
     for _, r in ipairs(res.ops) do

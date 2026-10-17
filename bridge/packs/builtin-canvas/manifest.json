@@ -1,0 +1,29 @@
+{
+  "id": "builtin-canvas",
+  "name": "画布与尺寸",
+  "version": "1.0.0",
+  "api": 1,
+  "permissions": [],
+  "views": [],
+  "commands": [],
+  "ops": [
+    {
+      "name": "canvas_info"
+    },
+    {
+      "name": "apply_ops"
+    },
+    {
+      "name": "crop"
+    },
+    {
+      "name": "scale"
+    },
+    {
+      "name": "canvas_size"
+    }
+  ],
+  "requires": [
+    "core"
+  ]
+}

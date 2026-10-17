@@ -2,7 +2,29 @@
 
 给下次继续的自己/agent：先读这一页，再动手。
 
-## 一句话状态
+## v1.0：架构重做为「三明治内核」+ UI 重做为工作台（未发版）
+
+**一句话**：内核压到永不改动的小体积，能力全部推出内核成为可热装载/可自测/可回滚的**能力包**；
+模型可以在**声明层修改自己**（提议 → 子进程验证 → 激活 → 回滚），并且这条链路的每一步都有护栏与断言。
+
+设计契约（先冻结再施工，三路并行才成立）：`docs/arch-v1.0.md`、`docs/ui-v1.0.md`；交付说明 `docs/v1.0-delivery.md`。
+
+**终值**：Lua **1476 通过 / 0 失败**（14 文件）；桥 **636 通过 / 3 失败**（那 3 条是 v0.5.9 就有、纯净 worktree 同样失败的
+测试隔离问题）。基线是 Lua 960/0、桥 470/3。
+
+**真机 GUI 验收**：`tests/lua/gui_v1_{console,packs,offline}.png`，跑法 `tests/run_gui_v1.ps1`。
+这一环抓到两个无头测不出的宿主陷阱，已固化成 kit_test 的不变式：
+1. onpaint 里探测 userdata 上不存在的字段（`gc.flush`）是**抛错**不是返回 nil → 错误穿出事件处理器 → 进程消失（0xC000001D）；
+2. `string.upper` 对中文做字节级大写会切出非法 UTF-8 → `gc:fillText` 崩。
+
+**跑批**：`powershell -NoProfile -ExecutionPolicy Bypass -File tests\verify-v1.0.ps1`（显式清单，纯 ASCII ——
+PS 5.1 读 UTF-8 无 BOM 脚本时中文正则会变乱码，这个坑踩过）。
+
+**已知缺口（诚实清单，全在 docs/v1.0-delivery.md 第 6 节）**：C 层阻塞挡不住、Lua 侧 `out.ok` 无消费点、
+纯 Lua 包无完整 verify 路径、授权框多一个、`resolveCels` 去重是有意的行为修正。
+
+## 一句话状态（v0.5.9）
+
 
 **v0.5.9：修掉二进制通道的根因（上传 / get_canvas 全死，正是 gaps.md #1 那条）+ 超时放宽且可调（180s/600s）+ 新增 sharpen / contrast 两个算子 + 小窗默认贴右下角。**
 `docs/plan-v0.5.9-timeouts-ops-corner.md` 是这轮的计划与结论；`docs/plan-v0.5.8-conversations.md` 是上一轮。
@@ -621,105 +643,3 @@ Aseprite，不是就**拒绝截图**（防隐私泄露）。
     `lib/ws.lua` 里的 `fromJson()` 统一转成普通 table。
 12. **无头（`-b`）模式下 WebSocket 回调不触发**（回调走 `os::queue_event`，批处理没有事件循环；
     33ms 的 Timer 只在 `isGui()` 时建）→ WS 链路只能在 GUI 下验证，但 Lua 逻辑可 `-b` 全量测。
-13. `app.version` 是 userdata，`json.encode` 会变 null → 要 `tostring(app.version)`。
-
-### Lua 语言层面（POSIX Lua 变体，坑最深）
-
-29. **`|`（模式或运算）完全不生效！** Aseprite 内置的 Lua 是 POSIX 正则版：实测
-    `("menu"):find("^%s*(menu|foo)%s*$") == nil`，而 `("menu"):find("^%s*menu%s*$") == 1`。
-    凡是需要"或"的地方一律**查表匹配**或拆成多次匹配（`lib/i18n.lua` 的 MENU_WORDS 就是因此写成查表）。
-30. **`string.lower()` 是字节级的**，会把多字节字符的尾巴改坏：`"menú":lower()` 的末字节
-    `C3 BA` → `C3 9A`，表查不到；俄文 `МЕНЮ` 更是根本不会被降格。含非 ASCII 时**别调 lower**。
-31. **`string.sub(2)` / `sub(-1)` 会切碎多字节字符**：`"menú":sub(2)` 得到 `en` + 残字节。
-    取首/尾字符要用 `utf8.offset`（见 `i18n.lastChar`）；剥括号/标点必须按字符边界走。
-32. **归一化要先洗 BOM 和 `\r`**：Lua 的 `%s` **不**匹配 `\r`，也不匹配 UTF-8 BOM，
-    带 BOM 的输入会让 `^%s*matching$` 整条失效（这次真的踩到了）。
-33. **无头（`-b`）下 `Dialog(...)` 返回 nil**（`dialog_class.cpp:Dialog_new` 里 `!isGui()` 直接 return 0），
-    所以面板代码要对 nil 兜底，无头测试才能跑纯逻辑（`Panel:_build` / `Panel:show` 已处理）。
-33b. **多行字符串字面量 + CRLF 文件 = 语法错误**。这个 Lua 的词法器只把 `\n` 当换行
-    （POSIX/C89 分支），CRLF 文件里的多行字符串会报 `unfinished string`（实测：含 `\r\n`
-    的多行字面量直接 loadfile 失败）。**测试脚本里的多行文本一律用 `\n` 转义**，别写真正的换行；
-    行尾也可能被编辑器/工具改掉，改完跑一遍 `loadfile` 检查最稳。
-
-### 终端化（IME 是硬约束）
-
-33c. **输入行不能自绘**：Aseprite 里只有 `ui::Entry` / `ui::TextEdit` 会主动开输入法
-    （`entry.cpp:170` 调 `os::System::setTextInput(true, caretPos)`），而**这个开关没有暴露给
-    Lua**（`app.os` 里只有系统信息查询）。Windows 的 IME 由 `laf/os/win/window.cpp` 的
-    `WM_IME_CHAR` 转成带 unicode 的 KeyDown 事件，但前提是控件先开了 text input。
-    所以自绘输入行 = 中文完全打不了字（连退格都得自己实现）。做法：**canvas 当屏幕、
-    原生 Entry 当提示行**（素边框 + 同底色），观感一致、中文能打。
-33d. **桥发来的状态是英文硬编码**（`ready` / `missing API key` …）——面板侧用查表翻译
-    （`i18n.statusText`），中文界面才不会漏出英文状态。
-
-### 命令表 / 小面板（新交互，都对过源码）
-
-34. **canvas 不只是画布**：`dlg:canvas` 支持 `onmousemove / onmousedown / onmouseup / onwheel /
-    onkeydown / onkeyup`（`canvas_widget.cpp:118-159` + `dialog_class.cpp:1373-1405`）→
-    "鼠标悬浮变蓝、点击执行"完全能自己实现，不需要主题也改不了 Aseprite 皮肤。
-    鼠标消息字段：`x/y`（已减去 widget 原点）、`button`（`MouseButton.LEFT`）、`altKey` 等。
-35. **键名走 `ev.code` 不是 `ev.key`**：`fill_keymessage_values` 里 `key` = unicode 字符，
-    `code` = `vkcode_to_code` 的名字（`"ArrowUp"/"ArrowDown"/"KeyA"`）。吃了按键要调
-    **`ev.stopPropagation()`**（消息表里的函数），不是 `app.canvas:…`。
-36. **对话框定位**：`dlg.bounds = Rectangle(x, y, w, h)`（`Dialog_set_bounds`）或
-    `dlg:show{ bounds = … }`；坐标是**相对主窗口内容区**的（`getWindowBounds()` 里减掉了
-    mainOrigin），所以贴边小窗写 (6,6) 就贴在 Aseprite 自己窗口的左上角，跟主窗口一起移动。
-37. **`dlg:modify{id=…, text=…}` 不会立刻刷新 `dlg.data`**（真人敲键会）——脚本/探针填进去的值
-    读回来还是旧的。面板因此自己存一份输入值（`Panel:fillInput` / `Panel:inputValue`）。
-38. **`app.command.OpenFile` 返回布尔值，不是文件名**（`app_command_object.cpp:Command_call`）；
-    要拿选中的文件得事后读 `app.activeSprite.filename`。
-
-### 字体（中文像素字体 + 关平滑）
-
-14. **laf 只查第一层回退**：位图字体的 `<fallback>` 指向谁，缺字就用谁渲染；再往下的 fallback
-    **不会被查**（那层缺字交给系统字体兜底）。中文字体必须挂在 `Aseprite` / `Aseprite Mini`
-    的**第一层**回退上，挂中间层（如 `Unicode` 的 fallback）**完全没效果**——实测过，别再试。
-15. **回退字号 = `size × guiscale()`**（`src/app/fonts/font_data.cpp:92`，`size` 默认 10）。
-16. **`antialias` 默认 true**（`skin_theme.cpp:257`）、**`hinting` 默认 Normal** → 像素字体必须
-    显式写 `antialias="false" hinting="false"`，否则会被抗锯齿糊掉、被自动微调挪位。
-    转换出的 TTF 里也写了 `gasp` 表（只留 GASP_GRIDFIT，不含 DOGRAY）做双保险。
-17. `<font>` 里 `<fallback font="X">` 的 X 必须**在前面声明**，否则启动报
-    "Font named 'X' not found"。
-18. **BDF 用不了**：`skin_theme.cpp` 里 `type=` 只认 `truetype` / `spritesheet` / `system`。
-    用户给的 Fusion Pixel 是 BDF，所以写了转换器 `tools/bdf2ttf.py`
-    （fontTools；每个点亮像素转成方形轮廓，同行连续像素合并成矩形、纵向再合并；
-    UPEM=1000，1 设计像素=100 单位）。实测 7 个语言 BDF 的**字形集完全一致**（各 25314 个），
-    只是区域字形变体不同，取 `zh_hans` 一个即可 → 25123 个码位、5.4MB、转换耗时 4.5 秒。
-19. 当前 `fonts.xml`：`<font name="Fusion Pixel 10" file="fusion-pixel-10px.ttf"
-    antialias="false" hinting="false" />`，`Aseprite` 与 `Aseprite Mini` 的第一层回退都指向它，
-    `size="10"`。想换回方舟像素只改两处 `file=` 和 `name=`。
-    **原始备份**：`data/fonts/fonts.xml.orig-backup`。
-
-## 未完成 / 下一步
-
-1. **重启 Aseprite** → `File > Scripts > AI Pixel Copilot (AI console)` 或 `Ctrl+Shift+A`
-   → 首次点几次授权框（勾不再提示）。
-2. **点面板上的 Settings**（或菜单 `AI: Settings`）填 Base URL / Model / API Key，
-   点 **Test Connection** 应看到 `Connection OK in ... ms`。保存后**立即生效**，不用重启桥。
-3. 试一句「把背景的 #FF0000 换成 #2E86DE」。
-4. 新交互的快捷键（都写在 `extension/keys.aseprite-keys`，装完重启生效）：
-   `Ctrl+Shift+A` 面板 / `Ctrl+Shift+M` 命令表 / `Ctrl+Shift+P` 贴边小面板。
-5. 真 LLM 跑通后，可考虑：
-   - 命令表增加"参数化命令"（如 `10: 换成颜色 [#RRGGBB]` 输入编号后追问参数）
-   - 上传图片 → 矫正的实测（`Fix Image` 按钮链路目前只在代码层验证过，GUI 未实测；
-     小面板的 Upload 走 `app.command.OpenFile`，选完自动进矫正流程）
-   - 界面语言只做了中/英两套（`lib/i18n.lua`）；想加语言就往 LOCALES + BUILDER 加表
-   - 输出区还不能选中复制（canvas 自绘）；要复制的需求真要满足只能走 C++
-
-## 架构速览
-
-```
-Aseprite (Lua 扩展)  <--WebSocket(JSON + 二进制 RGBA)-->  本地 Node 桥  <--HTTPS-->  LLM
-  lib/panel.lua      终端式控制台（canvas = 滚回缓冲/命令表；提示符行 = entry 输入）
-  lib/menu.lua       命令表：纵向表格、悬浮变蓝、点击/编号/键位执行（画在 canvas 上）
-  lib/miniwindow.lua 贴边小面板：自绘图标按钮的无标题栏小窗，可拖动
-  lib/i18n.lua       中/英双语文案 + 终端内建命令词表 + 语言判定（默认中文，查表匹配）
-  lib/agent.lua      编排：协议、画布上下文、导入新文档、待发队列
-  lib/ops.lua        7 个安全算子（可撤销）
-  lib/versions.lua   内存快照 + 磁盘 .aseprite 副本
-  lib/ws.lua         WebSocket 封装（JsonObj→table、文本帧 + 二进制帧配对）
-  bridge/src/*.mjs   会话 / 请求关联 / OpenAI 兼容工具循环 / 色值库
-  bridge/vendor/     Perfect Pixel 核心（esbuild 从原仓库 src/core 打包，不动原仓库）
-```
-
-设计原则：**模型永远不产出像素**，只产出结构化算子；图像级工作交给 Perfect Pixel 的算法。

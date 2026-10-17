@@ -25,6 +25,9 @@ local util = require("lib.util")
 local i18n = require("lib.i18n")
 local menu = require("lib.menu")
 local miniwindow = require("lib.miniwindow")
+-- console 渲染（配色语义 / 折行 / 命令表）已抽到 lib/views/console.lua ——
+-- 那里是工作台主视图与这里滚回区的**同一份实现**，面板只转发，不复制。
+local viewConsole = require("lib.views.console")
 
 local panel = {}
 
@@ -65,19 +68,19 @@ local MODE_ORDER = { "panel", "bar_bottom", "bar_side", "small" }
 local SENTINEL = " "
 
 -- 终端配色
-local BG      = Color(16, 18, 22)
-local TEXT    = Color(222, 226, 232)
-local DIM     = Color(118, 126, 138)
-local USER    = Color(126, 226, 168)
-local AI      = Color(240, 244, 250)
-local THINK   = Color(152, 158, 168)
-local TOOL    = Color(128, 178, 200)
-local ERROR   = Color(255, 122, 122)
-local RULE    = Color(44, 48, 56)
-local STATUS  = Color(130, 190, 255)
-local MENU_TX = Color(214, 220, 230)
-local MENU_HL = Color(46, 134, 222)      -- 悬浮：蓝
-local MENU_HLT= Color(255, 255, 255)
+local BG      = viewConsole.BG
+local TEXT    = viewConsole.TEXT
+local DIM     = viewConsole.DIM
+local USER    = viewConsole.USER
+local AI      = viewConsole.AI
+local THINK   = viewConsole.THINK
+local TOOL    = viewConsole.TOOL
+local ERROR   = viewConsole.ERROR
+local RULE    = viewConsole.RULE
+local STATUS  = viewConsole.STATUS
+local MENU_TX = viewConsole.MENU_TX
+local MENU_HL = viewConsole.MENU_HL      -- 悬浮：蓝
+local MENU_HLT= viewConsole.MENU_HLT
 -- 栏内控件的"空槽"底色（电量条空格子 / 缩略图外框 / 滑杆轨道）
 local FRAME   = Color(58, 64, 74)
 
@@ -124,24 +127,8 @@ local ERROR_STATUS_PREFIX = {
 
 local WARN = Color(255, 196, 110)
 
-local KIND_COLOR = {
-  user  = USER,
-  ai    = AI,
-  think = THINK,
-  tool  = TOOL,
-  info  = DIM,
-  warn  = WARN,
-  error = ERROR,
-  menu  = MENU_TX,
-}
-
-local KIND_PREFIX = {
-  user  = "▸ ",
-  think = "│ ",
-  tool  = "· ",
-  warn  = "! ",
-  error = "! ",
-}
+local KIND_COLOR = viewConsole.KIND_COLOR
+local KIND_PREFIX = viewConsole.KIND_PREFIX
 
 local ROW_FACTOR = 1.55
 
@@ -1456,13 +1443,14 @@ function Panel:_printTable(rows, title, kind)
   self.menuRows = rows or {}
   self.tableTitle = title
   self.tableKind = kind or "conv"
-  self:log(title or menu.titleLine(i18n), "info")
-  local lines = menu.tableLines(self.menuRows)
-  if #lines == 0 then
+  -- 排版与"空表文案"都归 views/console.lua，这里只把行打进滚回缓冲
+  local t = viewConsole.printTable(self.menuRows, title or menu.titleLine(i18n))
+  self:log(t.title, "info")
+  if #t.lines == 0 then
     self:log(i18n.t("noCommands"), "info")
     return
   end
-  for _, l in ipairs(lines) do
+  for _, l in ipairs(t.lines) do
     self:log(l.text, "menu", { menuIndex = l.index })
   end
 end
@@ -1866,52 +1854,20 @@ end
 -- 绘制
 ----------------------------------------------------------------------
 
+-- 下面三个都是 lib/views/console.lua 的转发（那里是工作台与面板共用的唯一实现）。
+-- self.charW 仍是本面板自己的测量缓存 —— 缓存跟着 gc 走，不该跨面板共享。
 function Panel:_charWidth(gc, ch)
-  local w = self.charW[ch]
-  if w == nil then
-    local sz = gc:measureText(ch)
-    w = sz and sz.width or 0
-    if w <= 0 then w = 1 end
-    self.charW[ch] = w
-  end
-  return w
+  return viewConsole.charWidth(self.charW, gc, ch)
 end
 
--- 整串宽度：**必须整串量**。
--- 逐字 measureText 拿到的是单字"墨迹"宽，比排版推进宽度小（中文约差 10%），
--- 累加起来会让光标落在一行文字中间（实测踩过）。逐字累加只当兜底。
+-- 整串宽度：**必须整串量**（逐字累加只当兜底，见 views/console.lua 的注释）
 function Panel:_textWidth(gc, text)
-  if text == "" then return 0 end
-  local sz = gc:measureText(text)
-  if sz and sz.width and sz.width > 0 then return sz.width end
-  local w = 0
-  for _, code in utf8.codes(text) do
-    w = w + self:_charWidth(gc, utf8.char(code))
-  end
-  return w
+  return viewConsole.textWidth(self.charW, gc, text)
 end
 
 -- 按宽度折行（保留 menuIndex，让折出来的续行也能点）
 function Panel:_wrapTo(gc, text, maxW, kind, menuIndex)
-  local rows = {}
-  if text == "" then
-    return { { text = "", kind = kind, menuIndex = menuIndex } }
-  end
-  local cur, curW = {}, 0
-  for _, code in utf8.codes(text) do
-    local s = utf8.char(code)
-    local cw = self:_charWidth(gc, s)
-    if curW + cw > maxW and #cur > 0 then
-      rows[#rows + 1] = { text = table.concat(cur), kind = kind, menuIndex = menuIndex }
-      cur, curW = {}, 0
-    end
-    cur[#cur + 1] = s
-    curW = curW + cw
-  end
-  if #cur > 0 then
-    rows[#rows + 1] = { text = table.concat(cur), kind = kind, menuIndex = menuIndex }
-  end
-  return rows
+  return viewConsole.wrapTo(self.charW, gc, text, maxW, kind, menuIndex)
 end
 
 function Panel:_wrap(gc, maxW)

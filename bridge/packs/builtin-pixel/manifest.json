@@ -1,0 +1,17 @@
+{
+  "id": "builtin-pixel",
+  "name": "图像矫正",
+  "version": "1.0.0",
+  "api": 1,
+  "permissions": [],
+  "views": [],
+  "commands": [],
+  "ops": [
+    {
+      "name": "perfect_pixel"
+    }
+  ],
+  "requires": [
+    "core"
+  ]
+}

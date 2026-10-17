@@ -1,0 +1,23 @@
+{
+  "id": "builtin-style",
+  "name": "风格库",
+  "version": "1.0.0",
+  "api": 1,
+  "permissions": [],
+  "views": [],
+  "commands": [],
+  "ops": [
+    {
+      "name": "style_list"
+    },
+    {
+      "name": "style_use"
+    },
+    {
+      "name": "style_save"
+    }
+  ],
+  "requires": [
+    "core"
+  ]
+}
