@@ -426,9 +426,29 @@ end
 -- 绘制
 ----------------------------------------------------------------------
 
+-- 状态改了必须真的让宿主重绘一次 —— 只记脏标记是不够的。
+--
+-- 这一条是整块 UI 的命门：invalidate 只改 kit 的 marks，谁也不会来调 paint；
+-- 用户看到的就是「状态变了但像素不动」＝什么都点不动（真机实测：整个会话只画过一帧）。
+-- 旧面板 panel.lua 里 self:repaint() 出现 28 次，就是为了这件事。
+--
+-- 为什么可以同步调、不必自己合并：dlg:repaint() 在 Aseprite 里只是标脏，
+-- 真正的绘制发生在 UI 循环的下一帧，所以一次爆发里调 N 次只会画一帧。
 function Workbench:invalidate(region)
   if not self.kit then return end
   self.kit:invalidate(region)
+  self:_requestRepaint()
+end
+
+-- 请宿主重绘；绘制过程中再触发会自递归，用 _painting 挡掉。
+function Workbench:_requestRepaint()
+  if self._painting then return false end
+  local dlg = self.dlg
+  if not dlg then return false end
+  self.repaintCount = (self.repaintCount or 0) + 1
+  local ok, err = pcall(function() dlg:repaint() end)
+  if not ok then self.lastRepaintError = tostring(err) end
+  return ok
 end
 
 -- 五区里只有这两处会因滚动/回显失效
@@ -455,7 +475,9 @@ end
 -- 0xC000001D 退出（不是弹错误，是进程消失）。所以整帧包一层 pcall，把原因留在
 -- self.lastPaintError 上给扩展页/测试读，画面最多少一块，绝不死。
 function Workbench:paint(gc)
+  self._painting = true
   local ok, err = pcall(self._paint, self, gc)
+  self._painting = false
   if not ok then
     self.lastPaintError = tostring(err)
   else
@@ -1038,8 +1060,11 @@ function Workbench:nav(delta)
     local ok, handled = pcall(self.view.nav, self.view, delta)
     if ok and handled then
       self:invalidateMain()
+      self.lastNavError = nil
       return true
     end
+    -- 视图 nav 出错时留痕：不然"按了没反应"完全没法排查
+    if not ok then self.lastNavError = tostring(handled) end
   end
   return false
 end
@@ -1331,8 +1356,12 @@ function Workbench:mouse(kind, x, y)
     end
     -- 视图自己画的按钮（启用/停用、算子行、示例…）：交给视图处理，壳不猜语义
     if self.view and type(self.view.click) == "function" then
-      local ok = pcall(self.view.click, self.view, h)
-      if ok then return "view-click:" .. tostring(h.kind) end
+      local ok, handled = pcall(self.view.click, self.view, h)
+      if ok and handled then
+        -- 视图内部状态改了（例如扩展开关），画面必须跟着变
+        self:invalidate("main")
+        return "view-click:" .. tostring(h.kind)
+      end
     end
     return h.kind
   end
@@ -1573,7 +1602,8 @@ function Workbench:hide()
 end
 
 function Workbench:repaint()
-  if self.shown and self.dlg then pcall(function() self.dlg:repaint() end) end
+  if not (self.shown and self.dlg) then return false end
+  return self:_requestRepaint()
 end
 
 return workbench
