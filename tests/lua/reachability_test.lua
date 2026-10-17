@@ -57,6 +57,7 @@ local function fakeAgent()
   function a:send(t) self.sent[#self.sent + 1] = tostring(t); return true end
   function a:open() self.opened = (self.opened or 0) + 1 end
   function a:interrupt() self.interrupted = (self.interrupted or 0) + 1 end
+  function a:connect(quiet) self.connects = (self.connects or 0) + 1; self.lastQuiet = quiet; return true end
   function a:docName() return "001.ase" end
   return a
 end
@@ -283,7 +284,7 @@ do
   ok(total >= 10, "视图内部也枚举到足量命中区", total)
 end
 
-print("== 3. 断连态的重试按钮 ==")
+print("== 3. 断连态的重试按钮：真的调 agent:connect（不是只改本地标志）==")
 do
   local wb, agent, kernel, dlg = newWB()
   wb:setConnected(false, { reason = "bridge refused", cmd = "node x.mjs" })
@@ -291,7 +292,33 @@ do
   wb:paint(fakeGC(900, 620))
   ok(wb.retryHit ~= nil, "断连态画出了重试按钮")
   if wb.retryHit then
-    total = checkAllHits("retry", wb, agent, kernel, dlg, { { rect = wb.retryHit, kind = "retry", id = "retry" } })
+    local x, y = rectCenter(wb.retryHit)
+    local connectsBefore = agent.connects or 0
+    clickAt(wb, x, y)
+    eq((agent.connects or 0) - connectsBefore, 1, "点重试调用了 agent:connect() 一次（真的重连）")
+    ok(wb.state.busy == true, "等待结果时 state.busy=true")
+    ok(tostring(wb.state.status):find("reconnect", 1, true) ~= nil
+       or tostring(wb.state.status):find("重连", 1, true) ~= nil,
+       "状态显示「正在重连…」", wb.state.status)
+
+    -- 真实回调（ws.onOpen → panel:setStatus(...,'ok')）到达后，断连态要自己收掉
+    wb:setStatus("connected", "ok")
+    eq(wb.state.connected, true, "真实回调把 connected 改回 true")
+    wb:setBusy(false)
+    wb:invalidate()
+    wb:paint(fakeGC(900, 620))
+    eq(wb.retryHit, nil, "连上后红条与重试按钮消失")
+  end
+
+  -- 没有 connect 入口时不许假装成功
+  local wb2, agent2, kernel2, dlg2 = newWB({})
+  agent2.connect = nil
+  wb2:setConnected(false, { reason = "x", cmd = "y" })
+  wb2:invalidate(); wb2:paint(fakeGC(900, 620))
+  if wb2.retryHit then
+    local x, y = rectCenter(wb2.retryHit)
+    clickAt(wb2, x, y)
+    ok(wb2.state.connected == false, "没有 connect 入口时不假装连上")
   end
 end
 

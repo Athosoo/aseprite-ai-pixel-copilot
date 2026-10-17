@@ -81,7 +81,9 @@ ok(#viewSpecs >= 7, "core 包注册了 7 个视图规格", #viewSpecs)
 ok(kernel.registry:get("view", "packs") ~= nil, "registry 里有 packs 视图规格")
 ok(kernel.registry:get("view", "console") ~= nil, "registry 里有 console 视图规格")
 
-local agent = { docName = function() return "001.ase" end }
+local agent = { docName = function() return "001.ase" end, connects = 0 }
+function agent:connect(quiet) self.connects = self.connects + 1; return true end
+function agent:sendChat(text) self.lastChat = text; return true end
 local wb = workbench.new({ width = 900, height = 620 })
 wb:mount(kernel, agent)
 wb:setSize(900, 620)
@@ -193,7 +195,12 @@ do
   ok(wb.retryHit ~= nil, "断连时画出了重试按钮")
   local x, y = rectCenter(wb.retryHit)
   clickAt(x, y)
-  eq(wb.state.connected, true, "点重试回到已连接")
+  -- 重试必须真的重连：connect 被调用一次，状态等真实回调
+  eq(wb.state.busy, true, "点重试后进入「正在重连」的 busy 态")
+  eq((agent.connects or 0), 1, "调用了 agent:connect 一次")
+  wb:setStatus("connected", "ok")
+  wb:setBusy(false)
+  eq(wb.state.connected, true, "真实回调把状态改回已连接")
 end
 
 print("== 8. 视图内按钮点得动（扩展页的启用/停用）==")

@@ -118,6 +118,16 @@ end
 -- 消息 / 状态
 ----------------------------------------------------------------------
 
+-- 重连：适配层只转给 agent:connect（连接不在面板手里）。
+-- 有这条，工作台的「重试」就能"经适配层"走真实重连，而不是只改本地标志。
+function Adapter:connect(quiet)
+  local a = self.agent
+  if a and type(a.connect) == "function" then
+    return (pcall(a.connect, a, quiet))
+  end
+  return self:_noop("connect")
+end
+
 function Adapter:log(text, kind, meta)
   return self:_run("log", function() return self.wb:log(text, kind, meta) end)
 end

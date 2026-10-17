@@ -1331,10 +1331,43 @@ function Workbench:setDoc(doc)
   return doc
 end
 
-function Workbench:setStatus(status)
+function Workbench:setStatus(status, kind)
   self.state.status = status
+  -- connected 跟着**真实回调**走：agent:connect 成功后 ws.onOpen 会发 setStatus(...,"ok")，
+  -- 失败走 "error"。不然重连接上了、红条还挂在上面。
+  if kind == "ok" then
+    self.state.connected = true
+    self.state.reason = nil
+    self:invalidate("main")
+  elseif kind == "error" or kind == "err" then
+    self.state.connected = false
+    self:invalidate("main")
+  end
   self:invalidate("titlebar")
   return status
+end
+
+-- 断连红条的「重试」：**真的重连**（之前只改本地标志，桥起来了也没用）。
+-- 走适配层/agent 的 connect()；结果由真实回调更新状态，这里先显示"正在重连…"。
+function Workbench:retryConnect()
+  local a = self.agent
+  local panel = a and a.panel or nil
+  local ok = false
+  if panel and type(panel.connect) == "function" then
+    ok = pcall(panel.connect, panel, true) and true or false
+  elseif a and type(a.connect) == "function" then
+    ok = pcall(a.connect, a, true) and true or false
+  end
+  if ok then
+    local text = i18n.isZh() and "正在重连…" or "reconnecting..."
+    self.state.reconnecting = true
+    self:setBusy(true, text)
+    self:invalidate("main")
+    return "retry"
+  end
+  self:log(i18n.isZh() and "没有可用的连接入口（agent:connect 不可用）"
+                         or "no connect() available on the agent", "warn")
+  return "retry-failed"
 end
 
 ----------------------------------------------------------------------
@@ -1486,8 +1519,7 @@ function Workbench:mouse(kind, x, y)
     elseif h.kind == "new" then
       return self:railNew()
     elseif h.kind == "retry" then
-      self:setConnected(true)
-      return "retry"
+      return self:retryConnect()
     elseif h.kind == "composer" then
       return self:composerAction(h.id)
     elseif h.kind == "action" then

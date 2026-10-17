@@ -151,9 +151,10 @@ local function fakeLedger(packs, health)
 end
 
 local function fakeAgent()
-  local a = { sent = {}, interrupted = 0 }
+  local a = { sent = {}, interrupted = 0, connects = 0 }
   function a:send(t) self.sent[#self.sent + 1] = t; return true end
   function a:interrupt() self.interrupted = self.interrupted + 1; return true end
+  function a:connect(quiet) self.connects = self.connects + 1; return true end
   return a
 end
 
@@ -744,8 +745,19 @@ do
     if c.op == "fill" and c.tone == "err" and c.w <= 4 then errBand = true end
   end
   ok(errBand, "断连：红条用 err 色（状态永远可见）")
-  eq(wb:mouse("click", wb.retryHit.x + 2, wb.retryHit.y + 2), "retry", "点重试回到已连接")
-  eq(wb.state.connected, true, "重试后状态回到已连接")
+  -- 重试 = 真的重连（调 agent:connect），不是把本地标志改成 true
+  local connAgent = wb.agent
+  local beforeConnects = connAgent.connects or 0
+  eq(wb:mouse("click", wb.retryHit.x + 2, wb.retryHit.y + 2), "retry", "点重试发起了重连")
+  eq((connAgent.connects or 0) - beforeConnects, 1, "调用了 agent:connect 一次")
+  eq(wb.state.busy, true, "等待结果时是 busy（显示正在重连）")
+  -- 真实回调到达后才算连上
+  wb:setStatus("connected", "ok")
+  wb:setBusy(false)
+  eq(wb.state.connected, true, "真实回调把状态改回已连接")
+  wb:invalidate()
+  wb:paint(fakeGC(900, 620))
+  eq(wb.retryHit, nil, "连上后红条消失")
 end
 
 print("== 扩展页空状态 ==")

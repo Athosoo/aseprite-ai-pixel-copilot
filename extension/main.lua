@@ -105,25 +105,123 @@ local function ensureAgent()
   return state.agent
 end
 
--- 后台拉起本地桥（端口已被占用时，新进程会自己安静退出）
-local function startBridge()
-  local entry = bridgeEntry()
+-- ---- 找 node ------------------------------------------------------------
+-- 为什么不能只写裸 node：Aseprite 从图形界面启动时，PATH 未必带 Node（很多机器
+-- 装了 Node 但只在用户 PATH 或默认安装目录里）。找不到就说清楚试过哪些地方。
+local sep = IS_WINDOWS and "\\" or "/"
+
+function resolveNode(deps)
+  deps = deps or {}
+  local exists = deps.exists or function(p)
+    local f = io.open(p, "rb")
+    if f then f:close(); return true end
+    return false
+  end
+  local env = deps.env or function(k) return os.getenv(k) end
+  local tried = {}
+
+  local names = IS_WINDOWS and { "node.exe", "node.cmd", "node.bat" } or { "node" }
+
+  -- 1) PATH 里的 node（自己拆 PATH：io.open("node.exe") 找不到 PATH 上的东西）
+  local pathVar = env("PATH") or ""
+  local sepChar = IS_WINDOWS and ";" or ":"
+  for dir in string.gmatch(pathVar, "[^" .. sepChar .. "]+") do
+    for _, name in ipairs(names) do
+      local cand = dir:gsub("[\\/]+$", "") .. sep .. name
+      tried[#tried + 1] = cand
+      if exists(cand) then return cand, nil, tried end
+    end
+  end
+
+  -- 2) 官方安装的默认目录
+  local pf = env("ProgramFiles")
+  if pf and pf ~= "" then
+    local cand = pf .. sep .. "nodejs" .. sep .. "node.exe"
+    tried[#tried + 1] = cand
+    if exists(cand) then return cand, nil, tried end
+  end
+
+  -- 3) 用户级安装（官方 zip / nvs / winget 都落在这里）
+  local lad = env("LOCALAPPDATA")
+  if lad and lad ~= "" then
+    local cand = lad .. sep .. "Programs" .. sep .. "nodejs" .. sep .. "node.exe"
+    tried[#tried + 1] = cand
+    if exists(cand) then return cand, nil, tried end
+  end
+
+  return nil, "找不到 node（试过 PATH、ProgramFiles\\nodejs、LOCALAPPDATA\\Programs\\nodejs）", tried
+end
+
+-- ---- 端口探测 -----------------------------------------------------------
+-- 桥已经在跑时再起一个只会撞端口、多一个立刻退出的 node 进程。
+-- netstat 的输出里只有 LISTENING 行才算"有桥在听"（TIME_WAIT 之类不算）。
+function portInUse(port, deps)
+  port = tonumber(port) or 8777
+  deps = deps or {}
+  local tmp = deps.tmpPath or ((os.getenv("TEMP") or ".") .. "/ai-pixel-copilot-port-" .. port .. ".tmp")
+  local cmd = string.format('netstat -ano | findstr ":%d" > "%s" 2>nul', port, tmp)
+  local ok = pcall(function()
+    if deps.run then return deps.run(cmd) end
+    return os.execute(cmd)
+  end)
+  if not ok then return false, "netstat 执行失败" end
+
+  local text = ""
+  if deps.output ~= nil then
+    text = tostring(deps.output)
+  else
+    local f = io.open(tmp, "rb")
+    if f then text = f:read("*a") or ""; f:close() end
+    pcall(function() os.remove(tmp) end)
+  end
+
+  for line in text:gmatch("[^\r\n]+") do
+    if line:find("LISTENING", 1, true) ~= nil and line:find(":" .. port, 1, true) ~= nil then
+      return true, "端口 " .. port .. " 已有进程在监听"
+    end
+  end
+  return false
+end
+
+-- 后台拉起本地桥。返回 state, detail：
+--   "already" 桥已在监听（不重复起） / "started" 已拉起 / "failed" 起不来（detail 说原因）
+function startBridge(deps)
+  deps = deps or {}
+  -- 先看端口：已经在跑就根本不需要桥入口，更不该再起一个
+  local busy = deps.portBusy
+  if busy == nil then busy = portInUse(CFG.port, deps) end
+  if busy then
+    return "already", "端口 " .. tostring(CFG.port) .. " 已有桥在监听，跳过启动"
+  end
+
+  local entry = deps.entry or bridgeEntry()
   if not entry then
-    return false, "找不到本地桥"
+    return "failed", "找不到本地桥入口（扩展里没有 bridge/dist/bridge.mjs，也没有 __project.lua）"
+  end
+
+  local nodePath, nodeErr = resolveNode(deps)
+  if not nodePath then
+    return "failed", tostring(nodeErr) .. "；装好 Node.js 18+ 后重开面板，或手动起桥: " ..
+      string.format('"%s" "%s"', "node", entry)
   end
 
   local cmd
   if IS_WINDOWS then
-    -- start /MIN：另开一个最小化的窗口，不抢焦点
-    cmd = string.format('start "AI-Pixel-Bridge" /MIN cmd /c node "%s"', entry)
+    -- start /MIN：另开一个最小化的窗口，不抢焦点；标题占位是 start 的语法要求
+    cmd = string.format('start "AI-Pixel-Bridge" /MIN "%s" "%s"', nodePath, entry)
   else
-    -- nohup + &：脱离父进程在后台跑，输出留个日志方便排查
-    local log = CFG.projectDir .. "/bridge/bridge.log"
-    cmd = string.format('nohup node "%s" >> "%s" 2>&1 &', entry, log)
+    local log = (CFG.projectDir or ".") .. "/bridge/bridge.log"
+    cmd = string.format('nohup "%s" "%s" >> "%s" 2>&1 &', nodePath, entry, log)
   end
 
-  local ok, err = pcall(function() os.execute(cmd) end)
-  return ok, err
+  local ok, rc = pcall(function()
+    if deps.run then return deps.run(cmd) end
+    return os.execute(cmd)
+  end)
+  if not ok then
+    return "failed", "拉起桥的命令执行失败: " .. tostring(rc)
+  end
+  return "started", "已拉起桥（node = " .. nodePath .. "）"
 end
 
 -- 工作台（T2 的 lib.workbench）：它没落地时回落到旧面板，三路并行谁也别等谁。
@@ -259,6 +357,15 @@ function presentUi(a, mode, forceWorkbench, wbModule)
   return "legacy"
 end
 
+-- 工作台只画状态、不负责连；旧面板在 a:open() 里已经连过了。
+-- 少了这一步，默认走工作台时根本没人发起连接 —— 正是"无法连接桥"的一半原因。
+function connectIfNeeded(a, uiPath)
+  if uiPath == "legacy" then return false end
+  if not (a and type(a.connect) == "function") then return false end
+  pcall(function() a:connect(true) end)
+  return true
+end
+
 -- 面板 + 桥：两个入口（主面板 / 小面板）共用
 local function openPanel(andThen, forceWorkbench)
   local a, aerr = ensureAgent()
@@ -276,14 +383,19 @@ local function openPanel(andThen, forceWorkbench)
     a.panel:log("        powershell -ExecutionPolicy Bypass -File install.ps1", "info")
     a.panel:log("   另外确认系统装了 Node.js 18+（node --version）", "info")
   elseif CFG.autoStartBridge then
-    local ok, err = startBridge()
-    if not ok then
-      a.panel:log("!! 本地桥没起来: " .. tostring(err), "error")
-      a.panel:log("   可以手动起: " .. bridgeHint(), "info")
+    local state, detail = startBridge()
+    if state == "failed" then
+      a.panel:log("!! 本地桥没起来: " .. tostring(detail), "error")
+      a.panel:log("   手动起: " .. bridgeHint(), "info")
+    elseif state == "already" then
+      a.panel:log(tostring(detail) .. "，直接连接", "info")
+    else
+      a.panel:log(tostring(detail), "info")
     end
   end
 
-  presentUi(a, readUiMode(CFG.extPath), forceWorkbench == true)
+  local uiPath = presentUi(a, readUiMode(CFG.extPath), forceWorkbench == true)
+  connectIfNeeded(a, uiPath)
   if andThen then pcall(andThen, a) end
   return a
 end

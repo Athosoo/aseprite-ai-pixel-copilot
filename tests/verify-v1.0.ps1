@@ -31,7 +31,7 @@ $luaTests = @(
   'tests\lua\panel_test.lua','tests\lua\ws_test.lua',
   'tests\lua\kernel_test.lua','tests\lua\kit_test.lua','tests\lua\e2e_pack_test.lua',
   'tests\lua\panel_contract_test.lua','tests\lua\workbench_click_test.lua',
-  'tests\lua\integration_wiring_test.lua','tests\lua\entry_input_test.lua'
+  'tests\lua\integration_wiring_test.lua','tests\lua\entry_input_test.lua','tests\lua\bridge_retry_test.lua'
 )
 
 $rows = @(); $sumP = 0; $sumF = 0

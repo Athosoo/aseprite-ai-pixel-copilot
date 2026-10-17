@@ -1,0 +1,19 @@
+fix: bridge connection actually happens, retries, and finds node
+
+Three causes stacked:
+1. after the default UI switched to the workbench, nothing called agent:connect
+   at all - the old panel connected inside a:open(), the workbench only painted
+   the status. So the default UI never even attempted a connection.
+2. Agent:connect connected once and gave up; the bridge takes a second or two to
+   listen after startBridge, so the first attempt was always refused.
+3. startBridge used bare "node" and never checked whether a bridge was already
+   listening.
+
+now: connectIfNeeded() starts the chain for the workbench; connect() runs a
+1s x 6 backoff with single-flight scheduling, ignored late callbacks from old
+connections and a readable conclusion when exhausted; resolveNode tries PATH,
+ProgramFiles and LOCALAPPDATA; portInUse skips starting a second bridge; the
+workbench retry button calls the real connect and the status line follows real
+callbacks.
+
+bridge_retry_test 54 new. Lua 1919/0.

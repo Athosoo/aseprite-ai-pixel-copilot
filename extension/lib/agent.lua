@@ -292,12 +292,83 @@ function Agent:url()
   return "ws://127.0.0.1:" .. tostring(self.cfg.port or 8777)
 end
 
+-- ---- 连接重试 ----------------------------------------------------------
+-- 为什么必须重试：桥是 main.lua 异步拉起来的（start /MIN cmd /c node …），
+-- 真正开始监听要 1~2 秒。面板一打开就连必然被拒 —— 只连一次的结果就是
+-- 永久停在"未连接"，用户看到的就是"无法连接桥"。
+local RETRY_DELAY = 1.0
+local RETRY_MAX = 6
+
+agent.connectRetryDefaults = { delay = RETRY_DELAY, max = RETRY_MAX }
+
+local function defaultAfter(seconds, fn)
+  local ok, timer = pcall(function()
+    local t = Timer{ interval = seconds, ontick = function(self2) self2:stop(); fn() end }
+    t:start()
+    return t
+  end)
+  if ok then return timer end
+  return nil
+end
+
+function Agent:_retryPolicy()
+  local c = (self.cfg and self.cfg.connectRetry) or {}
+  return tonumber(c.delay) or RETRY_DELAY, tonumber(c.max) or RETRY_MAX
+end
+
+-- 只清"排队中的下一次尝试"与在途回调，不动"还剩几次"
+function Agent:_cancelTimer()
+  self._retryToken = (self._retryToken or 0) + 1
+  local h = self._retryHandle
+  self._retryHandle = nil
+  if h and h ~= true then
+    if self.cfg and type(self.cfg.cancelTimer) == "function" then
+      pcall(self.cfg.cancelTimer, h)
+    else
+      pcall(function() h:stop() end)
+    end
+  end
+end
+
+function Agent:cancelRetry()
+  self:_cancelTimer()
+  self._retryLeft = 0
+  self._retrying = false
+end
+
+-- 对外入口：连一次失败就按退避重试，连上即停。面板/工作台的"重试"也走这里。
 function Agent:connect(quiet)
-  if self.conn and self.conn:isOpen() then return end
+  self:_cancelTimer()
+  local _, max = self:_retryPolicy()
+  self._retryLeft = max
+  self._retrying = true
+  self._retryQuiet = quiet and true or false
+  self:_attempt(quiet)
+end
+
+function Agent:_attempt(quiet)
+  self:_cancelTimer()
+  if self.conn and self.conn:isOpen() then
+    self:cancelRetry()
+    return
+  end
+  if self.conn then
+    pcall(function() self.conn:close() end)
+    self.conn = nil
+  end
+
+  -- 每次尝试一个 id：旧 conn 的迟到回调（onClose/onError）不许再排下一次
+  self._attemptId = (self._attemptId or 0) + 1
+  local attemptId = self._attemptId
+  local function current() return attemptId == self._attemptId end
+
   self.panel:setStatus(string.format(i18n.t("connecting"), self:url()), "busy", self:docName())
 
-  self.conn = ws.connect(self:url(), {
+  local wsMod = (self.cfg and self.cfg.ws) or ws
+  local conn = wsMod.connect(self:url(), {
     onOpen = function()
+      if not current() then return end
+      self:cancelRetry()                     -- 连上即停，别再排下一次
       self.panel:setStatus(i18n.t("connected"), "ok", self:docName())
       self.panel:log(string.format(i18n.t("bridged"), self:url()), "info")
       self:send{
@@ -311,19 +382,61 @@ function Agent:connect(quiet)
       self:flushPendingChats()
       self:flushPendingFixes()
     end,
-    onText = function(msg) self:onMessage(msg) end,
-    onBinary = function(header, data) self:onBinary(header, data) end,
-    onClose = function() self.panel:setStatus(i18n.t("disconnected"), "error") end,
+    onText = function(msg) if current() then self:onMessage(msg) end end,
+    onBinary = function(header, data) if current() then self:onBinary(header, data) end end,
+    onClose = function()
+      if not current() then return end
+      self.panel:setStatus(i18n.t("disconnected"), "error")
+      if self._retrying then self:_scheduleNextAttempt() end
+    end,
     onError = function(err)
-      self.panel:setStatus(i18n.t("connError"), "error")
-      self.panel:log(string.format(i18n.t("connErrorDetail"), tostring(err)), "error")
+      if not current() then return end
+      if self._retrying then
+        -- 重试期间失败是预期的（桥还没监听），别刷成红色错误
+        self.panel:log(string.format(i18n.t("connErrorDetail"), tostring(err)), "info")
+        self:_scheduleNextAttempt()
+      else
+        self.panel:setStatus(i18n.t("connError"), "error")
+        self.panel:log(string.format(i18n.t("connErrorDetail"), tostring(err)), "error")
+      end
     end,
   })
+  self.conn = conn
 
   if not quiet then
     self.panel:log(i18n.t("connectingLong"), "info")
     self.panel:log("  " .. tostring(self.cfg.bridgeHint or "node bridge/src/server.mjs"), "info")
   end
+end
+
+function Agent:_scheduleNextAttempt()
+  if self._retryHandle then return end        -- onError 与 onClose 可能都来，只排一次
+  local delay, max = self:_retryPolicy()
+  local left = self._retryLeft or 0
+  if left <= 1 then
+    self._retrying = false
+    self._retryLeft = 0
+    self.panel:setStatus(i18n.t("connError"), "error")
+    self.panel:log(string.format("!! %d 次尝试都没连上桥（%s）。", max, self:url()), "error")
+    self.panel:log("   桥可能还没起来，或 Node.js 没装（node --version 能查）。", "error")
+    self.panel:log("   确认后在命令表里执行「重连」再试一次。", "error")
+    self.panel:log("   手动起桥: " .. tostring(self.cfg and self.cfg.bridgeHint or "node bridge/src/server.mjs"), "info")
+    return
+  end
+  self._retryLeft = left - 1
+  local attemptNo = max - self._retryLeft
+  self.panel:log(string.format("桥还没就绪，%.0f 秒后重试（第 %d/%d 次）…", delay, attemptNo, max), "info")
+
+  local token = self._retryToken or 0
+  local after = (self.cfg and type(self.cfg.after) == "function") and self.cfg.after or defaultAfter
+  local quiet = self._retryQuiet
+  self._retryHandle = true                    -- 占位，防止 after 同步触发时重复排队
+  local handle = after(delay, function()
+    if (self._retryToken or 0) ~= token then return end
+    self._retryHandle = nil
+    self:_attempt(quiet)
+  end)
+  if self._retryHandle == true then self._retryHandle = handle end
 end
 
 function Agent:send(tbl)
@@ -1455,6 +1568,7 @@ end
 ----------------------------------------------------------------------
 
 function Agent:destroy()
+  self:cancelRetry()          -- 面板/扩展关掉时别留一个还在跑的定时器
   if self.conn then self.conn:close() end
   if self.settings then self.settings:destroy() end
   if self.panel then self.panel:destroy() end
