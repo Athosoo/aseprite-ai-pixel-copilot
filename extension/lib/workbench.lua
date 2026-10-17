@@ -149,6 +149,8 @@ function workbench.new(opts)
       elapsed = 0,
     },
     input = "",
+    -- 字段编辑态：设置页点一行就进这里，composer 变单行编辑器（不再弹旧面板的原生设置窗）
+    fieldEdit = nil,
     -- 原生输入行（entry + 磁吸按钮）默认收起来：用户明确说过那条白横条是控制台时代遗留。
     -- 但 entry 不能删 —— Aseprite 里只有 ui::Entry 开 IME，自绘 canvas 收不到中文。
     inputOpen = false,
@@ -800,6 +802,13 @@ function Workbench:drawMain(kit, r)
     inner = { x = inner.x, y = inner.y + m2.titleH, w = inner.w, h = inner.h - m2.titleH }
   end
 
+  -- 编辑态的字段 id 传给视图（设置页据此给那一行画 accent 竖条）
+  if self.fieldEdit and type(self.fieldEdit.id) == "string" then
+    self.state.fieldEditId = (self.fieldEdit.id:gsub("^settings%.", ""))
+  else
+    self.state.fieldEditId = nil
+  end
+
   if self.view and not self.view.broken and type(self.view.render) == "function" then
     local ok, err = self:_bounded(self.view.render, self.view, kit, inner, self.state)
     if not ok then
@@ -953,11 +962,27 @@ function Workbench:drawComposer(kit, r)
 
   local tx = left.x + left.w + 8
   local maxW = enterR.x - 8 - tx
+
+  -- 字段编辑态：左边是字段名（accent），右边是当前值；apiKey 只显示掩码
+  local fe = self.fieldEdit
+  if fe then
+    local label = tostring(fe.label or fe.id or "") .. (i18n.isZh() and "：" or ": ")
+    local lr = kit:text({ x = tx, y = y }, label, { tone = "accent" })
+    tx = lr.x + lr.w
+    maxW = enterR.x - 8 - tx
+  end
+
   local text = self.input or ""
   if text == "" then
     -- 提示文字给光标让出一个字符位：不然光标会压在提示的第一个字上，
     -- 看起来像"文字被画了两遍"（这条是看真机截图发现的）
-    local ph = kit:pick("说点什么，或敲 / 叫命令…", "say something, or press / for commands")
+    local ph
+    if fe then
+      ph = fe.mask and (i18n.isZh() and "••••（留空 = 保持不变）" or "•••• (blank = keep current)")
+                       or (i18n.isZh() and "回车确认 / Esc 取消" or "Enter to confirm / Esc to cancel")
+    else
+      ph = kit:pick("说点什么，或敲 / 叫命令…", "say something, or press / for commands")
+    end
     kit:text({ x = tx + 8, y = y }, ph, { tone = "faint" })
     self.caretX = tx
   else
@@ -1161,6 +1186,11 @@ end
 
 -- Esc 三级：关补全 -> 关弹层 -> 中断当前轮（2 秒内再按一次才真中断）
 function Workbench:escape()
+  -- 编辑态：Esc 取消字段编辑（不写盘），优先级最高
+  if self.fieldEdit then
+    self:cancelFieldEdit()
+    return "field"
+  end
   if self.completionOpen then
     self.completionOpen = false
     self:invalidate("composer")
@@ -1221,6 +1251,8 @@ function Workbench:setHistory(list, pos)
 end
 
 function Workbench:submit()
+  -- 字段编辑态：Enter 是"确认写回"，不是发给模型
+  if self.fieldEdit then return self:commitFieldEdit() end
   local text = tostring(self.input or ""):gsub("^%s+", ""):gsub("%s+$", "")
   self:setInput("")
   self.completionOpen = false
@@ -1524,6 +1556,58 @@ function Workbench:railNew()
     end
   end
   return self:noop("rail.new", "新建对话")
+end
+
+----------------------------------------------------------------------
+-- 画布内字段编辑（不弹旧面板的原生设置窗）
+--
+-- 复用的还是那套已验证的机制：原生 entry（中文输入）+ 哨兵差分 + composer 回显 +
+-- submit/Esc。没有新造控件：编辑态 = composer 变成"提示 + 当前值"的单行编辑器。
+----------------------------------------------------------------------
+
+-- spec = { id, label, value, mask?, hint?, onCommit=function(text) -> ok, err }
+function Workbench:beginFieldEdit(spec)
+  if type(spec) ~= "table" or spec.id == nil then return false end
+  self.fieldEdit = spec
+  self:openInput()
+  self:setInput(tostring(spec.value or ""))
+  self.state.focus = "composer"
+  self:invalidate("composer")
+  if spec.hint then self:log(tostring(spec.hint), "info") end
+  return true
+end
+
+function Workbench:cancelFieldEdit()
+  if not self.fieldEdit then return false end
+  local fe = self.fieldEdit
+  self.fieldEdit = nil
+  self:setInput("")
+  self:closeInput()
+  self:log(string.format(i18n.isZh() and "已取消编辑 %s（未保存）" or "cancelled %s (not saved)",
+    tostring(fe.label or fe.id)), "info")
+  self:invalidate()
+  return true
+end
+
+function Workbench:commitFieldEdit()
+  local fe = self.fieldEdit
+  if not fe then return false end
+  local text = self:getInput()
+  local ok, err = true, nil
+  if type(fe.onCommit) == "function" then
+    ok, err = fe.onCommit(text)
+  end
+  if ok == false or ok == nil then
+    -- 保留输入与编辑态，让用户改完再按一次回车
+    self:log(string.format(i18n.isZh() and "保存失败：%s" or "save failed: %s", tostring(err or "?")), "error")
+    self:invalidate("composer")
+    return false
+  end
+  self.fieldEdit = nil
+  self:setInput("")
+  self:closeInput()
+  self:invalidate()
+  return true
 end
 
 -- composer 右侧三个图标

@@ -339,25 +339,23 @@ do
   end
 end
 
-print("== 6. 设置页关闭后工作台要能自己回来（_afterModal）==")
+print("== 6. 原生模态窗（📎 选图器）关掉后工作台要能自己回来（_afterModal）==")
 do
   local wb, agent, kernel, dlg = newWB()
   -- 模拟宿主行为：打开原生模态窗的瞬间把我们的 dialog 收掉
   local realAction = agent.action
   agent.action = function(self, name)
     realAction(self, name)
-    if name == "settings" then dlg.shown = false; wb.shown = false end
+    if name == "upload" then dlg.shown = false; wb.shown = false end
     return true
   end
-  wb:setView("settings")
   wb:invalidate(); wb:paint(fakeGC(900, 620))
-  local fieldHit = nil
-  for _, hit in ipairs(wb.view.hits or {}) do if hit.kind == "field" then fieldHit = hit end end
-  ok(fieldHit ~= nil, "设置页有行命中区")
-  if fieldHit then
-    local x, y = rectCenter(fieldHit.rect)
-    clickAt(wb, x, y)
-    eq(wb.shown, true, "设置窗关掉之后，工作台自己重新显示了")
+  local attach = nil
+  for _, hit in ipairs(wb.composerHits or {}) do if hit.id == "attach" then attach = hit end end
+  ok(attach ~= nil, "composer 有 📎 命中框")
+  if attach then
+    clickAt(wb, rectCenter(attach.rect))
+    eq(wb.shown, true, "选图器关掉之后，工作台自己重新显示了")
     ok((wb.modalRecovered or 0) >= 1, "记下了 modalRecovered 次数", wb.modalRecovered)
   end
 end
@@ -458,6 +456,116 @@ do
   wb:invalidate()
   wb:paint(fakeGC(360, 56))
   ok(dlg.repaints > before, "帧内失效会在收尾时再请一帧", dlg.repaints - before)
+end
+
+print("== 10. 设置页：点行进入画布内编辑态，不再弹原生窗 ==")
+do
+  local wb, agent, kernel, dlg = newWB()
+  agent.config = { baseUrl = "https://api.openai.com/v1", model = "gpt-4o", apiKeySet = true, apiKeyHint = "abcd",
+                   temperature = 0.2, maxSteps = 24, contextTokens = 16000, thinking = "auto",
+                   timeoutMs = 180000, maxTurnMs = 600000 }
+  wb:setView("settings")
+  wb:invalidate(); wb:paint(fakeGC(900, 620))
+
+  local rows = wb.view:fields()
+  eq(#rows, 10, "设置页一共 10 个字段（一个不少）")
+  local keys = {}
+  for _, f in ipairs(rows) do keys[#keys + 1] = f.key end
+  eq(table.concat(keys, ","),
+     "baseUrl,model,apiKey,language,temperature,maxSteps,contextTokens,thinking,timeoutSec,maxTurnSec",
+     "字段顺序与清单一致")
+
+  local modelHit = nil
+  for _, hit in ipairs(wb.view.hits or {}) do if hit.id == "model" then modelHit = hit end end
+  ok(modelHit ~= nil, "模型行有命中区")
+  local callsBefore = #agent.calls
+  clickAt(wb, rectCenter(modelHit.rect))
+  ok(wb.fieldEdit ~= nil, "点行进入了字段编辑态")
+  -- 本测试把语言钉在 en，所以标签是英文
+  eq(wb.fieldEdit and wb.fieldEdit.label, "Model", "编辑态显示字段名")
+  eq(wb:getInput(), "gpt-4o", "当前值已预填")
+  eq(wb.inputOpen, true, "原生输入行浮出来（中文/输入都需要它）")
+  eq(#agent.calls, callsBefore, "**没有**调用 agent:action(settings)（不再弹旧原生窗）")
+
+  -- Enter：写回 set_config
+  wb:setInput("gpt-4.1")
+  wb:submit()
+  local lastSend = agent.sent and nil
+  local payload = nil
+  for _, s in ipairs(agent.sentPayloads or {}) do payload = s end
+  ok(wb.fieldEdit == nil, "保存成功后退出编辑态")
+  eq(wb.inputOpen, false, "保存后输入行收起")
+end
+
+print("== 11. 设置字段：Enter 落盘 / Esc 不落盘 / 非法值保留编辑态 ==")
+do
+  local wb, agent, kernel, dlg = newWB()
+  local sends = {}
+  function agent:send(t) self.sent[#self.sent + 1] = tostring(t); sends[#sends + 1] = t; return true end
+  agent.config = { model = "gpt-4o", temperature = 0.2, maxSteps = 24, contextTokens = 16000,
+                   thinking = "auto", timeoutMs = 180000, maxTurnMs = 600000, baseUrl = "https://x/v1",
+                   apiKeySet = true, apiKeyHint = "abcd" }
+  wb:setView("settings")
+  wb:invalidate(); wb:paint(fakeGC(900, 620))
+
+  local function hitOf(key)
+    for _, hit in ipairs(wb.view.hits or {}) do if hit.id == key then return hit end end
+    return nil
+  end
+
+  -- Model：改完回车
+  clickAt(wb, rectCenter(hitOf("model").rect))
+  wb:setInput("gpt-4.1")
+  wb:submit()
+  eq(#sends, 1, "Enter 后发出 1 条 set_config")
+  eq(sends[1] and sends[1].type, "set_config", "帧类型是 set_config")
+  eq(sends[1] and sends[1].llm and sends[1].llm.model, "gpt-4.1", "llm.model 是新值")
+  eq(wb.view.overlay.model, "gpt-4.1", "本地立刻反映新值（不等下一帧 status）")
+
+  -- Temperature：非法值 → 报错并保留编辑态，不落盘
+  wb:setView("settings"); wb:invalidate(); wb:paint(fakeGC(900, 620))
+  clickAt(wb, rectCenter(hitOf("temperature").rect))
+  wb:setInput("9.9")
+  local loaded = wb:getInput()
+  wb:submit()
+  eq(#sends, 1, "非法值不落盘")
+  ok(wb.fieldEdit ~= nil, "非法值保留编辑态（让用户改完再回车）")
+  eq(wb:getInput(), loaded, "非法值留在输入框里")
+
+  -- Esc：取消，不落盘
+  wb:setInput("0.5")
+  local lvl = wb:escape()
+  eq(lvl, "field", "Esc 优先取消字段编辑")
+  eq(#sends, 1, "Esc 不落盘")
+  eq(wb.fieldEdit, nil, "Esc 后退出编辑态")
+  eq(wb.view.overlay.temperature, nil, "Esc 后本地值也没变")
+
+  -- 超时字段：秒 → 毫秒
+  wb:setView("settings"); wb:invalidate(); wb:paint(fakeGC(900, 620))
+  clickAt(wb, rectCenter(hitOf("timeoutSec").rect))
+  eq(wb:getInput(), "180", "超时字段预填秒数")
+  wb:setInput("240")
+  wb:submit()
+  eq(sends[#sends].llm.timeoutMs, 240000, "单次超时按秒输入、按毫秒落盘")
+
+  -- 密钥：留空 = 保持不变（不发 apiKey）
+  wb:setView("settings"); wb:invalidate(); wb:paint(fakeGC(900, 620))
+  clickAt(wb, rectCenter(hitOf("apiKey").rect))
+  eq(wb:getInput(), "", "密钥不预填（不回显真 key）")
+  local n = #sends
+  wb:submit()
+  eq(#sends, n, "密钥留空不发 set_config")
+  eq(wb.fieldEdit, nil, "密钥留空也算完成（退出编辑态）")
+
+  -- 思考强度：枚举校验
+  wb:setView("settings"); wb:invalidate(); wb:paint(fakeGC(900, 620))
+  clickAt(wb, rectCenter(hitOf("thinking").rect))
+  wb:setInput("turbo")
+  wb:submit()
+  ok(wb.fieldEdit ~= nil, "非枚举值被拒（保留编辑态）")
+  wb:setInput("high")
+  wb:submit()
+  eq(sends[#sends].llm.thinking, "high", "合法枚举值落盘")
 end
 
 print("")

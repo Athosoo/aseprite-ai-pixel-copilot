@@ -411,10 +411,12 @@ do
   eq(w.legacyMode, true, "记下了 legacyMode")
 end
 
-print("== 12. 设置页：点任意一项 → 打开原生设置窗 ==")
+print("== 12. 设置页：点任意一项 → 进入画布内编辑态（不再弹旧原生窗）==")
 do
   local actions = {}
   local a = { docName = function() return "001.ase" end,
+              config = { model = "gpt-4o", baseUrl = "https://x/v1", temperature = 0.2 },
+              send = function() return true end,
               action = function(self, name) actions[#actions + 1] = name; return true end }
   local w = workbench.new({ width = 900, height = 620, viewId = "settings" })
   w:mount(nil, a)
@@ -445,7 +447,9 @@ do
 
     hh.onmousedown({ x = x, y = y, button = LEFT })
     hh.onmouseup({ x = x, y = y, button = LEFT })
-    eq(actions[1], "settings", "点行调用了 agent:action('settings')（打开原生设置窗）")
+    ok(w.fieldEdit ~= nil, "点行进入了字段编辑态（composer 变编辑器）")
+    eq(#actions, 0, "**没有**再调 agent:action('settings')（不弹旧原生窗）", table.concat(actions, ","))
+    ok(w.inputOpen, "编辑态把原生输入行浮出来了（中文输入要靠它）")
     ok(w.lastInputError == nil, "设置页点击不抛错", w.lastInputError)
   end
 end
