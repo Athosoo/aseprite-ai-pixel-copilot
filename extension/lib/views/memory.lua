@@ -87,6 +87,28 @@ end
 
 function View:setQuery(q) self.query = tostring(q or ""); return true end
 
+-- 标题行右侧「检索」：把焦点交给 composer（检索真正的通路是对话 + 桥侧 memory 检索）
+function View:action(id, state)
+  if id ~= "search" then return false end
+  local wb = self.ctx and self.ctx.workbench
+  if not wb then return false end
+  wb:openInput()
+  wb:log("在下面输入关键词检索记忆（例如「shell 蓝」）", "info")
+  return true
+end
+
+-- 点检索框 = 想搜：把焦点交给 composer（与标题行「检索」同一个动作）
+function View:click(hit)
+  if hit and hit.kind == "search" then
+    return self:action("search")
+  end
+  if hit and hit.kind == "entry" and hit.index then
+    self.sel = hit.index
+    return true
+  end
+  return false
+end
+
 function View:hitAt(x, y)
   for _, h in ipairs(self.hits) do
     if x >= h.rect.x and x < h.rect.x + h.rect.w and y >= h.rect.y and y < h.rect.y + h.rect.h then return h end

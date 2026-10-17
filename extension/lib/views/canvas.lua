@@ -160,6 +160,35 @@ function View:history()
   return out
 end
 
+-- 标题行右侧：应用 = 用当前参数真的跑一次选中的算子（一个撤销步骤）；
+-- 预览 = v1 没有预览通道 → 交回壳记 noop（带理由、并在会话里打一行）
+function View:action(id, state)
+  if id ~= "apply" then return false end
+  local spec = self:selected()
+  if not spec then return false end
+  local name = tostring(spec.name or spec.id or "")
+  if name == "" then return false end
+  local kernel = self.ctx and self.ctx.kernel
+  local host = self.ctx and self.ctx.host
+  local wb = self.ctx and self.ctx.workbench
+  if not (kernel and type(kernel.invoke) == "function") then
+    if wb then wb:log("应用需要内核（kernel:invoke 才能带沙箱预算）", "error") end
+    return true
+  end
+  local params = {}
+  for k, v in pairs(self.paramValues or {}) do params[k] = v end
+  local ok, res = kernel:invoke("op", name, host, params)
+  local changed = type(res) == "table" and res.changed or 0
+  if wb then
+    if ok then
+      wb:log(string.format("%s → %s px", name, tostring(changed)), "tool")
+    else
+      wb:log(string.format("%s 失败：%s", name, tostring(res)), "error")
+    end
+  end
+  return true
+end
+
 function View:click(hit)
   if not hit then return false end
   if hit.kind == "op" and hit.index then

@@ -170,13 +170,14 @@ function swapAgentPanel(a, wb, adapterModule)
   return true
 end
 
-local function openWorkbench(a)
-  if not M.workbench or not M.workbench.new then return false end
+function openWorkbench(a, wbModule)
+  local mod = wbModule or M.workbench
+  if not mod or not mod.new then return false end
   local wb = nil
   -- pcall 的第二个返回值才是真正的错误：只接 ok 会让日志永远说"returned nil"，
   -- 真机排查时那条日志等于没用。抛错和返回 nil 分开记，一眼能分辨。
   local ok, err = pcall(function()
-    wb = M.workbench.new{
+    wb = mod.new{
       kernel = state.kernel,
       agent = a,
       registry = state.kernel and state.kernel.registry or nil,
@@ -214,8 +215,52 @@ local function openWorkbench(a)
   return true
 end
 
+-- ---- UI 模式：默认工作台，旧面板是显式可选 -------------------------------
+-- 默认是工作台：这一个 UI 就是主界面，要继续把它做完善。
+-- 唯一切成旧面板的方式：在扩展目录写一个 ui.mode 文件，内容一个字 legacy。
+-- 其它一切（不存在/空/写错/读失败）都留在工作台 —— 只有明确要求才退，不猜。
+local UI_MODE_DEFAULT = "workbench"
+
+function uiModeFrom(text)
+  if type(text) ~= "string" then return UI_MODE_DEFAULT end
+  -- 约束 32/33b：BOM 和回车符会破坏 ^%s* 匹配（%s 在这个 Lua 里不吃回车），先手工洗掉
+  local v = text:gsub("^\239\187\191", "")
+  v = v:gsub("^[ \t\r\n]+", ""):gsub("[ \t\r\n]+$", "")
+  v = v:lower()
+  if v == "legacy" then return "legacy" end
+  return UI_MODE_DEFAULT
+end
+
+function readUiMode(baseDir)
+  local dir = (type(baseDir) == "string" and baseDir ~= "") and baseDir or nil
+  if not dir then return UI_MODE_DEFAULT end
+  local ok, mode = pcall(function()
+    local f = io.open(dir .. "/ui.mode", "rb")
+    if not f then return UI_MODE_DEFAULT end   -- 文件不存在
+    local text = f:read("*a")
+    f:close()
+    return uiModeFrom(text)
+  end)
+  if not ok then return UI_MODE_DEFAULT end    -- 读失败（权限/被占用/是目录…）静默用默认
+  return mode or UI_MODE_DEFAULT
+end
+
+-- 呈现路径：legacy 绝不构造工作台；workbench 起不来才回落旧面板。
+-- 返回 "workbench" | "legacy" | "legacy-fallback"，便于测试与日志核对。
+function presentUi(a, mode, forceWorkbench, wbModule)
+  if not (a and type(a.open) == "function") then return "legacy" end
+  local wantWorkbench = forceWorkbench == true or mode ~= "legacy"
+  if wantWorkbench then
+    if openWorkbench(a, wbModule) then return "workbench" end
+    a:open()
+    return "legacy-fallback"
+  end
+  a:open()
+  return "legacy"
+end
+
 -- 面板 + 桥：两个入口（主面板 / 小面板）共用
-local function openPanel(andThen)
+local function openPanel(andThen, forceWorkbench)
   local a, aerr = ensureAgent()
   if not a then
     note("面板不可用: " .. tostring(aerr))
@@ -238,9 +283,7 @@ local function openPanel(andThen)
     end
   end
 
-  if not openWorkbench(a) then
-    a:open()
-  end
+  presentUi(a, readUiMode(CFG.extPath), forceWorkbench == true)
   if andThen then pcall(andThen, a) end
   return a
 end
@@ -282,6 +325,14 @@ local COMMANDS = {
     id = "ai_pixel_copilot_rollback",
     title = "AI: Rollback Last Version",
     onclick = function() ensureAgent():action("rollback") end,
+  },
+  -- 工作台就是默认界面；这条命令是「强制打开工作台」——用户写了 ui.mode=legacy
+  -- 想临时切回来时用它。不挂 group，所以 File > Scripts 下仍然只有 open 一条（D4）。
+  {
+    id = "ai_pixel_copilot_workbench",
+    title = "AI: Open Workbench (beta)",
+    hint = "实验性三区工作台；出问题请回到默认面板",
+    onclick = function() openPanel(nil, true) end,
   },
 }
 
@@ -403,6 +454,9 @@ function init(plugin)
   CFG.projectDir = readProjectDir(plugin)
   CFG.extPath = (plugin and plugin.path) or nil
 
+  -- UI 模式：默认工作台。想用旧面板就在扩展目录写 ui.mode，内容一行 legacy；
+  -- 删掉/写错/读不到都留在工作台。见 readUiMode()。
+  --
   -- 所有 require 在这里一次性做完（约束 7），任何一个失败都只降级、不抛
   M.agent = (tryRequire("lib.agent"))
   M.versions = (tryRequire("lib.versions"))

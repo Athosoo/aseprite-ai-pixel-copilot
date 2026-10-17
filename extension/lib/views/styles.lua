@@ -82,6 +82,12 @@ function View:render(kit, r, state)
   return self
 end
 
+-- 标题行右侧「新建」：v1 只读骨架，交回壳记 noop（带理由并打一行）
+function View:action(id, state)
+  if id == "new" then return false end
+  return false
+end
+
 function View:hitAt(x, y)
   for _, h in ipairs(self.hits) do
     if x >= h.rect.x and x < h.rect.x + h.rect.w and y >= h.rect.y and y < h.rect.y + h.rect.h then return h end

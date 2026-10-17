@@ -400,11 +400,14 @@ function Workbench:layout()
   local L = { w = W, h = H, mode = self.mode }
 
   if self.mode == "small" then
-    -- 小窗仍归 lib/miniwindow.lua（不动）。壳在这里只让出一个整块，方便宿主画状态行。
+    -- 小窗的既定行为（v0.5.9 / D4）：状态行 + 最后一行输出 + **仍能输入**。
+    -- 之前这里只给了 titlebar+main、composer 高度写 0，于是小窗里内容区全黑、打不了字。
     L.small = true
-    L.titlebar = { x = 0, y = 0, w = W, h = math.min(30, H) }
-    L.main = { x = 0, y = L.titlebar.h, w = W, h = math.max(0, H - L.titlebar.h) }
-    L.composer = { x = 0, y = H, w = W, h = 0 }
+    local compH = math.min(m.composerH, H)
+    local statusH = math.max(0, H - compH)
+    L.titlebar = { x = 0, y = 0, w = W, h = 0 }
+    L.main = { x = 0, y = 0, w = W, h = statusH }
+    L.composer = { x = 0, y = statusH, w = W, h = compH }
     return L
   end
 
@@ -456,9 +459,14 @@ function Workbench:invalidate(region)
   self:_requestRepaint()
 end
 
--- 请宿主重绘；绘制过程中再触发会自递归，用 _painting 挡掉。
+-- 请宿主重绘；绘制过程中再触发会自递归，用 _painting 挡掉 —— 但不能只是丢掉：
+-- 记一个 deferred 标记，paint 收尾时发现有失效就再请一帧，否则"在回调/绘制里改的状态"
+-- 会永远停留在旧像素上（真机自点击：切到小窗后画面全黑就是这么来的）。
 function Workbench:_requestRepaint()
-  if self._painting then return false end
+  if self._painting then
+    self._repaintDeferred = true
+    return false
+  end
   local dlg = self.dlg
   if not dlg then return false end
   self.repaintCount = (self.repaintCount or 0) + 1
@@ -478,12 +486,20 @@ function Workbench:setSize(w, h)
   return true
 end
 
--- gc 变了（换 canvas / 换形态）就重建 kit；同一 gc 复用测量缓存。
+-- 换 gc（换 canvas / 新的一帧一个 GraphicsContext）只换指针，**不重建 kit**：
+-- 重建会丢掉测量缓存（中文测量结果每帧白算一遍），更糟的是 self:invalidate() 会在
+-- 绘制过程中再请一帧 —— 每帧都请，就变成无限重绘，真机上表现为画布全空。
 function Workbench:_ensureKit(gc)
-  if self.kit and self.kit.gc == gc then return self.kit end
+  if self.kit then
+    if self.kit.gc ~= gc then
+      self.kit.gc = gc
+      self.kit:invalidate()      -- 纹理全失效：五区都重画，但**不**再请宿主帧
+    end
+    return self.kit
+  end
   self.kit = kitMod.new(gc, self.th, { record = self.opts.record })
   if self.ctx then self.ctx.kit = self.kit end
-  self:invalidate()
+  self.kit:invalidate()
   return self.kit
 end
 
@@ -498,6 +514,20 @@ function Workbench:paint(gc)
     self.lastPaintError = tostring(err)
   else
     self.lastPaintError = nil
+  end
+  -- 本帧里有失效请求（被 _painting 挡下的那些）：再请一帧，别把变化留在旧像素上。
+  -- 但要有上限：如果"画的过程中每帧都在失效"，补帧会变成无限重绘（真机上就是画布全空 + CPU 跑满）。
+  if self._repaintDeferred then
+    self._repaintDeferred = false
+    self._deferStreak = (self._deferStreak or 0) + 1
+    if self._deferStreak > 3 then
+      self.lastDeferError = "repaint deferred " .. tostring(self._deferStreak) .. " frames in a row (stopped)"
+      self._deferStreak = 0
+    else
+      self:_requestRepaint()
+    end
+  else
+    self._deferStreak = 0
   end
   return ok
 end
@@ -519,6 +549,10 @@ function Workbench:_paint(gc)
     if kit:dirty("main") then
       kit:region("main", L.main)
       self:drawBarMain(kit, L.main, true)
+    end
+    if kit:dirty("composer") and L.composer.h > 0 then
+      kit:region("composer", L.composer)
+      self:drawComposer(kit, L.composer)
     end
     return kit:finish()
   end
@@ -905,12 +939,17 @@ function Workbench:drawComposer(kit, r)
   local right = { x = r.x + r.w - m.pad - 4 }
   local stopTone = self.state.busy and "err" or "faint"
   local stopR = kit:text({ x = right.x - 10, y = y }, "⏹", { tone = stopTone })
-  self.stopHit = { x = stopR.x - 4, y = r.y + 4, w = 20, h = r.h - 8 }
   local clipTone = self.state.attachments and "text" or "faint"
   local clipR = kit:text({ x = stopR.x - 24, y = y }, "📎", { tone = clipTone })
-  self.attachHit = { x = clipR.x - 4, y = r.y + 4, w = 20, h = r.h - 8 }
   local enterR = kit:text({ x = clipR.x - 24, y = y }, "⏎", { tone = "dim" })
-  self.enterHit = { x = enterR.x - 4, y = r.y + 4, w = 20, h = r.h - 8 }
+
+  -- 三个图标必须登记命中区：画出来却点不动，就是"界面上有一堆死按钮"。
+  -- 命中区比字形宽（20px），2x 缩放下也按得住。
+  self.composerHits = {
+    { rect = { x = stopR.x - 4, y = r.y + 4, w = 20, h = r.h - 8 }, kind = "composer", id = "stop" },
+    { rect = { x = clipR.x - 4, y = r.y + 4, w = 20, h = r.h - 8 }, kind = "composer", id = "attach" },
+    { rect = { x = enterR.x - 4, y = r.y + 4, w = 20, h = r.h - 8 }, kind = "composer", id = "enter" },
+  }
 
   local tx = left.x + left.w + 8
   local maxW = enterR.x - 8 - tx
@@ -1397,22 +1436,36 @@ function Workbench:mouse(kind, x, y)
     if h.kind == "tb" then
       if h.id == "ctx" then return self:toggleContext() and "toggle-ctx" or "expand-ctx" end
       if h.id == "mode" then return "mode:" .. tostring(self:cycleMode()) end
-      if h.id == "min" then return "min" end
-      if h.id == "close" then return "close" end
+      -- － 最小化 = 切到小窗形态（再点一次回来）。只 return 一个字符串等于死按钮。
+      if h.id == "min" then return "min:" .. tostring(self:toggleSmall()) end
+      -- × 只关面板，不关 Aseprite —— 用户点的是工作台的叉
+      if h.id == "close" then self:hide(); return "close" end
     elseif h.kind == "view" then
-      self:setView(h.id)
+      local switched = self:setView(h.id)
+      if not switched then
+        -- 点的是当前视图：切视图是空操作，但"把键盘焦点交给主视图"是有用的真实动作
+        self.state.focus = "main"
+        self:invalidate("main")
+      end
       return "view:" .. h.id
     elseif h.kind == "new" then
-      return "new"
+      return self:railNew()
     elseif h.kind == "retry" then
       self:setConnected(true)
       return "retry"
+    elseif h.kind == "composer" then
+      return self:composerAction(h.id)
+    elseif h.kind == "action" then
+      -- 主视图标题行右侧的视图内动作（预览/应用/让它提议/重扫/检索/Chat▾/⊕…）
+      return self:viewAction(h.id)
     end
     -- 视图自己画的按钮（启用/停用、算子行、示例…）：交给视图处理，壳不猜语义
     if self.view and type(self.view.click) == "function" then
       local ok, handled = pcall(self.view.click, self.view, h)
       if ok and handled then
-        -- 视图内部状态改了（例如扩展开关），画面必须跟着变
+        -- 视图内部状态改了（例如扩展开关 / 打开原生设置窗），画面必须跟着变；
+        -- 模态窗关掉后宿主可能把工作台一起收掉 → _afterModal 兜一层
+        self:_afterModal()
         self:invalidate("main")
         return "view-click:" .. tostring(h.kind)
       end
@@ -1420,6 +1473,111 @@ function Workbench:mouse(kind, x, y)
     return h.kind
   end
   return nil
+end
+
+----------------------------------------------------------------------
+-- 死按钮防治：每个画出来的命中区都必须"点了有可观察变化"
+--
+-- 允许"不接线"，但必须**有理由 + 有可见反馈**（记进 noop 表并往会话里打一行）。
+-- 空函数（只 return 一个字符串、什么都不做）一律不许过 —— reachability_test 会钉住。
+----------------------------------------------------------------------
+
+workbench.NOOP_REASONS = {
+  ["action.preview"] = "v1 没有预览通道：算子要么真执行（可 Ctrl+Z 撤销），要么不动画布",
+  ["action.propose"] = "提议链路要等 agent 的 proposal 接口（T1 侧），现在只记录请求",
+  ["action.new"] = "风格新建要写 bridge/data/styles，属于桥侧能力，v1 骨架只读",
+  ["composer.attach"] = "没有 agent 时无处可选图（正常安装下走 agent:action(upload)）",
+  ["rail.new"] = "没有 agent 时无法新建对话（正常安装下走 agent:action(conversation_new)）",
+}
+
+-- 记录一次"没有真正动作、但已给用户反馈"的点击
+function Workbench:noop(id, detail)
+  local reason = workbench.NOOP_REASONS[id] or "未接线"
+  self.noops = self.noops or {}
+  self.noops[id] = (self.noops[id] or 0) + 1
+  local text = i18n.isZh() and ("【未接线】" .. tostring(detail or id) .. "：" .. reason)
+                            or ("[not wired] " .. tostring(detail or id) .. ": " .. reason)
+  self:log(text, "warn")
+  return "noop:" .. tostring(id)
+end
+
+-- 最小化 = 小窗形态；再点一次回到原形态
+function Workbench:toggleSmall()
+  if self.mode == "small" then
+    local back = self._modeBeforeSmall or "panel"
+    self:setMode(back)
+    return back
+  end
+  self._modeBeforeSmall = self.mode
+  self:setMode("small")
+  return "small"
+end
+
+-- 左轨底部的 ⊕：新建对话（旧面板里就是 conversation_new 这条动作）
+function Workbench:railNew()
+  local a = self.agent
+  if a and type(a.action) == "function" then
+    local ok = pcall(a.action, a, "conversation_new")
+    if ok then
+      self:_afterModal()
+      return "rail-new"
+    end
+  end
+  return self:noop("rail.new", "新建对话")
+end
+
+-- composer 右侧三个图标
+function Workbench:composerAction(id)
+  if id == "enter" then
+    local sent = self:submit()
+    return sent and "submit" or "submit-empty"
+  elseif id == "attach" then
+    -- 附件 = 旧面板那条「选图/上传」通路（agent:pickFile → 原生文件选择器）
+    local a = self.agent
+    if a and type(a.action) == "function" then
+      local ok = pcall(a.action, a, "upload")
+      if ok then
+        self:_afterModal()
+        return "attach"
+      end
+    end
+    return self:noop("composer.attach", "选择图片")
+  elseif id == "stop" then
+    if not self.state.busy then
+      self:log(i18n.isZh() and "当前没有正在跑的轮次" or "nothing is running", "info")
+      return "stop-idle"
+    end
+    self:interrupt()
+    return "stop"
+  end
+  return self:noop("composer." .. tostring(id), tostring(id))
+end
+
+-- 主视图标题行右侧的视图内动作：交给视图的 action(id)，视图没实现就记 noop
+function Workbench:viewAction(id)
+  local v = self.view
+  if v and type(v.action) == "function" then
+    local ok, handled = pcall(v.action, v, id, self.state)
+    if ok and handled then
+      self:_afterModal()
+      self:invalidate()
+      return "view-action:" .. tostring(id)
+    end
+  end
+  return self:noop("action." .. tostring(id), tostring(id))
+end
+
+-- 原生模态窗（设置窗 / 文件选择器）关掉之后，宿主有可能把工作台一起收掉。
+-- 这里兜一层：只要工作台自己的 dlg 还在就重新显示，用户看到的是"设置窗关了、面板还在"。
+function Workbench:_afterModal()
+  if self.legacyMode then return end
+  if not self.dlg then return end
+  if self.shown then return end
+  local ok = pcall(function() self.dlg:show{ wait = false } end)
+  self.shown = true
+  self.modalRecovered = (self.modalRecovered or 0) + 1
+  if ok then self:invalidate() end
+  return ok
 end
 
 function Workbench:_railIndexOf(id)
@@ -1443,7 +1601,10 @@ function Workbench:hitTest(x, y)
      and y >= self.retryHit.y and y < self.retryHit.y + self.retryHit.h then
     return { kind = "retry" }
   end
-  local h = scan(self.actionHits)
+  -- composer 画在最后 = 最上层，命中优先级最高
+  local h = scan(self.composerHits)
+  if h then return h end
+  h = scan(self.actionHits)
   if h then return h end
   h = scan(self.titleHits)
   if h then return h end
@@ -1649,8 +1810,20 @@ function Workbench:fitToScreen()
 end
 
 function Workbench:show()
+  -- 上次是"关掉"的：重建一个新的 Dialog（关掉的控件不能再拿来 show）
+  if self.dlgClosed then
+    self.dlg = nil
+    self.dlgClosed = false
+  end
   self:fitToScreen()
-  local dlg = self:build(Dialog{ title = "AI Pixel Copilot", onclose = function() self.shown = false end })
+  -- newDialog 是给单测的注入口（无头下 Dialog{} 返回 nil，测不了"重建"这条路径）
+  local dlgObj = nil
+  if type(self.opts.newDialog) == "function" then
+    dlgObj = self.opts.newDialog()
+  else
+    dlgObj = Dialog{ title = "AI Pixel Copilot", onclose = function() self.shown = false end }
+  end
+  local dlg = self:build(dlgObj)
   if not dlg then
     -- 无头（-b）下 Dialog 构造返回 nil；把状态标成"已打开"以便单测继续跑
     self.shown = true
@@ -1663,9 +1836,31 @@ function Workbench:show()
   return self
 end
 
+-- 关窗口。注意两点（真机踩出来的）：
+--   1) 从自己的鼠标回调里调 dlg:close()，宿主有时会忽略这次关闭（窗口还在，只是 shown=false）
+--      → 除了立刻关，还排一个一次性 Timer 再关一次（GUI 下 Timer 会 tick；无头下不 tick，无副作用）。
+--   2) 关掉的 Dialog 不能再用：打 dlgClosed 标记，下次 show() 重建一个干净的。
 function Workbench:hide()
-  if self.dlg then pcall(function() self.dlg:close() end) end
   self.shown = false
+  local dlg = self.dlg
+  if not dlg then return self end
+
+  local ok1, err1 = pcall(function() dlg:close() end)
+  if not ok1 then self.lastCloseError = tostring(err1) end
+
+  if type(Timer) == "table" then
+    local t
+    t = Timer{
+      interval = 0.01,
+      ontick = function()
+        pcall(function() t:stop() end)
+        local ok2, err2 = pcall(function() dlg:close() end)
+        if not ok2 then self.lastCloseError = tostring(err2) end
+      end,
+    }
+  end
+
+  self.dlgClosed = true
   return self
 end
 

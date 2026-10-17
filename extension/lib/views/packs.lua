@@ -106,6 +106,15 @@ function View:render(kit, r, state)
         id = id,
       }
     end
+    -- 展开态多给一行健康度（点行切换）
+    if self.detail and self.detail[id] then
+      items[#items + 1] = {
+        text = "  " .. healthLine(h),
+        tone = "dim",
+        small = true,
+        id = id,
+      }
+    end
   end
 
   local layout = kit:list({ x = r.x, y = r.y + 4, w = r.w - 96, h = r.h - 8 }, items,
@@ -132,19 +141,50 @@ function View:render(kit, r, state)
   return self
 end
 
+-- 标题行右侧：重扫 = 重新 scan 账本；让它提议 = v1 未接线（交回壳记 noop + 打一行）
+function View:action(id, state)
+  if id ~= "rescan" then return false end
+  local l = self:ledger()
+  if not (l and type(l.scan) == "function") then return false end
+  local ok, list = pcall(l.scan, l)
+  if not ok then return false end
+  local wb = self.ctx and self.ctx.workbench
+  if wb then wb:log(string.format("重扫完成：%d 个能力包", #(list or {})), "info") end
+  return true
+end
+
 -- 点壳分发过来的命中框（Workbench:mouse 的 view:click 约定）
 function View:click(hit)
   if not hit then return false end
   local l = self:ledger()
   if hit.kind == "toggle" then
-    if not (l and hit.id) then return false end
+    if not (l and hit.id) then
+      if self.ctx and self.ctx.workbench then self.ctx.workbench:log("没有账本，无法启停能力包", "warn") end
+      return true
+    end
     if l:isEnabled(hit.id) then l:disable(hit.id) else l:enable(hit.id) end
     return true
   elseif hit.kind == "rollback" then
-    if not (l and hit.id and type(l.rollback) == "function") then return false end
+    if not (l and hit.id) then
+      if self.ctx and self.ctx.workbench then self.ctx.workbench:log("没有账本，无法回滚能力包", "warn") end
+      return true
+    end
+    if type(l.rollback) ~= "function" then
+      -- 账本这版没实现回滚：给用户一句明确的话，而不是点了没反应
+      if self.ctx and self.ctx.workbench then
+        self.ctx.workbench:log("账本未提供回滚（ledger:rollback 不可用）", "warn")
+      end
+      return true
+    end
     pcall(l.rollback, l, hit.id)
     return true
   elseif hit.kind == "pack" then
+    if self.sel == hit.index and hit.id then
+      -- 点已选中的那行：展开/收起它的详情（健康度、失败原因），有可见变化
+      self.detail = self.detail or {}
+      self.detail[hit.id] = not self.detail[hit.id]
+      return true
+    end
     self.sel = hit.index or self.sel
     return true
   end

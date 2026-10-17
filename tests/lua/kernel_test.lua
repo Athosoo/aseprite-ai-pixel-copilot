@@ -594,6 +594,85 @@ do
   end
 end
 
+-- ---------------------------------- main.lua：UI 模式（默认工作台，legacy 是可选）
+print("== main.lua: ui.mode 判定 + 默认走工作台 ==")
+do
+  local chunk = assert(loadfile(EXT .. "/main.lua"))
+  chunk()
+  check("main.lua 导出了 uiModeFrom / readUiMode / presentUi",
+    type(uiModeFrom) == "function" and type(readUiMode) == "function" and type(presentUi) == "function")
+
+  -- 1) 纯判定：默认工作台，只有明确写 legacy 才退
+  check("uiModeFrom('legacy') = legacy", uiModeFrom("legacy") == "legacy")
+  check("uiModeFrom 容忍空白/大小写/CRLF", uiModeFrom("  LeGaCy \r\n") == "legacy")
+  check("uiModeFrom 洗掉 BOM", uiModeFrom("\239\187\191legacy") == "legacy")
+  check("uiModeFrom('') = workbench（空 → 默认）", uiModeFrom("") == "workbench")
+  check("uiModeFrom('garbage') = workbench（写错 → 默认）", uiModeFrom("garbage") == "workbench")
+  check("uiModeFrom(nil) = workbench（读不到 → 默认）", uiModeFrom(nil) == "workbench")
+  check("uiModeFrom('workbench') = workbench", uiModeFrom("workbench") == "workbench")
+  check("uiModeFrom('legacyx') = workbench（不许前缀匹配）", uiModeFrom("legacyx") == "workbench")
+
+  -- 2) 读文件：不存在 / 显式 legacy / 空 / 写错 / 读失败
+  local dir = tempDir("uimode")
+  local noFileDir = tempDir("uimode-none")
+  check("ui.mode 不存在 → workbench（默认）", readUiMode(noFileDir) == "workbench", readUiMode(noFileDir))
+
+  writeFile(dir .. "/ui.mode", "legacy\n")
+  check("ui.mode 内容 legacy → legacy（显式可选）", readUiMode(dir) == "legacy", readUiMode(dir))
+
+  writeFile(dir .. "/ui.mode", "workbench\n")
+  check("ui.mode 内容 workbench → workbench", readUiMode(dir) == "workbench", readUiMode(dir))
+
+  writeFile(dir .. "/ui.mode", "")
+  check("ui.mode 空文件 → workbench（默认）", readUiMode(dir) == "workbench", readUiMode(dir))
+
+  writeFile(dir .. "/ui.mode", "garbage")
+  check("ui.mode 写错 → workbench（默认）", readUiMode(dir) == "workbench", readUiMode(dir))
+
+  -- 读失败：把"文件路径"指到一个目录上，io.open 打不开
+  local dirAsFile = tempDir("uimode-dir")
+  pcall(function() app.fs.makeAllDirectories(dirAsFile .. "/ui.mode") end)
+  check("ui.mode 读失败（是目录）→ workbench（默认）", readUiMode(dirAsFile) == "workbench", readUiMode(dirAsFile))
+  check("readUiMode(nil) → workbench（默认）", readUiMode(nil) == "workbench")
+
+  -- 3) 呈现路径：legacy 绝不构造工作台
+  local function newFakeAgent()
+    return { panel = { tag = "legacy" }, opened = false,
+             open = function(self) self.opened = true end }
+  end
+  local function newFakeWb()
+    local o = { newCalls = 0, showCalls = 0 }
+    o.mod = {
+      new = function() o.newCalls = o.newCalls + 1
+        return { show = function() o.showCalls = o.showCalls + 1 end }
+      end,
+    }
+    return o
+  end
+
+  local a1, wb1 = newFakeAgent(), newFakeWb()
+  local path1 = presentUi(a1, "workbench", false, wb1.mod)
+  check("默认（workbench）走工作台", path1 == "workbench" and wb1.newCalls == 1 and wb1.showCalls == 1,
+    path1 .. "/new=" .. tostring(wb1.newCalls))
+  check("走工作台时不再调 a:open（避免旧面板又冒出来）", a1.opened == false)
+
+  local a2, wb2 = newFakeAgent(), newFakeWb()
+  local path2 = presentUi(a2, "legacy", false, wb2.mod)
+  check("ui.mode=legacy 时才走旧面板（a:open 被调用）", path2 == "legacy" and a2.opened == true, path2)
+  check("legacy 分支里 workbench.new 一次都没被调用",
+    wb2.newCalls == 0 and wb2.showCalls == 0, "new=" .. tostring(wb2.newCalls))
+
+  local a3, wb3 = newFakeAgent(), newFakeWb()
+  local path3 = presentUi(a3, "legacy", true, wb3.mod)
+  check("beta 命令强制走工作台（无视 ui.mode=legacy）",
+    path3 == "workbench" and wb3.newCalls == 1 and a3.opened == false, path3)
+
+  local a4 = newFakeAgent()
+  local path4 = presentUi(a4, "workbench", false, { new = function() error("workbench blew up") end })
+  check("工作台起不来时回落旧面板（不乱崩）",
+    path4 == "legacy-fallback" and a4.opened == true, path4)
+end
+
 -- --------------------------------------------------- 薄入口 main.lua
 print("== extension/main.lua 薄入口 ==")
 do
@@ -607,17 +686,23 @@ do
   check("main.lua 能作为脚本加载", type(init) == "function" and type(exit) == "function")
   local okInit, initErr = pcall(init, fakePlugin)
   check("init(plugin) 不抛错", okInit, initErr)
-  check("注册了 6 个命令", #cmds == 6, #cmds)
+  check("注册了 6 个原有命令 + 1 个 beta 工作台命令", #cmds == 7, #cmds)
 
-  local ids = {}
-  for _, c in ipairs(cmds) do ids[#ids + 1] = tostring(c.id) end
-  table.sort(ids)
   local want = {
     "ai_pixel_copilot_menu", "ai_pixel_copilot_open", "ai_pixel_copilot_palette",
     "ai_pixel_copilot_rollback", "ai_pixel_copilot_settings", "ai_pixel_copilot_snapshot",
   }
-  check("6 个命令 id 与 v0.5.9 逐字一致", table.concat(ids, ",") == table.concat(want, ","),
-    table.concat(ids, ","))
+  local byId = {}
+  for _, c in ipairs(cmds) do byId[tostring(c.id)] = c end
+  local missing = {}
+  for _, id in ipairs(want) do if byId[id] == nil then missing[#missing + 1] = id end end
+  check("原有 6 个命令 id 一个不少（D4）", #missing == 0, table.concat(missing, ","))
+
+  local beta = byId["ai_pixel_copilot_workbench"]
+  check("新增 ai_pixel_copilot_workbench（beta）", beta ~= nil)
+  check("beta 命令标题带 beta", beta ~= nil and tostring(beta.title):lower():find("beta", 1, true) ~= nil,
+    beta and beta.title)
+  check("beta 命令不挂菜单 group", beta ~= nil and beta.group == nil, beta and tostring(beta.group))
 
   local menuCount, openGroup = 0, nil
   for _, c in ipairs(cmds) do

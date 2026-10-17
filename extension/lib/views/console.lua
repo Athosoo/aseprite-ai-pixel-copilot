@@ -394,6 +394,19 @@ local function kitHit(r, x, y)
 end
 console.hit = kitHit
 
+-- 标题行右侧两个动作：Chat▾ 切对话、⊕ 新建对话（都走 agent 既有通路）
+function Console:action(id, state)
+  local a = self.ctx and self.ctx.agent
+  if id == "session" then
+    if a and type(a.action) == "function" then return pcall(a.action, a, "conversations") end
+    return false
+  elseif id == "new" then
+    if a and type(a.action) == "function" then return pcall(a.action, a, "conversation_new") end
+    return false
+  end
+  return false
+end
+
 -- 空状态的三个示例是可点的：点一下等于把它填进 composer（不是直接发送）
 function Console:click(hit)
   if not hit then return false end
