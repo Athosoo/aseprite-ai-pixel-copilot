@@ -218,8 +218,16 @@ class Session {
   }
 
   request(kind, payload = {}, timeoutMs = 60000) {
+    return this.requestSend(kind, payload, timeoutMs).promise;
+  }
+
+  // request 的"只登记、先别结束"版本：给需要【先发头帧、再发二进制负载】的调用用。
+  // 直接 await request(...) 再发负载会死锁 —— 扩展侧要等二进制帧配对才会回话。
+  requestSend(kind, payload = {}, timeoutMs = 60000) {
     const id = ++this.seq;
-    return new Promise((resolve, reject) => {
+    let send;
+    const promise = new Promise((resolve, reject) => {
+      send = () => this.send({ type: kind, id, ...payload });
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`等待 Aseprite 响应超时：${kind}`));
@@ -228,8 +236,9 @@ class Session {
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
       });
-      this.send({ type: kind, id, ...payload });
     });
+    send();
+    return { id, promise };
   }
 
   resolvePending(id, value) {
@@ -240,11 +249,42 @@ class Session {
     }
   }
 
-  sendImport(data, width, height, note) {
-    // binary=true 告诉 Lua 侧"后面还跟着一个二进制帧"，它据此把头帧存起来等配对。
-    // 别去掉这个标记：去掉的话 Lua 会把它当普通消息，二进制帧配不上头就丢了。
-    this.send({ type: 'import_image', id: ++this.seq, width, height, note, binary: true });
+  // 头帧 + 二进制负载成对发出（ws.lua 认 binary=true 的头帧，收下等二进制帧配对）。
+  // 别去掉 binary 标记：去掉的话 Lua 会把它当普通消息，二进制帧配不上头就丢了。
+  sendBinary(header, data) {
+    this.send(header);
     this.ws.send(Buffer.from(data.buffer, data.byteOffset, data.byteLength), { binary: true });
+  }
+
+  // 把矫正结果送进 Aseprite，并【等它回话】这个结果到底怎么落地的。
+  //
+  // 以前这里是 fire-and-forget：只发头帧 + 二进制帧，没人回，于是桥只能对模型
+  // 说"开了一个新文档"—— 哪怕扩展侧其实是就地贴图层 / 因为没有文档而退回预览。
+  // 现在 import_image 走 request（同一个 id 头帧 + 二进制负载），扩展侧落完地
+  // 回 {type:'import_result', id}，桥据此如实回报。
+  //
+  // opts.target: 'active'（就地贴进当前文档的新图层）/ 'preview'（开预览文档 + 留待应用）
+  // opts.label:  落地时给模型看的来源名（"fixed image" / 上传文件名）
+  async sendImport(data, width, height, note, opts = {}) {
+    const payload = {
+      type: 'import_image',
+      width,
+      height,
+      note,
+      binary: true,          // 告诉 Lua 侧"后面还跟着一个二进制帧"，它据此把头帧存起来等配对。
+      target: opts.target || 'preview',
+      label: opts.label || 'fixed image',
+    };
+    try {
+      // 20s：落地要 push 快照（可能落盘）+ 一个事务，比普通算子重，但远不到 60s
+      // 顺序很重要：头帧 -> 二进制负载 -> 等结果。反了就是死锁（Lua 等负载才回话）。
+      const { promise } = this.requestSend('import_image', payload, 20000);
+      this.ws.send(Buffer.from(data.buffer, data.byteOffset, data.byteLength), { binary: true });
+      const res = await promise;
+      return res || { applied: false, pending: true };
+    } catch (err) {
+      return { applied: false, pending: false, error: err && err.message ? err.message : String(err) };
+    }
   }
 
   // 收到一个用户指令，串行处理（同一时间只跑一轮对话）
@@ -516,6 +556,19 @@ class Session {
         break;
       case 'snapshot_result':
         this.resolvePending(msg.id, msg.ok ? { ok: true, ...msg.meta } : { error: msg.error });
+        break;
+      case 'import_result':
+        // perfect_pixel 结果的落地回执：就地加层 / 开预览文档 / 扩了画布，都由这里说清楚
+        this.resolvePending(msg.id, msg.applied
+          ? {
+              applied: true,
+              layer: msg.layer, canvas: msg.canvas, canvasFrom: msg.canvasFrom,
+              expanded: msg.expanded === true, pending: msg.pending === true,
+            }
+          : {
+              applied: false, openedDoc: msg.openedDoc === true,
+              pending: msg.pending === true, reason: msg.reason, error: msg.error,
+            });
         break;
       case 'rollback_result':
         this.resolvePending(msg.id, msg.ok ? { ok: true, ...msg.report } : { error: msg.error });

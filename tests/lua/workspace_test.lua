@@ -98,6 +98,53 @@ do
   a.workspace:setRoot(WSROOT)
 end
 
+print("== run_ops 的 layers 参数：整图 = 'all'，写错层名要报错并列出可选项 ==")
+do
+  a.workspace:setRoot("")                     -- 这一节只看图层语义，不牵扯工作区
+  local spr = Sprite{ fromFile = ORIG }
+  app.activeSprite = spr
+  local base = spr.layers[1]
+  base.name = "base"
+  local l2 = spr:newLayer()
+  l2.name = "detail"
+  spr:newCel(l2, 1)                           -- 新层继承 sprite 的颜色模式
+  app.activeLayer = l2                        -- 活动层是 detail
+
+  local RED = Color(255, 0, 0)
+  local rect = Rectangle(0, 0, spr.width, spr.height)
+  base:cel(1).image:clear(rect, RED)
+  l2:cel(1).image:clear(rect, RED)
+
+  local r = feed{ type = "run_ops", id = 90, label = "整图换色",
+                  ops = { { op = "replace_color", from = "#FF0000", to = "#00FF00" } },
+                  layers = "all" }
+  ok(r.type == "ops_result" and r.ok == true, "layers='all' 的 run_ops 成功", r.error)
+  ok(r.report and r.report.layers ~= nil and #r.report.layers == 2,
+    "报告里是两层（不是只有活动层）", r.report and r.report.layers and #r.report.layers)
+  ok(r.report and r.report.ops[1].perLayer ~= nil and #r.report.ops[1].perLayer == 2,
+    "逐层改动数都在")
+  ok(r.report and r.report.ops[1].perLayer[1].changed > 0
+     and r.report.ops[1].perLayer[2].changed > 0,
+    "两层都真的被改了（这正是以前只动活动层的老毛病）",
+    r.report and string.format("%d / %d", r.report.ops[1].perLayer[1].changed,
+      r.report.ops[1].perLayer[2].changed))
+
+  local bad = feed{ type = "run_ops", id = 91, label = "层名写错",
+                    ops = { { op = "contrast", amount = 1.3 } }, layers = "nope" }
+  ok(bad.type == "ops_result" and bad.ok == false, "层名不存在时返回失败")
+  ok(tostring(bad.error):find("no layer named", 1, true) ~= nil
+     and tostring(bad.error):find("base", 1, true) ~= nil,
+    "错误里列出了本文档的层名，模型下一轮能自己纠正", bad.error)
+
+  -- 省掉 layers = 活动层（老行为一字不变）
+  local one = feed{ type = "run_ops", id = 92, label = "默认活动层",
+                    ops = { { op = "replace_color", from = "#00FF00", to = "#0000FF" } } }
+  ok(one.type == "ops_result" and one.ok == true, "不给 layers 时照常执行")
+  ok(one.report and one.report.layer == "detail" and one.report.layers == nil,
+    "默认只动活动层，且报告里是单个 layer 字段", one.report and one.report.layer)
+  a.workspace:setRoot(WSROOT)
+end
+
 print("== prepare：备份 + 副本 + 打开副本 ==")
 do
   local spr = Sprite{ fromFile = ORIG }

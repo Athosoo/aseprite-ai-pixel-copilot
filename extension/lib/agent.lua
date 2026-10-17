@@ -26,6 +26,7 @@ local ops = require("lib.ops")
 local sizelib = require("lib.sizelib")
 local artlib = require("lib.artlib")
 local versions = require("lib.versions")
+local pixfix = require("lib.pixfix")
 local panel = require("lib.panel")
 local settings = require("lib.settings")
 local ws = require("lib.ws")
@@ -45,6 +46,7 @@ function agent.new(cfg)
     seq = 0,
     pendingAskId = nil,      -- P7：正在等用户回答的提问 id
     pendingAskOptions = nil,
+    pendingApply = nil,      -- 待应用的矫正结果（面板「应用这个结果」按钮用）
   }, Agent)
 
   self.panel = panel.new{
@@ -531,6 +533,8 @@ function Agent:action(name, arg)
     self:abort()
   elseif name == "deliver" then
     self:deliver()
+  elseif name == "apply_result" then
+    self:applyPendingFixed()
   elseif name == "reset_history" then
     self:resetHistory()
   elseif name == "gaps" then
@@ -928,19 +932,28 @@ function Agent:runOps(msg)
   local label = msg.label or "AI edit"
   local id = msg.id
 
+  -- 目标层：msg.layers 可以是 nil（活动层）/ "all" / "base" / {"base","detail"}
+  local frame = app.activeCel and app.activeCel.frameNumber or 1
+  local okCel, cels = pcall(ops.resolveCels, app.activeSprite, frame, msg.layers)
+  if not okCel then
+    self.panel:log(string.format(i18n.t("opsFailed"), tostring(cels)), "error")
+    self:send{ type = "ops_result", id = id, ok = false, error = tostring(cels) }
+    return
+  end
+
   local okSnap, meta = pcall(versions.push, "before: " .. label, app.activeSprite)
   if okSnap then
     self.panel:log(string.format(i18n.t("autoBacked"), meta.id, meta.label), "tool")
   end
 
-  local ok, res = pcall(ops.run, list, label)
+  local ok, res = pcall(ops.run, list, label, cels)
   if ok then
     local parts = {}
     for _, r in ipairs(res.ops) do
       parts[#parts + 1] = string.format("%s %dpx", r.op, r.changed)
     end
     self.panel:log(string.format(i18n.t("applied"),
-      #res.ops, res.layer, table.concat(parts, ", ")), "tool")
+      #res.ops, res.layer or table.concat(res.layers or {}, "+"), table.concat(parts, ", ")), "tool")
     self:invalidateFrame()
     self:send{ type = "ops_result", id = id, ok = true, report = res }
   else
@@ -1106,14 +1119,110 @@ function Agent:answerAsk(index)
   end
 end
 
--- Build a new document from the pixels the bridge sent back.
-function Agent:importImage(header, data)  local w, h = header.width, header.height
+-- 把 perfect_pixel 的结果【就地】落进当前文档：新增一个 ASCII 名图层，
+-- 原图层像素一个不动，画布不够大就扩（不裁）。快照 + 工作区门禁走和 runOps 同一套纪律。
+--
+-- 返回 { ok=true, layer, canvas, canvasFrom, expanded, snapshot } 或 { ok=false, error }
+-- info = { data, w, h, label }
+function Agent:applyFixed(info)
+  local spr = app.activeSprite
+  if not spr then
+    return { ok = false, reason = "no-document", error = "no document is open" }
+  end
+
+  local label = info.label or "apply fixed image"
+
+  -- 工作区门禁（P10）：和 run_ops / crop / draw_art 同样的纪律。
+  -- 注意必须在这里读 app.activeSprite 之后再调 —— prepareEdit 可能把用户
+  -- 原文件换成工作区里的副本，spr 要在它之后重新取。
+  if not self:prepareEdit("apply_fixed_image") then
+    return { ok = false, error = "blocked by the workspace gate" }
+  end
+  spr = app.activeSprite
+  if not spr then
+    return { ok = false, reason = "no-document", error = "no document is open" }
+  end
+
+  -- 快照（用户拍板的要求）：label 形如 "before: apply fixed image"，
+  -- 落地前先记一条，rollback 能退回应用前。
+  local okSnap, snap = pcall(versions.push, "before: " .. label, spr)
+  if okSnap then
+    self.panel:log(string.format(i18n.t("autoBacked"), snap.id, snap.label), "tool")
+  end
+
+  local res = pixfix.applyFixedRGBA(spr, info.data, info.w, info.h, { name = info.name })
+  if not res.ok then
+    self.panel:log(string.format(i18n.t("fxFailed"), tostring(res.error)), "error")
+    return { ok = false, error = res.error }
+  end
+
+  self.panel:log(string.format(i18n.t("fxApplied"), res.layer, res.result), "tool")
+  if res.expanded then
+    self.panel:log(string.format(i18n.t("fxGrew"), res.canvasFrom, res.canvas), "info")
+  end
+  self:invalidateFrame()
+
+  return {
+    ok = true,
+    layer = res.layer,
+    at = res.at,
+    canvas = res.canvas,
+    canvasFrom = res.canvasFrom,
+    expanded = res.expanded,
+    snapshot = okSnap and snap.id or nil,
+  }
+end
+
+-- perfect_pixel 结果的落地入口（二进制帧：import_image 头帧 + RGBA 负载）。
+--
+-- 两条路，共用 applyFixed 这一份像素代码：
+--   target="active"  -> 就地加图层（同一轮结束时回 import_result 给桥）
+--   没有可用文档      -> 开预览文档 + 记为待应用（面板上出现「应用这个结果」）
+--   target="preview" -> 上传图矫正 / 无文档兜底：开预览文档 + 记为待应用
+function Agent:importImage(header, data)
+  local w, h = header.width, header.height
   if not w or not h or #data ~= w * h * 4 then
     self.panel:log(string.format(i18n.t("importMismatch"),
       #data, (w or 0) * (h or 0) * 4), "error")
+    self:send{ type = "import_result", id = header.id, applied = false,
+               error = "size mismatch" }
     return
   end
 
+  local target = header.target
+  -- target 是桥按来源给的意图；这里再做一次事实判断：
+  -- "bridge 以为是 active" 与 "现在真有文档" 是两件事（用户可能刚把文档关了）。
+  if target == "active" and app.activeSprite then
+    local res = self:applyFixed{
+      data = data, w = w, h = h,
+      label = header.label or "apply fixed image",
+    }
+    if res.ok then
+      self:send{ type = "import_result", id = header.id, applied = true,
+                 layer = res.layer, canvas = res.canvas, canvasFrom = res.canvasFrom,
+                 expanded = res.expanded, pending = false }
+      return
+    end
+    if res.reason ~= "no-document" then
+      self:send{ type = "import_result", id = header.id, applied = false, error = res.error }
+      return
+    end
+    -- 没有文档：落到下面的预览分支，同时保留待应用状态
+  end
+
+  self:setPendingApply{ data = data, w = w, h = h, label = header.label or "fixed image" }
+  local ok, err = self:openPreviewDoc(data, w, h, header.note)
+  if not ok then
+    self:send{ type = "import_result", id = header.id, applied = false,
+               pending = true, error = tostring(err) }
+    return
+  end
+  self:send{ type = "import_result", id = header.id, applied = false, openedDoc = true,
+             pending = true, noDocument = (app.activeSprite == nil) }
+end
+
+-- 开预览文档（上传图矫正 / 没有文档可贴时的兜底）。这就是改造前唯一的那条路。
+function Agent:openPreviewDoc(data, w, h, note)
   local ok, err = pcall(function()
     app.command.NewFile{ width = w, height = h, colorMode = ColorMode.RGB }
     local img = app.activeCel.image
@@ -1125,11 +1234,42 @@ function Agent:importImage(header, data)  local w, h = header.width, header.heig
   end)
 
   if ok then
-    self.panel:log(string.format(i18n.t("openedDoc"),
-      w, h, header.note and ("  (" .. header.note .. ")") or ""), "ai")
+    self.panel:log(string.format(i18n.t("fxOpened"), w, h,
+      note and ("  (" .. note .. ")") or ""), "ai")
+    self.panel:log(i18n.t("fxPending"), "info")
     self.panel:log(i18n.t("blurry"), "info")
-  else
-    self.panel:log(string.format(i18n.t("importFailed"), tostring(err)), "error")
+    return true
+  end
+  self.panel:log(string.format(i18n.t("importFailed"), tostring(err)), "error")
+  return false, err
+end
+
+-- 待应用结果：面板据此显示「应用这个结果」，点了才落地。
+function Agent:setPendingApply(info)
+  self.pendingApply = info
+  if self.panel then self.panel:setPendingApply(info ~= nil) end
+end
+
+function Agent:clearPendingApply()
+  self:setPendingApply(nil)
+end
+
+-- 面板点了「应用这个结果」：把待应用的那份像素贴进当前活动文档。
+-- 成功（含开预览文档那一步之外的任何情况）后按钮就消失。
+function Agent:applyPendingFixed()
+  local p = self.pendingApply
+  if not p then return end
+  if not app.activeSprite then
+    self.panel:log(i18n.t("fxNeedDoc"), "error")
+    return          -- 没有文档：待应用状态与按钮都留着，用户开好文档再点
+  end
+
+  local res = self:applyFixed{
+    data = p.data, w = p.w, h = p.h,
+    label = p.label or "apply fixed image",
+  }
+  if res.ok then
+    self:clearPendingApply()
   end
 end
 

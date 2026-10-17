@@ -209,6 +209,10 @@ function panel.new(opts)
     lastMode = "panel",       -- 最小化之前是哪个形态（还原时回去）
     -- 图片矫正队列
     fixQueue = {},
+    -- 待应用的矫正结果（有值 -> 日志区底部出现「应用这个结果」条）
+    pendingApply = false,
+    applyHover = false,
+    applyHit = nil,
     -- 栏内控件（v0.5.3）
     ctx = { used = 0, budget = 0 },
     thinking = "auto",
@@ -631,6 +635,13 @@ end
 
 function Panel:_onCanvasMouseMove(ev)
   if self:_onBarMouseMove(ev) then return end
+  -- 「应用这个结果」条：悬浮高亮必须重绘（和命令表同一套路）
+  local hitApply = self:applyHitAt(ev.x, ev.y)
+  if hitApply ~= (self.applyHover == true) then
+    self.applyHover = hitApply
+    self:repaint()
+    return
+  end
   local idx = self:_menuIndexAt(ev.x or 0, ev.y or 0)
   if (idx or 0) ~= (self.menuHover or 0) then
     self.menuHover = idx or 0
@@ -680,6 +691,11 @@ end
 function Panel:_onCanvasMouseDown(ev, dlg)
   if ev.button ~= MouseButton.LEFT then return end
   if self:_onBarMouseDown(ev) then return end
+  -- 「应用这个结果」：点整条都算（不是只有文字），点完不抢输入焦点
+  if self:applyHitAt(ev.x, ev.y) then
+    if self.opts.onAction then self.opts.onAction("apply_result") end
+    return
+  end
   if self:_menuIndexAt(ev.x or 0, ev.y or 0) then return end
   if self.inputFocused then return end
   dlg = dlg or self.dlg
@@ -1517,11 +1533,42 @@ function Panel:_menuIndexAt(x, y)
 end
 
 ----------------------------------------------------------------------
+-- 待应用的矫正结果：「应用这个结果」条
+--
+-- 什么时候出现：perfect_pixel 把结果【开成了预览文档】（上传图矫正，或当时没有
+-- 打开的文档）-> agent 调 setPendingApply(true)。这时结果还没进用户的画布，
+-- 面板底部就多一条可点的横条，点一下才落地成当前活动文档的新图层。
+-- 什么时候消失：agent 在"落地成功"或"再没有待应用结果"时调 setPendingApply(false)。
+-- 状态本身存在 agent.pendingApply（像素在那儿），面板只存一个布尔。
+--
+-- 为什么做成画布上自绘的一条而不是原生按钮：底部的原生按钮只有 entry 那三颗
+-- （见 _build 的注释），加一颗会改窗口几何，而 panel_test 里有一批几何断言。
+-- 自绘条在日志区底部、输入区上方，不碰任何既有几何。
+----------------------------------------------------------------------
+
+function Panel:setPendingApply(on)
+  self.pendingApply = on == true
+  -- 小面板的图标清单也要跟着变（多/少一颗「应用结果」），缓存要失效
+  if self.mini then self.mini:invalidate() end
+  self:repaint()
+end
+
+function Panel:hasPendingApply() return self.pendingApply == true end
+
+-- 命中测试：给 _onCanvasMouseMove / _onCanvasMouseDown 和测试用。
+-- 只在结果条真的画出来的那一帧有效（矩形由 _paint 记下）。
+function Panel:applyHitAt(x, y)
+  local h = self.applyHit
+  if not h then return false end
+  x, y = x or 0, y or 0
+  return x >= h.x and x < h.x + h.w and y >= h.y and y < h.y + h.h
+end
+
+----------------------------------------------------------------------
 -- 图片矫正：队列 + 小确认窗（两段式）
 ----------------------------------------------------------------------
 
 function Panel:fixQueueSize() return #(self.fixQueue or {}) end
-
 function Panel:addFixFile(path)
   self.fixQueue = self.fixQueue or {}
   path = tostring(path or "")
@@ -1717,6 +1764,10 @@ function Panel:_miniItems()
     fix = "fix", bar = "versions", settings = "settings", close = "clear",
   }
   local out = {}
+  -- 有待应用结果时排第一位：小面板里点它也能落地，不必先展开主面板
+  if self.pendingApply then
+    out[#out + 1] = { id = "apply_result", icon = "apply", label = i18n.miniLabel("apply_result") }
+  end
   for _, id in ipairs(ids) do
     out[#out + 1] = { id = id, icon = icons[id], label = i18n.miniLabel(id) }
   end
@@ -1883,6 +1934,8 @@ function Panel:_paint(gc)
   self.canvasW, self.canvasH = w, h
   self.barHit = {}
   self.thinkTrack = nil
+  -- 结果条只在面板形态、且结果条真的画出来的那一帧才可点；其余形态一律清掉（用 setPendingApply 通知即可重新画出来）
+  self.applyHit = nil
 
   -- 栏模式下底色可配置（G5）：Aseprite 读不到主题色（实测真名假名都返回 0,0,0），
   -- 所以给用户一个填色口来贴合自己的主题；没填就用面板默认深色。
@@ -2042,6 +2095,22 @@ function Panel:_paint(gc)
   if self.hint ~= "" then
     gc.color = DIM
     gc:fillText(self.hint, 6, logBottom - 1 - lh)
+  end
+
+  -- 「应用这个结果」条：日志区最底下一条（提示行之下、输入区之上）。
+  -- 整条可点（命中矩形记在 self.applyHit，鼠标事件靠它判定）。
+  if self.pendingApply then
+    local barH = lh + 4
+    local barY = inputTop - 4 - barH
+    if barY < logTop then barY = logTop end     -- 极窄窗口：宁可靠上也不画到输入区
+    self.applyHit = { x = 0, y = barY, w = w, h = barH }
+    gc.color = self.applyHover and MENU_HL or MENU_TX
+    gc:fillRect(Rectangle(2, barY, w - 4, barH))
+    gc.color = self.applyHover and MENU_HLT or BG
+    gc:fillText(i18n.t("fxBtn"), 6, barY + 2)
+    self.dbg = tostring(self.dbg) .. string.format(" apply=%d,%d,%d", barY, barH, self.applyHover and 1 or 0)
+  else
+    self.applyHit = nil
   end
 end
 

@@ -241,7 +241,7 @@ end
 -- 自动减色：中位切分（median cut）把用色数压到 colors 以内，并同步调色板。
 -- 用户明确要求过这个能力（"配色太杂，合并到 64 色以内"），所以别再回答"做不到"。
 -- 透明像素不参与统计也不改；alpha 原样保留，只换 RGB。
-local function op_quantize(img, o, sprite)
+local function op_quantize(img, o, sprite, ctx)
   local target = math.floor(tonumber(o.colors) or 64)
   if target < 2 or target > 256 then
     error("quantize: 'colors' must be between 2 and 256")
@@ -259,24 +259,29 @@ local function op_quantize(img, o, sprite)
       region.w, region.h))
   end
 
-  -- 1) 直方图（只数不透明像素）
-  local src = img.bytes
+  -- 1) 直方图（只数不透明像素）。多层同时减色时用【所有目标层的并集】算一份调色板 ——
+  --    调色板是全图共享的，逐层各算一份会互相踩（后一层把前一层的色表覆盖掉）。
   local hist, colors, opaque = {}, {}, 0
-  for y = region.y, region.y + region.h - 1 do
-    local base = y * stride + region.x * 4 + 1
-    for i = 0, region.w - 1 do
-      local p = base + i * 4
-      local rr, gg, bb, aa = src:byte(p, p + 3)
-      if aa > 0 then
-        opaque = opaque + 1
-        local key = rr * 65536 + gg * 256 + bb
-        local e = hist[key]
-        if e then
-          e.n = e.n + 1
-        else
-          e = { r = rr, g = gg, b = bb, n = 1 }
-          hist[key] = e
-          colors[#colors + 1] = e
+  for _, im in ipairs((ctx and ctx.images) or { img }) do
+    if im.bytesPerPixel == 4 and im.width == w and im.height == h then
+      local src, st = im.bytes, im.rowStride
+      for y = region.y, region.y + region.h - 1 do
+        local base = y * st + region.x * 4 + 1
+        for i = 0, region.w - 1 do
+          local p = base + i * 4
+          local rr, gg, bb, aa = src:byte(p, p + 3)
+          if aa > 0 then
+            opaque = opaque + 1
+            local key = rr * 65536 + gg * 256 + bb
+            local e = hist[key]
+            if e then
+              e.n = e.n + 1
+            else
+              e = { r = rr, g = gg, b = bb, n = 1 }
+              hist[key] = e
+              colors[#colors + 1] = e
+            end
+          end
         end
       end
     end
@@ -479,16 +484,106 @@ function ops.describe()
   return table.concat(out, "\n")
 end
 
--- 在单个事务里执行一串算子。label 会成为撤销步骤的名字。
--- targetCel 可选（默认当前活动 cel），传参是为了让无头测试能指定目标。
-function ops.run(list, label, targetCel)
-  local cel = targetCel or app.activeCel
-  if not cel or not cel.image then error("the current layer has no editable cel; select a layer first") end
-  local sprite = cel.sprite or app.activeSprite
+-- 把"目标层"规格解析成 cel 列表。spec 允许：
+--   nil / ""              -> 当前活动 cel（老行为，不变）
+--   "all"                 -> 当前帧里所有有可编辑 cel 的层
+--   "base"                -> 指定层名
+--   { "base", "detail" }  -> 多个层名
+-- 名字找不到时把本文档的层名一起报出去，模型下一轮能自己纠正。
+function ops.resolveCels(sprite, frame, spec)
+  sprite = sprite or app.activeSprite
   if not sprite then error("no document is open") end
+  frame = frame or 1
+
+  local names = {}
+  for _, l in ipairs(sprite.layers) do names[#names + 1] = l.name end
+
+  local wanted = {}
+  if spec == nil or spec == "" then
+    local c = app.activeCel
+    if not c or not c.image then error("the current layer has no editable cel; select a layer first") end
+    wanted[1] = c
+  elseif type(spec) == "string" and spec:lower() == "all" then
+    for _, l in ipairs(sprite.layers) do
+      local c = l:cel(frame)
+      if c and c.image then wanted[#wanted + 1] = c end
+    end
+    if #wanted == 0 then error("no layer in this document has an editable cel") end
+  else
+    local list = (type(spec) == "table") and spec or { spec }
+    for _, one in ipairs(list) do
+      local want = tostring(one)
+      local hit = nil
+      for _, l in ipairs(sprite.layers) do
+        if l.name == want then hit = l break end
+      end
+      if not hit then
+        error(string.format("no layer named %q; layers in this document: %s",
+          want, table.concat(names, ", ")))
+      end
+      local c = hit:cel(frame)
+      if not c or not c.image then
+        error(string.format("layer %q has no editable cel in this frame", want))
+      end
+      wanted[#wanted + 1] = c
+    end
+  end
+
+  local seen, out = {}, {}
+  for _, c in ipairs(wanted) do
+    if not seen[c] then seen[c] = true; out[#out + 1] = c end
+  end
+  return out
+end
+
+-- 一层有多少不透明像素。只在"一个像素都没改到"时算，用来给模型指路。
+local function opaqueCount(cel)
+  if not cel or not cel.image then return 0 end
+  local img = cel.image
+  if img.bytesPerPixel ~= 4 then return 0 end
+  local src, stride = img.bytes, img.rowStride
+  local n = 0
+  for y = 0, img.height - 1 do
+    local base = y * stride + 1
+    for x = 0, img.width - 1 do
+      if src:byte(base + x * 4 + 3) > 0 then n = n + 1 end
+    end
+  end
+  return n
+end
+
+-- 在单个事务里执行一串算子。label 会成为撤销步骤的名字。
+-- targets 可以是单个 cel（老行为，无头测试用），也可以是 cel 列表（多层一起改）。
+-- 多层：一个事务 = 一步撤销；各层改各自的图像，直方图类算子（quantize）用全部目标层的并集。
+function ops.run(list, label, targets)
   if type(list) ~= "table" or #list == 0 then error("nothing to execute") end
 
-  local img = cel.image
+  local cels
+  if targets == nil then
+    local c = app.activeCel
+    if not c or not c.image then error("the current layer has no editable cel; select a layer first") end
+    cels = { c }
+  elseif type(targets) == "table" and targets[1] ~= nil then
+    cels = targets
+  else
+    cels = { targets }
+  end
+  local first = cels[1]
+  if not first or not first.image then
+    error("the current layer has no editable cel; select a layer first")
+  end
+  local sprite = first.sprite or app.activeSprite
+  if not sprite then error("no document is open") end
+
+  local images, layerNames = {}, {}
+  for i, c in ipairs(cels) do
+    if not c.image then
+      error("layer has no editable cel: " .. tostring(c.layer and c.layer.name))
+    end
+    images[i] = c.image
+    layerNames[i] = c.layer.name
+  end
+  local multi = #images > 1
   local reports = {}
 
   app.transaction("AI: " .. (label or "编辑"), function()
@@ -498,19 +593,62 @@ function ops.run(list, label, targetCel)
       if not entry then
         error("unknown op " .. tostring(name) .. "; available ops: " .. table.concat(ops.names, ", "))
       end
-      local changed, extra = entry.fn(img, op, sprite)
-      reports[#reports + 1] = {
-        index = i, op = name, changed = changed or 0, extra = extra,
-      }
+      local total, extra, perLayer = 0, nil, {}
+      for k, img in ipairs(images) do
+        local changed, ex = entry.fn(img, op, sprite, { images = images, layer = layerNames[k] })
+        changed = changed or 0
+        total = total + changed
+        if ex then extra = ex end
+        if multi then perLayer[#perLayer + 1] = { layer = layerNames[k], changed = changed } end
+      end
+      local rep = { index = i, op = name, changed = total, extra = extra }
+      if multi then rep.perLayer = perLayer end
+      reports[#reports + 1] = rep
     end
   end)
 
-  return {
+  local res = {
     sprite = (sprite.filename ~= "" and app.fs.fileName(sprite.filename)) or "(未命名)",
-    layer = cel.layer.name,
-    frame = cel.frameNumber,
+    frame = first.frameNumber,
     ops = reports,
   }
+  if multi then
+    res.layers = layerNames
+    res.scope = "layers"
+  else
+    res.layer = layerNames[1]
+  end
+
+  -- 一个像素都没改到：把"别的层里有东西"直接告诉模型，别让它下一轮靠猜
+  local totalChanged = 0
+  for _, r in ipairs(reports) do totalChanged = totalChanged + r.changed end
+  if totalChanged == 0 then
+    local ok, candidates = pcall(function()
+      local out = {}
+      for _, l in ipairs(sprite.layers) do
+        local isTarget = false
+        for _, n in ipairs(layerNames) do if n == l.name then isTarget = true end end
+        if not isTarget then
+          local n = opaqueCount(l:cel(first.frameNumber))
+          if n > 0 then out[#out + 1] = { layer = l.name, opaque = n } end
+        end
+      end
+      return out
+    end)
+    if ok and #candidates > 0 then
+      res.hint = {
+        warning = string.format(
+          "no pixel changed on %s. Other layers do have content -- if the effect was meant for " ..
+          "the whole image, retry with layers:\"all\" or layers:[\"<name>\"], or pass another op.",
+          table.concat(layerNames, ", ")),
+        layersWithContent = candidates,
+      }
+    else
+      res.hint = { warning = "no pixel changed; the op had nothing to do in the target layer(s)" }
+    end
+  end
+
+  return res
 end
 
 -- 统计画布用色（给 AI 当上下文，也给色值库用）

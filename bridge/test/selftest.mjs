@@ -174,7 +174,7 @@ class MockAseprite {
 
     switch (msg.type) {
       case 'run_ops': {
-        this.received.push({ type: 'run_ops_payload', ops: msg.ops, label: msg.label });
+        this.received.push({ type: 'run_ops_payload', ops: msg.ops, label: msg.label, layers: msg.layers });
         if (this.failNextOps) {
           const err = this.failNextOps;
           this.failNextOps = null;
@@ -358,6 +358,25 @@ async function main() {
   check('label 正确', runOps && runOps.label === '背景换蓝', runOps?.label);
   const aiSay = ase.says.filter((s) => s.kind === 'ai');
   check('AI 最终回复推送到面板', aiSay.some((s) => s.text.includes('蓝色')), ase.says);
+
+  // ---- 场景 1b：apply_ops 的图层目标（默认活动层 / all / 指定层）
+  console.log('== 场景 1b：apply_ops 的图层目标归一化 ==');
+  ase.received.length = 0;
+  mockLlm.close();
+  mockLlm = await startMockLlm([
+    toolCall('call_1b', 'apply_ops', { label: '整图对比度', ops: [{ op: 'contrast', amount: 1.3 }], layers: 'all' }),
+    toolCall('call_1c', 'apply_ops', { label: '只改 base', ops: [{ op: 'contrast', amount: 1.3 }], layer: 'base' }),
+    toolCall('call_1d', 'apply_ops', { label: '默认活动层', ops: [{ op: 'contrast', amount: 1.3 }] }),
+    textReply('改好了。'),
+  ]);
+  await sleep(150);
+  ase.chat('整体加对比度，再只调 base 层');
+  await sleep(2200);
+  const layerPayloads = ase.received.filter((m) => m.type === 'run_ops_payload');
+  check('layers:"all" 原样下发', layerPayloads[0] && layerPayloads[0].layers === 'all', layerPayloads[0]);
+  check('layer:"base" 归一化成单层名', layerPayloads[1] && layerPayloads[1].layers === 'base', layerPayloads[1]);
+  check('不给图层时不下发 layers（= 活动层）',
+    layerPayloads[2] && layerPayloads[2].layers === undefined, layerPayloads[2]);
 
   // ---- 场景 2：算子失败时错误回传
   console.log('== 场景 2：Aseprite 拒绝操作时，错误回到模型 ==');

@@ -46,7 +46,14 @@ export const TOOLS = [
     function: {
       name: 'apply_ops',
       description:
-        'Run a list of canvas ops on the active layer. The system snapshots first; the whole batch is one undo step. ' +
+        'Run a list of canvas ops. By default they apply to the ACTIVE LAYER only; pass layers:"all" to hit every ' +
+        'layer of the current frame, or layers:["base","detail"] to pick specific ones. ' +
+        'Image-wide requests (more contrast, sharpen, reduce the colours, swap a colour everywhere) almost always ' +
+        'want layers:"all" on a multi-layer sprite -- an active-layer-only edit looks like "nothing happened" to the ' +
+        'user, because the pixels they are looking at live on another layer. ' +
+        'One transaction = one undo step for the whole batch, across all layers. ' +
+        'The report gives changed pixels per op (and per layer when several were hit); if 0 pixels changed you also ' +
+        'get a hint listing the layers that DO have content -- retarget with it instead of guessing. ' +
         'Ops: ' +
         'replace_color(from,to,tolerance) swaps one colour for another; ' +
         'erase_color(color) makes a colour transparent; ' +
@@ -69,6 +76,18 @@ export const TOOLS = [
           label: {
             type: 'string',
             description: 'Short description of this edit; becomes the undo step name, e.g. "background to blue"',
+          },
+          layer: {
+            type: 'string',
+            description: 'Optional: name of ONE layer to apply to (default: the active layer)',
+          },
+          layers: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Optional: which layers to apply to. ["all"] = every layer of the current frame; ' +
+              'otherwise a list of layer names (e.g. ["base","highlight"]). ' +
+              'Use "all" for any image-wide effect. Takes precedence over layer.',
           },
           ops: {
             type: 'array',
@@ -409,9 +428,11 @@ export const TOOLS = [
       name: 'perfect_pixel',
       description:
         'Run Perfect Pixel Studio\'s core algorithm: detect the pixel grid of an image that only looks like pixel art (skewed cells, blurry edges) and resample it into true pixel art. ' +
-        'The result opens as a NEW document in Aseprite so the user can copy from it. ' +
-        'Use source="uploaded" when the user uploaded an image, source="active_canvas" to fix the canvas they have open. ' +
-        'If automatic detection fails, retry with an explicit gridSize such as [32,32].',
+        'source="active_canvas" applies the result IN PLACE: the current document gains one new layer (named "PP <w>x<h>") holding the fixed image at (0,0); no existing pixel is touched, and if the result is larger than the canvas the canvas is grown (never cropped). ' +
+        'The whole apply is one undo step and is snapshotted first, so rollback also works. ' +
+        'source="uploaded" (fixing a picture the user dropped in) opens the result as a NEW preview document and also leaves an "Apply this result" button in the panel for the user to drop it onto whatever document is active later. ' +
+        'If automatic detection fails, retry with an explicit gridSize such as [32,32]. ' +
+        'Read the returned "applied" / "openedDoc" fields to describe what really happened instead of guessing.',
       parameters: {
         type: 'object',
         properties: {
@@ -660,15 +681,27 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
         if (!Array.isArray(args.ops) || args.ops.length === 0) {
           return { error: 'ops is empty' };
         }
+        // 目标层归一化：接受 layers:"all" / layers:["base"] / layer:"base" / 都不给（活动层）
+        let targets;
+        if (args.layers != null) targets = Array.isArray(args.layers) ? args.layers : [args.layers];
+        else if (args.layer != null && String(args.layer).trim() !== '') targets = [String(args.layer)];
+        if (Array.isArray(targets)) {
+          targets = targets.map((t) => String(t).trim()).filter((t) => t !== '');
+          if (targets.length === 0) targets = undefined;
+          else if (targets.length === 1) targets = targets[0];
+        }
         return await session.request('run_ops', {
           label: args.label || 'AI edit',
           ops: args.ops,
+          layers: targets,
         });
       }
 
       case 'perfect_pixel': {
         const source = args.source || 'uploaded';
-        let buf, w, h, note, sourceKey;
+        // 落地方式：active = 就地贴进当前文档的新图层（只可能来自 active_canvas）；
+        // preview = 开预览文档（上传图，或扩展侧发现没有可用文档时自己退回这一档）
+        let buf, w, h, note, sourceKey, target, label;
         if (source === 'uploaded') {
           if (!session.upload) {
             return { error: 'No image has been uploaded yet. Pick a file in the panel and click "Fix Image".' };
@@ -676,6 +709,8 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
           ({ buf, w, h } = session.upload);
           note = `from upload ${session.upload.name}`;
           sourceKey = `upload:${session.upload.name}`;
+          target = 'preview';
+          label = `PP ${session.upload.name}`;
         } else {
           const got = await session.request('get_canvas');
           if (got.error) return got;
@@ -684,6 +719,8 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
           h = got.height;
           note = 'from the active canvas';
           sourceKey = `canvas:${w}x${h}`;
+          target = 'active';
+          label = 'fixed image';
         }
 
         // 同一轮里已经矫正过这个来源了 —— 模型在复读，别再开一个文档（P8）
@@ -736,20 +773,56 @@ export function makeDispatcher({ session, bank, memory, styles, cfg, bundlePath,
         }
 
         session.turnProcessed?.add(sourceKey);
-        await session.sendImport(res.data, res.outWidth, res.outHeight, note);
+        const placed = await session.sendImport(res.data, res.outWidth, res.outHeight, note, { target, label });
 
         // 诊断（P9）：把四组尺寸推到面板，用户觉得结果不对时可以直接截图
         session.say?.('info', `perfect_pixel: input=${res.inputWidth}x${res.inputHeight} grid=${res.gridW}x${res.gridH} refined=${res.refinedW}x${res.refinedH} output=${res.outWidth}x${res.outHeight} sample=${args.sampleMethod || 'center'} colors=${distinctColors}`);
 
-        return {
+        const out = {
           detected: true,
           input: `${res.inputWidth}x${res.inputHeight}`,
           grid: `${res.gridW}x${res.gridH}`,
           refined: `${res.refinedW}x${res.refinedH}`,
           output: `${res.outWidth}x${res.outHeight}`,
           distinctColors,
-          note: 'Result opened as a new document; the user can copy from it.',
         };
+
+        // 落地结果：note 必须如实描述发生了什么，别让模型猜（也别再一律说"开了新文档"）
+        if (placed && placed.applied) {
+          out.applied = true;
+          out.layer = placed.layer || null;
+          out.canvas = placed.canvas || null;
+          out.expanded = !!placed.expanded;
+          if (placed.expanded) out.canvasWas = placed.canvasFrom || null;
+          out.note =
+            `Applied in place: added layer "${placed.layer}" with the ${res.outWidth}x${res.outHeight} fixed image at (0,0) ` +
+            `of the active document` +
+            (placed.expanded
+              ? `, growing its canvas from ${placed.canvasFrom} to ${placed.canvas} after EXTENDING the canvas` +
+                ` (nothing was cropped).`
+              : ` (canvas stayed ${placed.canvas}).`) +
+            ` No existing pixel changed, the apply is one undo step, and a snapshot was taken first so rollback works. ` +
+            `Report this to the user as done in their current document -- do NOT tell them to open or copy from another document.`;
+        } else if (placed && placed.applied === false && placed.reason === 'no-document') {
+          out.applied = false;
+          out.openedDoc = true;
+          out.pendingApply = true;
+          out.note =
+            `No document was open, so the ${res.outWidth}x${res.outHeight} result was opened as a new document instead. ` +
+            `It is also held as a pending result: once the user has a document open, the panel shows an "Apply this result" button that drops it in as a new layer. ` +
+            `Tell the user to open their artwork and click that button -- do not tell them to copy pixels by hand.`;
+        } else {
+          out.applied = false;
+          out.openedDoc = true;
+          out.pendingApply = !!(placed && placed.pending);
+          out.note =
+            `Opened as a new ${res.outWidth}x${res.outHeight} document so the user can copy from it. ` +
+            `It is also held as a pending result: the panel's "Apply this result" button drops it into the active document as a new layer ` +
+            `(canvas grown if needed, existing pixels untouched). ` +
+            `Say that the result is ready to be applied -- do not claim the user's canvas was already changed.`;
+        }
+        if (placed && placed.error) out.applyError = String(placed.error);
+        return out;
       }
 
       case 'ask_user': {

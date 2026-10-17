@@ -16,6 +16,35 @@ GUI 端到端已在真实 Aseprite 里跑通并留下截图证据；中文像素
 
 **v0.5.7：最小化小窗补上输入行 —— 收起来以后照样能打字、而且看得见自己打了什么（gaps.md #2 的兑现）。**
 
+### 本轮（未发版：apply_ops 图层语义 —— 「说了整张图，却只动了一层」）
+
+用户实测后的原话是「我总觉得还是不能用啊」。翻 21:31–21:50 那轮真机对话
+（`bridge/data/conversations/c-20261016-xt53.json`）定位到三条具体堵点，本轮先修最要命的一条：
+
+1. **`apply_ops` 只作用于活动图层**（`ops.run` 拿 `app.activeCel`），而模型**无从知道**要传层：
+   用户说"整体加对比度"，模型改的是当时活动的那一层，其余 4 层没动；甚至 `outline`
+   改了 **0 像素**却回 `ok:true`，模型只好自己重新 `draw_art` 画一遍。现在：
+   - `apply_ops` 新增 `layer`（单层）/ `layers`（`"all"` 或层名数组）；**都不给 = 活动层，老行为一字不变**。
+   - Lua 侧新增 `ops.resolveCels(sprite, frame, spec)`：`"all"` = 当前帧所有有 cel 的层；
+     层名写错时**报错并列出本文档的层名**（模型下一轮能自己纠正，不用猜）。
+   - `ops.run(list, label, targets)` 接受 cel 列表：**一个事务 = 一步撤销**，逐层报告
+     `perLayer`，总数放 `changed`。
+   - **0 改动时回 `hint`**：列出别的层各有多少不透明像素，直接说"改错层了，重试用
+     `layers:\"all\"`" —— 这是本轮最省事的自愈机制。
+   - **多层 `quantize` 用并集直方图**：调色板是全图共享的，逐层各算一份会互相踩
+     （后一层覆盖前一层的色表），所以 `op_quantize` 新增 `ctx` 参数、直方图数**所有目标层**。
+   - 系统提示新增**规则 12d**（`bridge/config.example.json` 与本地 `config.json` 同步写入，
+     改前已备份）；`apply_ops` 工具描述改写（默认活动层 / 整图要 `layers:"all"` /
+     0 改动必须看 hint 再重试）。
+2. **测试 +23**：`ops_test` 82 → **97**（四种规格的 resolveCels、层名报错、perLayer 汇总、
+   0 改动 hint、并集直方图 3 色 → 2 色）；`workspace_test` **+8**（走真消息入口 `feed`
+   打通 `msg.layers → 真画布`：两层都真的被改、层名写错报错、省 layers 时只动活动层）；
+   `selftest` 152 → **155**（`layers:"all"` 原样下发 / `layer:"base"` 归一化成单层名 /
+   不给就不下发 `layers`）。
+
+**测试**：Lua **924** + 桥 **473** = **1397** 项全绿（`workspace_test` 的断言数会随工作区里的残留
+测试产物逐次上涨，实测 229 → 235 → 239，全程 0 失败；`git status` 保持干净）。
+
 ### 本轮（v0.5.9：二进制通道 / 超时 / 锐化与对比 / 小窗贴角）
 
 用户一口气提了四件事（原话在 plan 文档里）。**先查再动手**，查出两件事和说法不一样：
@@ -508,16 +537,38 @@ install.ps1 现在复制完会删掉目标目录里的 `bridge/`，源码安装�
 ## 复现测试
 
 ```bash
-aseprite.exe -b --script tests/lua/ops_test.lua
-aseprite.exe -b --script tests/lua/versions_test.lua
-aseprite.exe -b --script tests/lua/menu_test.lua
-cd bridge && node test/selftest.mjs
+# 无头 Lua 套件：11 个文件，2026-10-16 实测 924 项全绿
+aseprite.exe -b --script tests/lua/ops_test.lua        # 97（算子 + 目标层 layers）
+aseprite.exe -b --script tests/lua/artop_test.lua      # 103（协议层：桥的消息 -> 真动画布）
+aseprite.exe -b --script tests/lua/workspace_test.lua  # 229+（工作区；需要 ASE_PROJ=<repo 根>；断言数随残留产物漂移）
+aseprite.exe -b --script tests/lua/panel_test.lua      # 254
+aseprite.exe -b --script tests/lua/menu_test.lua       # 89
+aseprite.exe -b --script tests/lua/settings_test.lua   # 44
+aseprite.exe -b --script tests/lua/artlib_test.lua     # 40
+aseprite.exe -b --script tests/lua/sizelib_test.lua    # 23
+aseprite.exe -b --script tests/lua/versions_test.lua   # 20
+aseprite.exe -b --script tests/lua/ws_test.lua         # 20
+aseprite.exe -b --script tests/lua/path_test.lua       # 5
 
-# GUI 可视化验证（会短暂弹 Aseprite 窗口，自动截图后杀进程）
-bash tests/run_gui_visual.sh tests/lua/gui_panel_final.png
-bash tests/run_gui_visual.sh --term        # 终端 + 命令表 + 小面板（中文），截两张
-bash tests/run_gui_visual.sh --term-en     # 英文模式同上
+# 桥套件：7 个文件，实测 473 项全绿
+cd bridge && npm test
+
+# GUI 可视化验证（会短暂弹 Aseprite 窗口，探针跑完自动截图）
+bash tests/run_gui_agent.sh tests/lua/gui_agent_shot.png   # 末尾应见 RESULT=DONE + extension restored
+bash tests/run_gui_bar.sh   tests/lua/gui_bar_shot.png
 ```
+
+⚠️ **`tests/run_gui_visual.sh` 已过期，别用**：它给探针写的 `[script_access]` 清单漏了
+`__project.lua`，Aseprite 会弹**原生安全授权框**把探针挡在门外（截到的只有弹框，
+`%TEMP%\gui_visual.log` 是 0 字节）；它第 94 行还 `cd "$PROJ/bridge"`，相对 `-Out`
+会落到错误目录。改用 `run_gui_agent.sh` / `run_gui_bar.sh`。
+
+⚠️ 截图 `-Out` **必须传绝对路径**；`.sh` 脚本要用 **Git Bash**
+（`C:\Program Files\Git\bin\bash.exe`）—— PATH 里的 `bash` 是 WSL，`/D:/...` 路径会直接失败。
+
+⚠️ 无环境（`env` 为空）的自动化 runner 直接跑 `aseprite.exe -b` 会崩：
+`Error creating directory`（找不到 `%APPDATA%`）并留下 `memory.dmp`。
+至少要补 `APPDATA` / `USERPROFILE` / `TEMP` 三个变量。
 
 GUI 截图里能看到完整证据链：
 `Connected to local bridge` → `Bridge ready. Aseprite 1.3.18.6-dev, 7 ops available.` →
@@ -528,9 +579,10 @@ AI 回复 → `Auto-backed up v1 "before: 红色换蓝色"` → `Applied 1 op(s)
 不会拍到同屏幕位置上别的程序）；`-Method foreground` 是旧的前台方案，会校验前台窗口确实是
 Aseprite，不是就**拒绝截图**（防隐私泄露）。
 
-`run_gui_visual.sh` 会临时改两处首选项并**无条件还原**：
-`scripts.show_run_script_alert=false`（否则运行脚本弹确认框），
-以及预置 `[script_access]` 授权（否则 io.open/WebSocket 弹授权框阻塞，见下）。
+`run_gui_agent.sh` / `run_gui_bar.sh` 在探针期间把**已安装的扩展目录**挪到
+`%APPDATA%\Aseprite\_extensions_parked_ai-pixel-copilot`（`extensions/` 之外），
+这样 `__project.lua` 不会被读、也就不会弹原生授权框；跑完**无条件还原**扩展目录与
+`aseprite.ini`（`scripts.show_run_script_alert=false` 等）。
 
 ## 关键实现约束（踩过的坑，别重复踩）
 

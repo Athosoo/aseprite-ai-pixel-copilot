@@ -417,5 +417,88 @@ do
   check("describe 里列了 contrast", d:find("contrast", 1, true) ~= nil)
 end
 
+print("== ops: 目标层语义（layers / layer / 全部）==")
+do
+  -- 造一个三层文档：base 有内容、highlight 是空层、detail 有内容
+  local function makeDoc()
+    local spr = Sprite(8, 8, ColorMode.RGB)
+    app.activeSprite = spr
+    local base = spr.layers[1]
+    base.name = "base"
+    local cBase = app.activeCel
+    cBase.image:clear(Rectangle(0, 0, 8, 8), RED)
+
+    local function addLayer(name, color, rect)
+      local l = spr:newLayer()
+      l.name = name
+      local img = Image(8, 8, ColorMode.RGB)
+      if color then img:clear(rect, color) end
+      spr:newCel(l, 1, img)
+      return l
+    end
+    local lHl = addLayer("highlight")
+    local lDt = addLayer("detail", BLUE, Rectangle(0, 0, 4, 4))
+    return spr, cBase, lHl, lDt
+  end
+
+  local spr, cBase, lHl, lDt = makeDoc()
+  app.activeLayer = lDt
+
+  check("resolveCels('all') 拿到全部 3 层", #ops.resolveCels(spr, 1, "all") == 3,
+    #ops.resolveCels(spr, 1, "all"))
+  check("resolveCels('base') 只拿 1 层", #ops.resolveCels(spr, 1, "base") == 1)
+  check("resolveCels({base,detail}) 拿 2 层", #ops.resolveCels(spr, 1, { "base", "detail" }) == 2)
+  check("resolveCels(nil) 拿活动层", #ops.resolveCels(spr, 1, nil) == 1)
+  local okBad, errBad = pcall(ops.resolveCels, spr, 1, "nope")
+  check("层名不存在时报错并列出本文档的层",
+    (not okBad) and tostring(errBad):find("no layer named", 1, true) ~= nil
+      and tostring(errBad):find("base", 1, true) ~= nil, tostring(errBad))
+
+  -- 多层一起改：一个事务，逐层报告
+  local r = ops.run({ { op = "contrast", amount = 1.4 } }, "多层",
+    ops.resolveCels(spr, 1, { "base", "detail" }))
+  check("多层报告带 layers 列表", r.layers ~= nil and #r.layers == 2, r.layers and #r.layers)
+  check("多层报告里没有单个 layer 字段", r.layer == nil)
+  check("逐层改动数都在", r.ops[1].perLayer ~= nil and #r.ops[1].perLayer == 2)
+  check("改动总数 == 各层之和",
+    r.ops[1].changed == r.ops[1].perLayer[1].changed + r.ops[1].perLayer[2].changed,
+    r.ops[1].changed)
+  app.undo()
+
+  -- 一个像素都没改到：必须指出"别的层里有东西"，别让模型下一轮靠猜
+  local spr2, _, lHl2 = makeDoc()
+  app.activeLayer = lHl2
+  local r2 = ops.run({ { op = "contrast", amount = 1.4 } }, "空层")
+  check("在空层上改 0 像素", r2.ops[1].changed == 0, r2.ops[1].changed)
+  check("0 改动时给出 hint 警告", r2.hint ~= nil and r2.hint.warning ~= nil)
+  local hintNames = {}
+  for _, c in ipairs((r2.hint and r2.hint.layersWithContent) or {}) do
+    hintNames[#hintNames + 1] = c.layer
+  end
+  check("指路里列出了有内容的 base", table.concat(hintNames, ","):find("base", 1, true) ~= nil,
+    table.concat(hintNames, ","))
+
+  -- 多层 quantize：调色板全图共享，必须用【所有目标层的并集】算一份
+  local spr3 = Sprite(8, 8, ColorMode.RGB)
+  app.activeSprite = spr3
+  spr3.layers[1].name = "base"
+  app.activeCel.image:clear(Rectangle(0, 0, 8, 8), RED)
+  local l2 = spr3:newLayer()
+  l2.name = "detail"
+  local img2 = Image(8, 8, ColorMode.RGB)
+  img2:clear(Rectangle(0, 0, 4, 4), BLUE)
+  img2:clear(Rectangle(4, 4, 4, 4), GREEN)
+  spr3:newCel(l2, 1, img2)
+  local r3 = ops.run({ { op = "quantize", colors = 2 } }, "多层减色",
+    ops.resolveCels(spr3, 1, "all"))
+  check("多层直方图看到了两层的颜色（红+蓝+绿 = 3 色）",
+    r3.ops[1].extra ~= nil and r3.ops[1].extra.colorsBefore == 3,
+    r3.ops[1].extra and r3.ops[1].extra.colorsBefore)
+  check("多层减色后调色板同步成 2 色",
+    r3.ops[1].extra ~= nil and r3.ops[1].extra.paletteChanged == 2,
+    r3.ops[1].extra and r3.ops[1].extra.paletteChanged)
+  check("两层都出现在逐层报告里", r3.ops[1].perLayer ~= nil and #r3.ops[1].perLayer == 2)
+end
+
 print(string.format("\n==== ops_test: %d 通过, %d 失败 ====", passes, fails))
 if fails > 0 then error(fails .. " 个断言失败") end
