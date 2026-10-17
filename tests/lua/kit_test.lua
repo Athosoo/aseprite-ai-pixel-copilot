@@ -327,6 +327,81 @@ do
   kit:finish()
 end
 
+print("== kit: 假粗只对纯 ASCII 生效（中文偏移双画会糊成一团）==")
+do
+  local th = themeMod.new({ name = "dark", locale = "zh" })
+
+  -- 中文 + bold：只许画一次
+  local gcZh = fakeGC(900, 620)
+  local kitZhB = kitMod.new(gcZh, th)
+  kitZhB:begin()
+  kitZhB:region("main", { x = 0, y = 0, w = 400, h = 100 })
+  kitZhB:text({ x = 10, y = 10 }, "加强明暗对比", { bold = true, tone = "text" })
+  kitZhB:finish()
+  eq(#gcZh.texts, 1, "含中文的 bold 文本只发出 1 次 text 绘制")
+  local zhCall = kitZhB.calls[1]
+  eq(zhCall and zhCall.double, false, "中文 bold 不标记 double（不做偏移双画）")
+
+  -- 纯 ASCII + bold：照旧两次
+  local gcEn = fakeGC(900, 620)
+  local kitEnB = kitMod.new(gcEn, th)
+  kitEnB:begin()
+  kitEnB:region("main", { x = 0, y = 0, w = 400, h = 100 })
+  kitEnB:text({ x = 10, y = 10 }, "CONSOLE", { bold = true, tone = "text" })
+  kitEnB:finish()
+  eq(#gcEn.texts, 2, "纯 ASCII 的 bold 文本发出 2 次 text 绘制（假粗）")
+  eq(gcEn.texts[1].text, gcEn.texts[2].text, "两次画的是同一串")
+  eq(gcEn.texts[2].x, gcEn.texts[1].x + 1, "第二次偏移 1px（这才是假粗）")
+
+  -- 不加 bold：任何语种都只画一次
+  local gcPlain = fakeGC(900, 620)
+  local kitPlain = kitMod.new(gcPlain, th)
+  kitPlain:text({ x = 10, y = 10 }, "加强明暗对比", { tone = "dim" })
+  eq(#gcPlain.texts, 1, "非 bold 的中文只画一次")
+
+  -- 半角符号/数字/空格也算 ASCII，别误伤
+  local gcMix = fakeGC(900, 620)
+  local kitMix = kitMod.new(gcMix, th)
+  kitMix:text({ x = 10, y = 10 }, "PACKS 1.0", { bold = true })
+  eq(#gcMix.texts, 2, "ASCII + 数字 + 空格的 bold 仍然双画")
+  eq(kitMod.isAsciiText("加强"), false, "isAsciiText 认得出中文")
+  eq(kitMod.isAsciiText("PACKS 1.0"), true, "isAsciiText 认得出纯 ASCII")
+
+  -- 全帧不变式（中文界面）：整帧里凡出现「同一串在 x+1 处再画一次」，那串必须是纯 ASCII。
+  -- 这条才是能兜住「任何新加的 bold 中文」的那张网。
+  local zhWB = workbench.new({
+    width = 900, height = 620,
+    theme = themeMod.new({ name = "dark", locale = "zh" }),
+  })
+  zhWB:mount(nil, { docName = function() return "001.ase" end })
+  zhWB:setSize(900, 620)
+  zhWB:setDoc({ name = "001.ase", w = 32, h = 32, layers = 4, frame = 1, frames = 1 })
+  zhWB:log("把这层的红色换深一点", "user")
+  local gcZhFrame = fakeGC(900, 620)
+  zhWB:invalidate()
+  zhWB:paint(gcZhFrame)
+
+  -- 同一串在一个 x+1 的位置重复出现 => 假粗。扫一遍实际 fillText。
+  local seen, doubled = {}, {}
+  for _, t2 in ipairs(gcZhFrame.texts) do
+    local key = tostring(t2.y) .. "|" .. tostring(t2.text)
+    if seen[key] then doubled[#doubled + 1] = t2.text end
+    seen[key] = true
+  end
+  local badZh = nil
+  for _, txt in ipairs(doubled) do
+    if not kitMod.isAsciiText(txt) then badZh = txt; break end
+  end
+  ok(badZh == nil, "中文界面整帧：没有任何中文串被偏移双画（假粗）", badZh)
+
+  -- 中文界面确实出现了中文标题（不然上一条是空转）
+  local hasCjk = false
+  for _, t2 in ipairs(gcZhFrame.texts) do
+    if not kitMod.isAsciiText(t2.text) then hasCjk = true; break end
+  end
+  ok(hasCjk, "中文界面整帧里确实有中文文本（不变式不是空转）")
+end
+
 print("== theme: 令牌 ==")
 do
   eq(themeMod.TOKENS.dark.bg, "#111318", "bg 令牌 = #111318（ui §3.1）")
@@ -794,6 +869,13 @@ for _, g in ipairs(GOLDEN) do
     if utf8.len(txt.text) == nil then badUtf8 = txt.text; break end
   end
   ok(badUtf8 == nil, g.name .. "：整帧没有任何非法 UTF-8 文本（fillText 会被它崩掉）", badUtf8)
+
+  -- 假粗不变式：偏移双画只允许出现在纯 ASCII 上，否则中文会糊
+  local badBold = nil
+  for _, c in ipairs(wb.kit.calls) do
+    if c.op == "text" and c.double and not kitMod.isAsciiText(c.text or "") then badBold = c.text; break end
+  end
+  ok(badBold == nil, g.name .. "：整帧没有对非 ASCII 文本做偏移双画（假粗）", badBold)
 
   -- ASE_GOLDEN_REGEN=1 重录（改布局时用，改完必须再跑一遍不带它确认能逐条相等）
   -- 注意别写成 "x and nil or readAll()"：真分支是 nil 时 and/or 会走到 or（Lua 的经典坑）

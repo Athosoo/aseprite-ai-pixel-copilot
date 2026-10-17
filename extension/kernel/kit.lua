@@ -327,18 +327,31 @@ local function xyOf(xy)
 end
 kit.xyOf = xyOf
 
+-- 纯 ASCII 才判定：偏移 1px 双次绘制（假粗）对拉丁字形是加法，对像素方块字是灾难。
+local function isAsciiText(s)
+  return type(s) == "string" and s:find("[\128-\255]") == nil
+end
+kit.isAsciiText = isAsciiText
+
 function Kit:text(xy, text, style)
   local st = styleOf(style, nil)
+  local str = tostring(text or "")
   local x, y = xyOf(xy)
-  local w, h = self:measure(text, st)
+  local w, h = self:measure(str, st)
   local r = rect(x, y, w, h)
   local tone = st and st.tone or nil
-  push(self, "text", r, { tone = tone, bold = st and st.bold or false, mono = st and st.mono or false })
+  -- double = 这一条真的做了偏移双画（只有纯 ASCII 的 bold 才会）
+  local double = (st and st.bold and isAsciiText(str)) and true or false
+  push(self, "text", r, { tone = tone, bold = st and st.bold or false, mono = st and st.mono or false,
+                           text = str, double = double })
   if self.gc then
     self.gc.color = self:tone(tone or "text")
-    self.gc:fillText(tostring(text or ""), x, y)
-    -- GC 没有字重：标题用双次绘制偏移 1px 模拟半粗（ui §3.2，仅标题行）
-    if st and st.bold then self.gc:fillText(tostring(text or ""), x + 1, y) end
+    self.gc:fillText(str, x, y)
+    -- 字重：GC 没有真的 bold，只能用「同一串再画一遍、偏移 1px」模拟半粗。
+    -- **只对纯 ASCII 做**：中文是方块字，笔画密集，偏移再画一遍会把笔画叠糊成一团
+    -- （真机截图：画布页标题「加强明暗对比」糊得看不出字形）。
+    -- 中文的层级表达交给 tone（accent/text/dim），不靠假粗。
+    if double then self.gc:fillText(str, x + 1, y) end
   end
   return r
 end

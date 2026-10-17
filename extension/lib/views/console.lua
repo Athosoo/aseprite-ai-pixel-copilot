@@ -311,7 +311,15 @@ function Console:renderEmpty(kit, r, state)
     local tw = kit:measure(text, {})
     local er = { x = r.x + m.viewPad, y = y, w = tw + 16, h = m.lineH + 8 }
     kit:button(er, text, { hover = (state and state.hover == ("ex" .. i)) or false })
-    self.hits[#self.hits + 1] = { rect = er, kind = "example", index = i, text = text }
+    -- 画的是紧凑按钮，命中区给宽一点：真机上偏几个像素就点空，用户只会说「点不动」。
+    -- 横向多给到 240（点行内空白也算），纵向上下各 3px（行距 26，相邻命中区只擦 1px 边）。
+    local hr = {
+      x = er.x - 4,
+      y = er.y - 3,
+      w = math.max(er.w + 8, 240),
+      h = er.h + 6,
+    }
+    self.hits[#self.hits + 1] = { rect = hr, kind = "example", index = i, text = text }
     layout[i] = er
     y = y + m.lineH + 12
   end
