@@ -5,7 +5,7 @@
 --
 -- 架构：Aseprite(Lua 扩展) <--WebSocket--> 本地 Node 桥 <--HTTPS--> LLM
 
-local VERSION = "0.6.0"
+local VERSION = "0.6.1"
 
 local CFG = {
   -- 本地桥监听的端口（要和 bridge/config.json 里的 port 一致）

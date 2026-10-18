@@ -415,6 +415,39 @@ do
   local d = ops.describe()
   check("describe 里列了 sharpen", d:find("sharpen", 1, true) ~= nil)
   check("describe 里列了 contrast", d:find("contrast", 1, true) ~= nil)
+
+  -- params 元数据是插件清单 / 工具 schema / 系统提示的单一真源，
+  -- 所以"每个算子都有参数说明"是硬约束，不是文档建议。
+  local man = ops.manifest()
+  check("manifest 条数 == 算子数", #man == #ops.names, #man)
+  local byName, badParam = {}, nil
+  for _, e in ipairs(man) do
+    byName[e.name] = e
+    if type(e.desc) ~= "string" or e.desc == "" then badParam = e.name .. ".desc" end
+    for _, p in ipairs(e.params or {}) do
+      if type(p.name) ~= "string" or type(p.type) ~= "string" or type(p.desc) ~= "string" then
+        badParam = e.name .. "." .. tostring(p.name)
+      end
+    end
+  end
+  check("manifest 每项都有 desc，每个参数有 name/type/desc", badParam == nil, badParam)
+  local rc = byName.replace_color
+  local reqSeen = {}
+  for _, p in ipairs(rc and rc.params or {}) do if p.required then reqSeen[p.name] = true end end
+  check("replace_color 的 from/to 标成必填", reqSeen.from == true and reqSeen.to == true)
+  check("contrast 默认 amount 与实现一致（1.3）", (function()
+    for _, p in ipairs(byName.contrast.params) do if p.name == "amount" then return p.default == 1.3 end end
+  end)())
+  check("quantize 默认 colors 与实现一致（64）", (function()
+    for _, p in ipairs(byName.quantize.params) do if p.name == "colors" then return p.default == 64 end end
+  end)())
+  -- 10 个算子全部接受 region（erase_region 是必填的 region，其余是可选）
+  local regionOps = 0
+  for _, e in ipairs(man) do
+    for _, p in ipairs(e.params) do if p.name == "region" then regionOps = regionOps + 1 end end
+  end
+  check("region 参数出现在 10 个算子上", regionOps == 10, regionOps)
+  check("describe 带出参数摘要", d:find("[params:", 1, true) ~= nil)
 end
 
 print("== ops: 目标层语义（layers / layer / 全部）==")

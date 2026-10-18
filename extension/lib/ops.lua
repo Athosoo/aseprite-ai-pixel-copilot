@@ -459,29 +459,105 @@ local function op_contrast(img, o)
   end)
 end
 
+-- params 元数据是【单一真源】：工具 schema、插件清单、系统提示都从这里生成，
+-- 所以加一个参数只改这一处。字段：name/type/required/default/desc。
+-- type 取值：color(#RRGGBB / #RRGGBBAA) | int | number | bool | object | region({x,y,w,h})。
+local REGION_PARAM = { name = "region", type = "region", desc = "rect {x,y,w,h}; omitted = whole frame" }
+
 local OPS = {
-  replace_color = { fn = op_replace_color, desc = "replace pixels of one colour with another (tolerance absorbs anti-aliased edges)" },
-  erase_color   = { fn = op_erase_color,   desc = "make pixels of one colour transparent" },
-  erase_region  = { fn = op_erase_region,  desc = "clear a rectangular region to transparent" },
-  fill_region   = { fn = op_fill_region,   desc = "fill a rectangular region with a solid colour" },
-  outline       = { fn = op_outline,       desc = "draw a 1px outline around opaque pixels, on previously transparent pixels" },
-  despeckle     = { fn = op_despeckle,     desc = "delete isolated blobs up to maxCluster pixels (1 = single stray pixel)" },
-  palette_map   = { fn = op_palette_map,   desc = "remap colours by { old: new } and update the palette too" },
-  quantize      = { fn = op_quantize,      desc = "reduce the number of colours to N by median cut (merges similar colours); use it for \"too many colours / simplify the palette / merge to 64 colours\"; also rewrites the palette" },
-  sharpen       = { fn = op_sharpen,       desc = "sharpen edges: 3x3 unsharp mask on RGB, alpha untouched; use it for \"sharpen / crisp up the edges / make it less blurry\" (amount 1 = standard, 2+ = aggressive; threshold 0-255 leaves flat areas alone)" },
-  contrast      = { fn = op_contrast,      desc = "raise or lower light/dark contrast: pushes every channel away from pivot (default 128) by amount (1.3 = +30%, 1 = unchanged, 0.5 = flatter); alpha untouched; use it for \"more contrast / darker shadows, brighter highlights / flat looking\"" },
+  replace_color = { fn = op_replace_color, desc = "replace pixels of one colour with another (tolerance absorbs anti-aliased edges)", params = {
+    { name = "from", type = "color", required = true, desc = "colour to find, e.g. #ff0000" },
+    { name = "to", type = "color", required = true, desc = "colour to write; 6 digits keep the original alpha, 8 digits set it, e.g. #00ff00" },
+    { name = "tolerance", type = "int", default = 0, desc = "per-channel tolerance 0-255" },
+    REGION_PARAM,
+  } },
+  erase_color   = { fn = op_erase_color,   desc = "make pixels of one colour transparent", params = {
+    { name = "color", type = "color", required = true, desc = "colour to erase, e.g. #ff0000" },
+    { name = "tolerance", type = "int", default = 0, desc = "per-channel tolerance 0-255" },
+    REGION_PARAM,
+  } },
+  erase_region  = { fn = op_erase_region,  desc = "clear a rectangular region to transparent", params = {
+    { name = "region", type = "region", required = true, desc = "rect {x,y,w,h} to clear" },
+  } },
+  fill_region   = { fn = op_fill_region,   desc = "fill a rectangular region with a solid colour", params = {
+    { name = "color", type = "color", required = true, desc = "fill colour, e.g. #112233" },
+    REGION_PARAM,
+  } },
+  outline       = { fn = op_outline,       desc = "draw a 1px outline around opaque pixels, on previously transparent pixels", params = {
+    { name = "color", type = "color", required = true, desc = "outline colour, e.g. #000000" },
+    REGION_PARAM,
+  } },
+  despeckle     = { fn = op_despeckle,     desc = "delete isolated blobs up to maxCluster pixels (1 = single stray pixel)", params = {
+    { name = "maxCluster", type = "int", default = 1, desc = "largest blob to delete, in pixels" },
+    REGION_PARAM,
+  } },
+  palette_map   = { fn = op_palette_map,   desc = "remap colours by { old: new } and update the palette too", params = {
+    { name = "map", type = "object", required = true, desc = "{ \"#old\": \"#new\" } pairs" },
+    { name = "tolerance", type = "int", default = 0, desc = "per-channel tolerance 0-255" },
+    { name = "updatePalette", type = "bool", default = true, desc = "rewrite the sprite palette too" },
+    REGION_PARAM,
+  } },
+  quantize      = { fn = op_quantize,      desc = "reduce the number of colours to N by median cut (merges similar colours); use it for \"too many colours / simplify the palette / merge to 64 colours\"; also rewrites the palette", params = {
+    { name = "colors", type = "int", default = 64, desc = "target colour count" },
+    { name = "updatePalette", type = "bool", default = true, desc = "rewrite the sprite palette too" },
+    REGION_PARAM,
+  } },
+  sharpen       = { fn = op_sharpen,       desc = "sharpen edges: 3x3 unsharp mask on RGB, alpha untouched; use it for \"sharpen / crisp up the edges / make it less blurry\" (amount 1 = standard, 2+ = aggressive; threshold 0-255 leaves flat areas alone)", params = {
+    { name = "amount", type = "number", default = 1.0, desc = "1 = standard, 2+ = aggressive" },
+    { name = "threshold", type = "int", default = 0, desc = "ignore differences up to this, 0-255" },
+    REGION_PARAM,
+  } },
+  contrast      = { fn = op_contrast,      desc = "raise or lower light/dark contrast: pushes every channel away from pivot (default 128) by amount (1.3 = +30%, 1 = unchanged, 0.5 = flatter); alpha untouched; use it for \"more contrast / darker shadows, brighter highlights / flat looking\"", params = {
+    { name = "amount", type = "number", default = 1.3, desc = "1 = unchanged, >1 = more contrast, <1 = flatter" },
+    { name = "pivot", type = "int", default = 128, desc = "axis colour value 0-255" },
+    REGION_PARAM,
+  } },
 }
 
 ops.names = {}
 for name in pairs(OPS) do ops.names[#ops.names + 1] = name end
 table.sort(ops.names)
 
+-- 单个算子的参数摘要，给系统提示用（"amount:number=1.3, region:region"）
+local function paramsSummary(name)
+  local list = {}
+  for _, p in ipairs(OPS[name].params or {}) do
+    local s = p.name .. ":" .. p.type
+    if p.required then s = s .. "!" end
+    if p.default ~= nil then s = s .. "=" .. tostring(p.default) end
+    list[#list + 1] = s
+  end
+  return table.concat(list, ", ")
+end
+
 function ops.describe()
   local out = {}
   for _, name in ipairs(ops.names) do
-    out[#out + 1] = "- " .. name .. "：" .. OPS[name].desc
+    local line = "- " .. name .. "：" .. OPS[name].desc
+    local ps = paramsSummary(name)
+    if ps ~= "" then line = line .. "  [params: " .. ps .. "]" end
+    out[#out + 1] = line
   end
   return table.concat(out, "\n")
+end
+
+-- 机器可读清单：插件/工具 schema 都从它生成，别再手写第二份算子表。
+-- 返回 { { name=, desc=, params={ {name=,type=,required=,default=,desc=} } }, ... }
+function ops.manifest()
+  local list = {}
+  for _, name in ipairs(ops.names) do
+    local entry = { name = name, desc = OPS[name].desc, params = {} }
+    for _, p in ipairs(OPS[name].params or {}) do
+      entry.params[#entry.params + 1] = {
+        name = p.name, type = p.type,
+        required = p.required == true,
+        default = p.default,
+        desc = p.desc,
+      }
+    end
+    list[#list + 1] = entry
+  end
+  return list
 end
 
 -- 把"目标层"规格解析成 cel 列表。spec 允许：

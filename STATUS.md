@@ -2,6 +2,26 @@
 
 给下次继续的自己/agent：先读这一页，再动手。
 
+## v0.6.1：算子参数变成契约（ops.manifest），插件侧 P1b 落地
+
+**为什么**：`dsh-plugin-aseprite`（DSH 插件，独立项目在 `D:\PraticleTool\dsh-plugin-aseprite`）
+需要「算子叫什么、吃什么参数、默认值多少」的机器可读清单。以前只有 10 个名字 + 一句描述，
+参数只活在实现里；插件面板要跑默认参数、对话要给模型填参数，都没有真源。
+
+**改了什么**（`docs/RELEASE-v0.6.1.md` 有完整说明）：
+
+1. `extension/lib/ops.lua`：OPS 表每项新增 `params`（10 算子 / 27 参数，
+   字段 `name/type/required/default/desc`），并新增 `ops.manifest()`；
+   `ops.describe()` 带出参数摘要（系统提示立刻变准）。**OPS 表是唯一真源。**
+2. `ops_test` **97 → 104**：manifest 条数、每参数有 name+type+desc、必填项与默认值、
+   region 覆盖 10 算子、describe 带摘要。
+3. 插件侧 P1b 完成：vendor 了 `ops.lua`+`util.lua` 并用 `ops.manifest()` 生成清单、
+   覆盖前自动备份（同源 10 份 / 失败即中止）、GUI 冲突提示、7 个工具、
+   `test/config.mjs` 22 + `test/manifest.mjs` 10 + `test/smoke.mjs` 18 全绿。
+   **插件从此不依赖本仓库的路径**。
+
+**下一步**：桥侧 `tools.mjs` 的 enum 也可以从 `ops.manifest()` 生成（现在仍是手写，第二份名单）。
+
 ## v1.0：架构重做为「三明治内核」+ UI 重做为工作台（未发版）
 
 **一句话**：内核压到永不改动的小体积，能力全部推出内核成为可热装载/可自测/可回滚的**能力包**；
@@ -563,7 +583,7 @@ install.ps1 现在复制完会删掉目标目录里的 `bridge/`，源码安装�
 
 ```bash
 # 无头 Lua 套件：11 个文件，2026-10-16 实测 924 项全绿
-aseprite.exe -b --script tests/lua/ops_test.lua        # 97（算子 + 目标层 layers）
+aseprite.exe -b --script tests/lua/ops_test.lua        # 104（算子 + 目标层 layers + manifest 契约）
 aseprite.exe -b --script tests/lua/artop_test.lua      # 103（协议层：桥的消息 -> 真动画布）
 aseprite.exe -b --script tests/lua/workspace_test.lua  # 229+（工作区；需要 ASE_PROJ=<repo 根>；断言数随残留产物漂移）
 aseprite.exe -b --script tests/lua/panel_test.lua      # 254
