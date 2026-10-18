@@ -201,7 +201,7 @@ window.__ModuleLoader__.load({
             state ? react.createElement("span", { style: S.path }, state.workspace) : null
           ),
           state && !state.aseprite
-            ? react.createElement("div", { style: S.err }, "找不到 Aseprite，可执行文件路径：" + state.config)
+            ? react.createElement("div", { style: S.err }, "找不到 Aseprite。检查配置里的 aseprite 路径（配置文件：" + state.config + "）")
             : null,
           error ? react.createElement("div", { style: S.err }, error) : null,
           react.createElement(
