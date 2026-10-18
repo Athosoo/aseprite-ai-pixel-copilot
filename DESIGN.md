@@ -89,11 +89,11 @@ UI       client/client.js       侧边栏条目 + 工作台页面（文件列表
 
 ## 7. UI 面板（薄版三块，一次做）
 
-| 块 | 内容 |
+| 块 | 内容（P2 已实现） |
 |---|---|
 | 文件列表 | 工作区里的 .ase/.aseprite/.png，点击选中并预览 |
-| 画布预览 | 当前帧合成图（`aseprite_export` 出的 PNG），**算子跑完自动刷新** + 手动刷新按钮 |
-| 算子台 | 10 个算子按钮，**跑默认参数**（contrast 1.5 / sharpen 1.0 / quantize 64…） |
+| 画布预览 | 当前帧合成图（`aseprite_export` 出的 PNG，落 `<workspace>/_preview/`），**算子跑完自动刷新** + 手动刷新按钮 |
+| 算子台 | 10 个算子按钮，**跑默认参数**（来自 `ops.manifest()` 的 `default`） |
 
 **参数怎么给**（决策 R3-C）：按钮跑默认值；要精细调参就去对话里说一句让模型填。
 面板负责快，对话负责准，两者不重复。
@@ -103,6 +103,21 @@ UI       client/client.js       侧边栏条目 + 工作台页面（文件列表
 
 **不做的**：不在面板里实现对话（DSH 已有一流会话）。多帧切换、图层显隐不做（R4-A：只预览当前帧合成图）。
 
+### 7.1 面板的数据通路（P2 实现细节）
+
+UI 与宿主之间只有两条路由（不经过模型，也不新增工具）：
+
+- `POST /aseprite/api/<method>`：`state` / `ls` / `preview` / `apply` / `export` / `open`，
+  统一 `{ok:true,value}` 与 `{ok:false,error}` 信封，方法名只认自己的属性（防 `constructor` 之类）；
+- `GET /aseprite/media?path=…`：图片字节。**媒体白名单**只放行工作区与导出区内的文件；
+  两条路由都过 `ctx.connection.requestRejection(req)` 的同源/鉴权闸门。
+
+**回显**（R4-B）：`apply` / `export` 成功后，宿主用 `ctx.agents` 找到当前 Agent，
+`agent.inject(createUserMessage({ source: { kind: 'plugin:dsh-plugin-aseprite' } }))` 排一条模型可见的
+上下文 —— `inject` 不唤醒驱动，所以不会触发新一轮。会话 id 由客户端尝试
+`ctx.sidebarRight.mounted`（官方认可的"屏幕上那个会话"），取不到时宿主退回"唯一的活动 Agent"；
+仍定位不到就**不伪造**，如实返回 `echoed:false` 并在面板日志里说明。
+
 ---
 
 ## 8. 里程碑与验收
@@ -110,7 +125,7 @@ UI       client/client.js       侧边栏条目 + 工作台页面（文件列表
 | 阶段 | 内容 | 验收判据 |
 |---|---|---|
 | **P1b**（完成） | 领域层 + params 元数据；备份；冲突提示；算子清单动态生成；清单生成脚本 | `test/config.mjs` 24 + `test/manifest.mjs` 14 + `test/smoke.mjs` 19 + `test/lua/ops_test.lua` 104 全绿；备份真的生成；越界真的拒绝 |
-| **P2** | 面板薄版三块 + 回显 | 侧边栏点进去能选文件、看预览、点按钮改图并看到变化 |
+| **P2**（完成） | 面板薄版三块 + 回显 | 侧边栏点进去能选文件、看预览、点按钮改图并看到变化；`test/api.mjs` 24 + `test/client-load.mjs` 4 + smoke 面板段全绿 |
 | **P3** | 薄扩展 + ws 实时通道（改你正在编辑的未保存画布） | 需重新走一遍安装与授权；**首个要解决的正是第 5 节的 stale/覆盖问题** |
 
 ---

@@ -2,6 +2,28 @@
 
 给下次继续的自己：先读 `DESIGN.md`（行为契约），再读这一页（做到哪了）。
 
+## 2026-10-18 · P2 面板完成（三块 + 回显）
+
+**这一版做了什么**
+
+1. **宿主路由**（`lib/routes.js`）：`POST /aseprite/api/<method>` 与 `GET /aseprite/media?path=…`。
+   同源/鉴权闸门走 `ctx.connection.requestRejection`；媒体**白名单**只放行工作区与导出区（越界 403）。
+   方法派发只认自有属性（`constructor` 之类返回 404）。
+2. **面板 API**（`lib/api.js`）：`state / ls / preview / apply / export / open`。
+   `preview` 把 .ase 导出到 `<workspace>/_preview/<stem>-<hash>.png`（不污染导出区）；
+   `apply` 复用覆盖前备份、失败即中止。
+3. **回显**：成功后 `agent.inject(createUserMessage({ source: { kind: 'plugin:dsh-plugin-aseprite' } }))`
+   —— 不唤醒驱动、不触发新一轮。会话定位：客户端先试 `ctx.sidebarRight.mounted`，
+   宿主退回"唯一活动 Agent"，都拿不到就如实 `echoed:false`（不伪造）。
+4. **UI**（`client/client.js`）：文件列表 / 画布预览 / 算子台 + 顶部刷新·打开·导出 + 底部操作日志；
+   预览棋盘底、`image-rendering: pixelated`；算子按钮跑 manifest 默认参数。
+
+**测试**：`config 24 + manifest 14 + api 24 + client-load 4 + smoke 25 = 91`（smoke 需真机）+
+`ops_test 104`。`client-load` 用 vm + react stub 验证外层壳、工厂导出、两个插槽注册与首屏渲染树。
+
+**已验证 / 未验证**：路由、白名单、信封、回显降级、真机 preview/apply 都有测试；
+**浏览器里的实际观感与真实点击尚未验证**（重启 DSH 后要人眼确认）。
+
 ## 2026-10-18 · 仓库合并 + P1b 完成
 
 **这一版做了什么**
@@ -30,7 +52,6 @@
 
 | 优先级 | 事项 | 备注 |
 |---|---|---|
-| P2 | 面板薄版三块（文件列表 / 画布预览 / 算子台）+ 操作回显 | 预览 = `aseprite_export` 的 PNG；按钮跑默认参数 |
 | P3 | 薄扩展 + ws 实时通道（P3 才需要从 `archive/extension` 取回旧扩展代码） | 先解决 GUI stale / Ctrl+S 覆盖问题 |
 
 ## 遗留风险

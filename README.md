@@ -7,7 +7,9 @@
 > 保留在 Git 历史里：`git show v0.6.1` / 分支 `archive/extension`。领域层 `lib/ops.lua`
 > 就是从那边迁过来的，现在是本仓库的真源。
 
-## 现在能做什么（P1b 已验证）
+## 现在能做什么（P1b + P2）
+
+**对话侧：7 个工具**
 
 | 工具 | 作用 |
 |---|---|
@@ -18,6 +20,17 @@
 | `aseprite_apply` | 跑算子并保存：**覆盖前自动备份**、失败即中止、结果里带 GUI 冲突提示 |
 | `aseprite_export` | 导出 PNG 等格式（默认落导出区） |
 | `aseprite_open` | 用 GUI 打开文件，改完直接看图 |
+
+**UI 侧：Aseprite Workbench（侧边栏 → 主区面板）**
+
+- **文件列表**：工作区里的 .ase/.aseprite/.png，点击选中
+- **画布预览**：`aseprite_export` 出的 PNG（棋盘底、像素化渲染），算子跑完自动刷新
+- **算子台**：10 个算子按钮，跑 `ops.manifest()` 里的默认参数
+- 顶部：刷新 / 用 Aseprite 打开 / 导出 PNG
+- 底部：操作日志；每次操作**回显一行到当前会话**（宿主 `agent.inject`，不唤醒新一轮）
+
+面板数据走两条宿主路由：`POST /aseprite/api/<method>` 与 `GET /aseprite/media?path=…`（同源校验 +
+媒体白名单，只放行工作区/导出区内的文件）。
 
 执行方式：`aseprite -b --script`（每次一个新进程，约 0.37s），**不需要在 Aseprite 里装任何东西**。
 
@@ -34,12 +47,16 @@ lib/index.js          插件入口：defineTool × 7 + ctx.tools.register
 lib/opsinfo.js        算子清单文本化 / 工具说明 / 冲突提示（不依赖 dsh，可单测）
 lib/config.js         工作区 / 路径判定 / 备份（零 dsh 依赖，可单测）
 lib/runner.js         批处理执行器（零 dsh 依赖，可脱离宿主单测）
+lib/api.js            面板 API 表：列文件 / 预览 / apply / export / open + 媒体白名单
+lib/routes.js         宿主路由：POST /aseprite/api/*、GET /aseprite/media + 会话回显
 lib/ops.lua           领域层：10 个算子 + params 元数据 + ops.manifest()（唯一真源）
 lib/util.lua          ops.lua 的公共小工具
 lib/ops.manifest.json 由 ops.manifest() 生成的机器可读清单（别手改）
-client/client.js      客户端 bundle（当前是 hello 版，P2 才接真实数据）
+client/client.js      客户端 bundle：三块面板 + 宿主路由调用 + 操作日志/回显
 test/config.mjs       路径 / 配置 / 备份单测（不需要 Aseprite）
 test/manifest.mjs     清单与 ops.lua 一致性 + 工具说明生成（不需要 Aseprite）
+test/api.mjs          面板 API / 路由信封 / 媒体白名单 / 回显降级（不需要 Aseprite）
+test/client-load.mjs  客户端 bundle 外壳与插槽注册（不需要浏览器）
 test/smoke.mjs        对真 Aseprite 的冒烟：建图 / 导出 / 算子 / 备份 / 越界拒绝 / 清单新鲜度
 test/gen-manifest.mjs 从 ops.lua 重生成清单（--check 只校验是否过期）
 test/lua/ops_test.lua 领域层 104 条无头断言（和旧仓库同一份测试）
@@ -52,7 +69,9 @@ test/register-check.mjs  用假 ctx 验证注册（需要 dsh-tools stub，见�
 ```bash
 node test/config.mjs     # 24：路径 / 配置 / 备份
 node test/manifest.mjs   # 14：清单一致性 + 工具说明生成
-node test/smoke.mjs      # 19：需要本机装了 Aseprite（还校验清单没过期）
+node test/api.mjs        # 24：面板 API / 路由 / 回显降级
+node test/client-load.mjs # 4：客户端 bundle 外壳与插槽注册
+node test/smoke.mjs      # 25：需要本机装了 Aseprite（含面板 API 真机路径）
 node test/gen-manifest.mjs            # 改了 ops.lua 之后：重生成清单
 node test/gen-manifest.mjs --check    # 只校验，过期 exit 1
 aseprite -b --script test/lua/ops_test.lua   # 104：领域层断言

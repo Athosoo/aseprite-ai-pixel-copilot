@@ -11,7 +11,7 @@ const dst = join(homedir(), '.dsh', 'profiles', 'desktop', 'node_modules', 'dsh-
 
 const files = [
   'package.json', 'cordis.patch.yml', 'README.md', 'DESIGN.md', 'STATUS.md', 'LICENSE',
-  'lib/index.js', 'lib/runner.js', 'lib/config.js', 'lib/opsinfo.js',
+  'lib/index.js', 'lib/runner.js', 'lib/config.js', 'lib/opsinfo.js', 'lib/api.js', 'lib/routes.js',
   'client/client.js'
 ];
 for (const rel of files) {

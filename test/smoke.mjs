@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { SCRIPTS, applyScript, exportScript, readManifest, runLua } from '../lib/runner.js';
 import { backupFile, ensureWorkspace, loadConfig, resolvePath } from '../lib/config.js';
+import { createApi } from '../lib/api.js';
 import { computeManifest } from './manifest-lua.mjs';
 
 const TMP_HOME = mkdtempSync(join(tmpdir(), 'ase-smoke-home-'));
@@ -73,6 +74,18 @@ const bad = resolvePath(cfg, 'C:/Windows/system32/evil.ase');
 check('工作区外路径被拒绝', bad.ok === false && /outside the workspace/.test(bad.error), bad.error);
 const allow = resolvePath(Object.assign({}, cfg, { allowOutside: true }), 'C:/Windows/system32/evil.ase');
 check('allowOutside=true 才放行', allow.ok === true && allow.outside === true);
+
+console.log('== 面板 API（真机路径）==');
+const panel = createApi({}, cfg, manifest, { echo: async () => ({ echoed: false, reason: 'test' }) });
+const panelState = await panel.state();
+check('state 列出工作区文件', panelState.files.some((f) => f.name === 'smoke.ase'), panelState.files.map((f) => f.name).join(','));
+const pv = await panel.preview({ file: 'smoke.ase' });
+check('preview 真机导出 PNG', existsSync(pv.path) && statSync(pv.path).size > 0, pv.path);
+check('preview 落在工作区 _preview 下', pv.path.includes('_preview'), pv.path);
+const panelApply = await panel.apply({ file: 'smoke.ase', op: 'contrast', params: { amount: 1.2 } });
+check('面板 apply 成功并报告像素数', panelApply.ok && /changed=\d+/.test(panelApply.text), panelApply.text);
+check('面板 apply 覆盖前留了备份', typeof panelApply.backup === 'string' && existsSync(panelApply.backup), panelApply.backup);
+check('回显降级被如实报告', panelApply.echo && panelApply.echo.echoed === false);
 
 rmSync(TMP_HOME, { recursive: true, force: true });
 console.log('\n==== smoke: ' + pass + ' 通过, ' + fail + ' 失败 ====');
