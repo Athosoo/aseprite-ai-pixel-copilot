@@ -27,14 +27,26 @@ window.__ModuleLoader__.load({
     }
 
     async function api(method, args) {
-      const res = await fetch(routeUrl("aseprite/api/" + method), {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(args || {})
-      });
+      let res;
+      try {
+        res = await fetch(routeUrl("aseprite/api/" + method), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(args || {})
+        });
+      } catch (e) {
+        throw new Error("连不上宿主路由（" + (e && e.message) + "）");
+      }
+      const text = await res.text().catch(() => "");
       let payload = null;
-      try { payload = await res.json(); } catch (e) { payload = null; }
-      if (!payload) throw new Error("bad response (" + res.status + ")");
+      try { payload = JSON.parse(text); } catch (e) { payload = null; }
+      if (!payload) {
+        // 405 = 宿主路由没注册（插件装好后没重启，或服务注入失败）；看 %TEMP%\dsh-plugin-aseprite.log
+        const hint = res.status === 405 || res.status === 404
+          ? "  ← 宿主路由没注册：重启 DSH；若仍如此看 %TEMP%\\dsh-plugin-aseprite.log"
+          : "";
+        throw new Error("HTTP " + res.status + hint + (text ? "：" + text.slice(0, 120) : ""));
+      }
       if (!payload.ok) throw new Error(payload.error || "request failed");
       return payload.value;
     }

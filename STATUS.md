@@ -2,6 +2,27 @@
 
 给下次继续的自己：先读 `DESIGN.md`（行为契约），再读这一页（做到哪了）。
 
+## 2026-10-18 · v0.1.1 修面板 405（cordis 服务注入竞态）
+
+**症状**：面板渲染出来但红字 `HTTP 405`、文件列表空、点不动。
+
+**根因（日志实锤）**：`webServer` / `connection` / `agents` 都是**后注册**的 cordis 服务。
+插件可能先于它们挂载 —— 实测两次启动，一次 `panel routes registered: 2`，一次
+`cannot get property "webServer" without inject`。我们的 `service()` 先 `ctx.get()`（返回 undefined）
+再退到属性访问（未 inject 的 ctx 上属性访问**会抛**），于是路由一条都没注册，DSH 自己的
+handler 对 `/aseprite/api/state` 回 405。
+
+**修法**：
+1. `lib/index.js`：路由挂载改成 `ctx.inject(['webServer','connection'], wire)` —— 等服务就绪再挂；
+   `agents` 单独 `ctx.inject(['agents'], …)`，回显拿不到就保持诚实降级。
+2. `lib/routes.js` 的 `service()`：`ctx.get` 与属性访问**两条路都包 try/catch**，任何一条都不许抛。
+3. `client/client.js`：错误显示带 HTTP 状态 + 正文摘要，405/404 时直接提示看
+   `%TEMP%\dsh-plugin-aseprite.log`。
+4. 新增 `test/inject-wiring.mjs`（8 条）：模拟"服务未就绪 → 注入回调 → 挂上 2 条路由"的完整时序，
+   并断言 apply 在没有服务、属性访问会抛的情况下也不炸。
+
+**测试**：`config 24 + manifest 14 + api 24 + client-load 4 + inject-wiring 8 + smoke 25 = 99` + `ops_test 104`。
+
 ## 2026-10-18 · P2 面板完成（三块 + 回显）
 
 **这一版做了什么**
