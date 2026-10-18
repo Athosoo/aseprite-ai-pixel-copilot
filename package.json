@@ -1,0 +1,34 @@
+{
+  "name": "dsh-plugin-aseprite",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "description": "Aseprite control surface for DeepSeek Harness (batch route)",
+  "scripts": {
+    "test": "node test/config.mjs && node test/manifest.mjs && node test/smoke.mjs",
+    "test:config": "node test/config.mjs",
+    "test:manifest": "node test/manifest.mjs",
+    "test:smoke": "node test/smoke.mjs",
+    "test:ops": "aseprite -b --script test/lua/ops_test.lua",
+    "manifest": "node test/gen-manifest.mjs",
+    "manifest:check": "node test/gen-manifest.mjs --check",
+    "sync": "node test/sync.mjs"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  }
+}

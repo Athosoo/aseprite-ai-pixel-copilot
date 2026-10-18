@@ -1,0 +1,4 @@
+# 把本插件插进 profile 的 loader 层
+- insert:
+    - id: dsh-plugin-aseprite
+      name: 'dsh-plugin-aseprite'

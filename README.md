@@ -1,754 +1,92 @@
-# AI Pixel Copilot
+# dsh-plugin-aseprite
 
-给 Aseprite 加一个控制台式 AI 对话框：用自然语言操作画布、调用 Perfect Pixel Studio
-把 AI 生成的"伪像素画"矫正成真像素画、改动前自动备份、可回滚、记住用过的色值与场景。
+把 Aseprite 的能力接进 DeepSeek Harness。**UI 全在 DSH，Aseprite 侧零安装**（batch 路线）。
+设计契约见 `DESIGN.md`（改行为先改那里）。
 
-```
-Aseprite (Lua 扩展)  <--WebSocket-->  本地 Node 桥  <--HTTPS-->  LLM（OpenAI 兼容）
-```
+> 这个仓库 2026-10-18 起以插件为主产品。之前的 Aseprite 扩展 + Node 桥（v0.5.x–v0.6.1）
+> 保留在 Git 历史里：`git show v0.6.1` / 分支 `archive/extension`。领域层 `lib/ops.lua`
+> 就是从那边迁过来的，现在是本仓库的真源。
 
-不需要改 Aseprite 源码、不需要重编译。Aseprite 的 Lua 只有 WebSocket 没有 HTTP，
-所以必须有一个本地桥进程负责调 LLM。
+## 现在能做什么（P1b 已验证）
 
-![控制台面板](docs/screenshot-console.png)
-
-<sub>↑ 终端式面板：命令表是"打印"出来的，鼠标悬浮变蓝，点一下或敲编号执行。
-底部只有输入框 + ⏎ + […]。</sub>
-
-![贴边小面板](docs/screenshot-palette.png)
-
-<sub>↑ 小面板贴在**对话窗自己的右下角**，图标按钮对应主面板的功能，按住顶部把手可拖动。</sub>
-
-## 能力
-
-- **画布算子**（区域级、每个请求一个撤销步骤，Ctrl+Z 可退）
-  `replace_color` 换色 / `erase_color` 删某个颜色 / `erase_region` 清区域 /
-  `fill_region` 填区域 / `outline` 描边 / `despeckle` 清孤立杂点 / `palette_map` 批量换色+改调色板 /
-  `quantize` **自动减色**（中位切分，配色太杂就说"合并到 64 色以内"）/
-  `sharpen` **锐化边缘**（3x3 非锐化掩模） / `contrast` **加强明暗对比**（以中灰为轴拉开）
-- **尺寸操作**：`crop` 裁剪（像素不动）/ `scale` 整体缩放（重采样）/ `canvas_size` 改画布
-  （内容不变）。AI 靠内容包围盒和留白量判断该用哪个，拿不准会先问你
-- **风格包**：把「调色板 + 图层结构 + 作画规矩」打包成一个可切换的风格（内置像素图标 /
-  星露谷风 / 极简扁平，也能自己存）。切换后 AI 按该风格的颜色和图层作画。
-  **只有当前那一个风格进 prompt（约 200 字符）**，不是把整库塞进去
-- **作画**：`new_sprite` 建画布 → `add_layer` 按风格建图层 → `draw_art` 落像素。
-  AI 输出的是**字符网格**（一个字符 = 一个像素 + 一张字符→颜色表），不是坐标数组 ——
-  同样的 16×16 内容，字符网格约 100 token，坐标数组要几千，而且行宽写歪了会被当场挡住
-- **记忆**：把配色、风格规矩、项目约定记下来，之后按关键词检索。**不占常驻 token**，
-  越常被用到越留得住
-- **整张矫正**：面板里选一张 GPT 生成的图 → 调 Perfect Pixel Studio 核心算法检测网格并重采样
-  → 结果作为**新文档**打开，直接复制到你的画布
-- **备份/回滚/临时版本**：每次 AI 改动前自动快照；面板上有 Snapshot / Rollback / Versions 按钮；
-  同时落盘 `.aseprite` 副本到 `%APPDATA%\Aseprite\ai-pixel-copilot\versions\`
-- **色值记忆**：记住色值 + 使用场景 + 标签，之后按关键词/颜色/标签检索
-- **工作文件夹**（可选）：设一个工作区根目录后，AI 改图前会**自动把原文件备份**到
-  `<工作区>/backups/<原文件夹名>_back/`，再复制出一份 `<时间戳>_<原名>_copy.ase` 并
-  **在 Aseprite 里打开它**，之后所有改动都落在副本上 —— 原文件在你点「交付」之前一个字节都不会动。
-  敲「交付 / deliver」选：覆盖原文件 / 保留副本 / 丢弃副本 / 继续修改
-- **上传图片**：工作区开启时，选中的图会先复制到 `<工作区>/uploads/` 再处理，原图不动
-- **打开文档**：直接跟 AI 说「打开 001.ase」，它会在工作区里找；异步列出工作区文件也能问
-- **选项式提问**：AI 需要你拍板时会弹一个按钮窗（也能在终端里敲数字回答），
-  不再是"请回复 1 或 2"那种要打字的
-- **随时可中断**：跑飞了敲「停止 / stop」或按 **Esc** 立刻中断当前任务；
-  整轮还有超时（默认 **10 分钟**）自动中断兜底，单次请求超时默认 **3 分钟**，
-  两个都能在设置窗里改（见「超时」一节）
-- **状态可见**：状态栏有转圈动画 + 状态文本 + 当前文件名；思考/执行/出错/断联四种颜色，
-  断联时另给一行红字提示怎么修
-- **四种形态**：敲「栏 / bar」在 **面板 → 底边栏 → 侧边栏 → 小窗** 之间循环，
-  底边栏是一条贴底的宽条（够显示状态 + 最后一行输出 + 输入，能看见 AI 在干什么），
-  侧边栏贴右侧，小窗收成 360x56 贴在**右下角**。**形态会记住**，重启还是上次那个
-- **打开文件…**：命令表里的 O 键走 Aseprite 原生选择器，只打开不矫正
-  （要矫正走 U 键「选图」），或者直接跟 AI 说文件名让它开
-- **能力清单**：AI 有一份从**真实工具表生成**的能力清单（`capabilities` 工具），
-  问它"你能做什么"会照实回答，做不到的明确说做不到
-
-## 安装
-
-### 前置要求
-
-| 需要 | 说明 |
+| 工具 | 作用 |
 |---|---|
-| **Aseprite 1.3.x** | 在 1.3.18.6-dev 上开发验证。1.2 及更早没有扩展系统，装不了 |
-| **Node.js 18+** | 本地桥要用。**装法 A 也只需要这一个** |
-
-Windows / macOS / Linux 都支持（起桥按平台分支；`install.ps1` 是 Windows 的，其他平台手动两步即可）。
-
-### 装法 A：单文件安装（推荐）
-
-**不需要 clone 仓库、不需要 npm install。**
-
-1. 到 [Releases](https://github.com/Athosoo/aseprite-ai-pixel-copilot/releases) 下载
-   `ai-pixel-copilot-<版本>.aseprite-extension`
-2. 把它**拖进 Aseprite 窗口**（或 `Edit > Preferences > Extensions > Add Extension`）
-3. 重启 Aseprite，按 **Ctrl+Shift+A** 打开面板
-4. 首次会弹 3~4 个授权框（每个脚本文件一次），勾选"不再提示"即可
-
-桥（那个本地 Node 进程）**已经打包在扩展里**，装完就能用。首次打开面板时它会在
-扩展目录下自动生成 `bridge/config.json` —— 在面板里敲 `menu` 选「设置」把 API Key 填进去就行。
-
-### 装法 B：从源码安装（想改代码 / 跑测试）
-
-```bash
-# 1) 克隆到任意位置
-git clone https://github.com/Athosoo/aseprite-ai-pixel-copilot.git
-cd aseprite-ai-pixel-copilot
-
-# 2) 装桥的依赖
-cd bridge && npm install && cd ..
-
-# 3) 生成配置（config.json 不进版本库 —— 里面有 API Key）
-copy bridge\config.example.json bridge\config.json      # Windows
-# cp bridge/config.example.json bridge/config.json      # macOS / Linux
-
-# 4) 装扩展：把 extension/ 复制到 Aseprite 扩展目录，
-#    并把【本仓库的绝对路径】写进扩展，让扩展知道去哪找桥
-powershell -ExecutionPolicy Bypass -File install.ps1    # Windows
-# macOS / Linux 见下面的「其他平台」
-
-# 5) 重启 Aseprite（扩展只在启动时加载一次）
-```
-
-> **为什么第 4 步要写路径**：Aseprite 的 Lua 沙箱里没有 HTTP、只有 WebSocket，
-> 所以必须有个本地 Node 桥替它调 LLM。扩展不知道自己被 clone 到哪，
-> `install.ps1` 会把仓库路径写进扩展目录的 `__project.lua`，扩展启动时读它。
-> 这样源码里不用写死任何人的路径，仓库 clone 到哪都能用。
->
-> 装法 B 的好处是改完 `extension/` 里的代码跑一下 `install.ps1` 就生效，方便开发。
-
-打开：菜单 **File > Scripts > AI Pixel Copilot (AI console)**，或 **Ctrl+Shift+A**。
-菜单里**只有这一条**——其余命令（命令表 / 小面板 / 快照 / 回滚 / 设置）都不挂菜单，
-走快捷键或面板内的命令表，免得 `File > Scripts` 被一长串 `AI: ...` 塞满。
-
-首次使用会弹 **3~4 个授权框**（`lib/ws.lua` 开 socket、`lib/versions.lua` 写/删文件、
-`lib/agent.lua` 读上传图片、`main.lua` 执行命令拉起桥），每个勾选"不再提示"即可，一次性。
-面板会自动拉起本地桥。
-
-### 其他平台 / 不想让它自动起桥
-
-装法 B 在 macOS / Linux 上等价于手动两步（把 `extension/` 复制进扩展目录，
-并写一个 `__project.lua` 指向仓库），或者直接手动起桥：
-
-```bash
-cd bridge && node src/server.mjs      # 监听 ws://127.0.0.1:8777
-```
-
-扩展会连上来。扩展目录位置：
-- macOS：`~/Library/Application Support/Aseprite/extensions/ai-pixel-copilot/`
-- Linux：`~/.config/aseprite/extensions/ai-pixel-copilot/`
-- Windows：`%APPDATA%\Aseprite\extensions\ai-pixel-copilot\`
-
-### 自己打包 .aseprite-extension
-
-改完代码想重新发一个单文件包：
-
-```bash
-powershell -ExecutionPolicy Bypass -File tools/pack-extension.ps1     # Windows
-# macOS / Linux:  node bridge/scripts/bundle-for-extension.mjs
-#                 cd extension && zip -r ../dist/ai-pixel-copilot.zip . 
-```
-
-它会把桥 bundle 成零依赖单文件（含 `ws`）一起塞进包里。
-
-## 关于那些"权限索取"弹窗（英文的）
-
-装上扩展后，Aseprite 可能会弹几段**英文**的 Security 询问框，例如：
-
-> **Security** — The following script: `.../main.lua` wants to access this file: `...`
-> [ Allow Read Access ]  [ Stop Script ]
-> ☐ Don't show this specific alert again for this script
-> ☐ Give full trust to this script
-
-**这些框是 Aseprite 本体的脚本沙箱机制，不是本扩展的界面**，所以它们的语言跟着
-Aseprite 自己的界面语言走 —— 扩展代码改不了它们（Aseprite 没有把沙箱对话框的文案
-暴露给脚本）。扩展自己的窗口（面板 / 设置 / 选项窗）全部走 `lib/i18n.lua`，默认中文。
-
-每个框在要什么、为什么需要：
-
-| 框里的动作 | 为什么需要 |
-|---|---|
-| **Access this file**（读） | 读 `__project.lua`（install.ps1 写的仓库路径）来定位 `bridge/`；读你选的图片文件 |
-| **Write to this file**（写） | 写工作区的备份/副本、写版本快照到 `%APPDATA%\Aseprite\ai-pixel-copilot\versions\` |
-| **Execute**（执行） | 打开面板时自动拉起本地桥（`node bridge/src/server.mjs`，可在设置里关掉） |
-| **OpenSocket**（网络） | 连本地桥（`ws://127.0.0.1:8777`），以及桥去连 LLM |
-
-建议：点 **"Don't show this specific alert again for this script"** 再 Allow，
-下次就不再问了。**别**点 "Give full trust" 除非你读过源码 —— 那等于给它全部权限。
-如果你不希望它自动起桥，把 `main.lua` 里 `autoStartBridge` 改成 `false`，
-授权框里就只剩"读/写"这两类。
-
-## 能力边界（它做不到什么）
-
-下面这份清单和扩展里的 `capabilities` 工具是同一份内容，工具那份是**从真实注册表生成**
-的（有测试盯着两边一致），所以你问它的时候得到的就是这个：
-
-- **不能联网**：不能搜索、不能访问网页、不能调任何除你配置的 LLM 以外的服务。
-- **不能随便读写文件**：只能打开图片/文档类文件（`.ase .aseprite .png .jpg .gif .webp .bmp`），
-  只能往工作区里写。工作区之外的任意文件读写是做不到的。
-- **不能做位图以外的创作**：没有矢量、音频、字体生成。
-- **不能自己撤销**：每次改动前会自动快照，但"回退"必须你明确说（Ctrl+Z 或 rollback）。
-- **不能画到画布外**：落在画布外的像素会被跳过并计数（面板会提示）。
-- **看不见你的屏幕**：它只知道画布状态、图层表、颜色直方图和文件列表，看不到渲染结果。
-- **不能把面板停靠进 Aseprite 布局**：Aseprite 没给脚本 dock 接口，
-  所以"栏模式"是一条**浮动**条（贴到主窗口底边/右侧），标题栏去不掉。
-- **不能改 Aseprite 本体的对话框语言**：见上一节。
-
-## 用法
-
-打开面板就是一台终端（PowerShell / git-bash 那种）：输出往上滚，底部是提示符加输入行，回车执行。
-
-```
-AI Pixel Copilot
-❯ 把背景的红色换成蓝色                  ← 你敲的（绿色回显）
-│ 好的，我把画布上的红色换成蓝色。        ← AI 输出（白）
-· 自动备份 v1 "before: 红色换蓝色"      ← 工具动作（青）
-· 已执行 1 个算子，图层 Layer 1 —— replace_color 256px
-已经换好了：红色像素全部变成蓝色。
-就绪                                   ← 状态栏
-AI ❯ _                                 ← 提示符 + 输入行（中文输入法可用）
-```
-
-指令例子：
-
-- `把背景的 #FF0000 换成 #2E86DE`
-- `删掉所有 #00FF00`
-- `给主体加一圈 #1B1B1B 描边`
-- `清理孤立杂点`
-- `把四周的空白裁掉，缩到 32x32` ← 裁剪（像素不动）
-- `整张缩到 32x32` ← 整体重采样
-- `画布扩到 64x64，图案居中别动` ← 只改画布
-- `记住 #2E86DE 是我蓝色外壳的主体色，标签：外壳、蓝`
-- `记住这个项目一律用 1px 深色描边`
-- `我之前用过哪些外壳色？` / `我之前定过什么风格规矩？`
-- `边缘有点发虚，帮我锐化一下` / `加强一下明暗对比，让它更立体` ← v0.5.9
-- `回滚到上一个版本`
-
-### 锐化边缘 / 加强明暗对比（v0.5.9）
-
-这两个是**逐像素算子**，都只改 RGB、**绝不碰 alpha**，所以剪影形状和透明区域一定不变：
-
-| 算子 | 做什么 | 参数 |
-|---|---|---|
-| `sharpen` | 3x3 非锐化掩模：`新值 = 原值 + amount × (原值 − 周围均值)` | `amount`（默认 **1**，2–3 激进）、`threshold`（0–255 **忽略带**：局部差异小于它就不动，用来保护平色和抖动网点）、`region` |
-| `contrast` | 以 `pivot`（默认 **128** 中灰）为轴把每个通道乘开 | `amount`（默认 **1.3** = +30%；<1 是压平）、`pivot`、`region` |
-
-两条实现上的硬规矩（都有单测钉着，改之前先看）：
-
-1. **`sharpen` 的 3x3 均值只统计不透明邻居。** 把透明邻居当成黑色算进去的话，剪影边缘
-   会被整体提亮一圈 —— 在透明背景上就是一圈脏边，这是像素画里最显眼的毛病。
-2. **透明像素一律跳过**，alpha 原样写回。像素画的"锐"是 RGB 的对比，不是透明度。
-
-实测数字（8x8 灰阶、中间一条竖直边界、`amount=1`）：100/160 的边界两侧变成 **80/180**，
-离边界远的地方一个像素都不动；`contrast` 默认档把 100/160 变成 **92/170**。
-
-要"整体减色 / 合并调色板"是另一个算子（`quantize`），别混：锐化和对比**不减少颜色数**，
-只是把明暗拉开 —— 拉太狠反而会让色数变多（都是新算出来的中间色）。
-
-### 尺寸操作：裁剪 / 缩放 / 改画布
-
-这三个是**不同**的操作，AI 会自己判断该用哪个：
-
-| 你说的 | 实际做的 | 像素会变吗 |
-|---|---|---|
-| 「把空白裁掉」「切到中间那块」 | **裁剪**（crop） | 不变，只是画布变小 |
-| 「整张缩到 32x32」「放大两倍」 | **整体缩放**（scale） | 重采样，每个像素都重算 |
-| 「画布留 4px 边框」「画布扩到 64」 | **改画布尺寸**（canvas_size） | 内容尺寸不变，只是挪位置 |
-
-判断依据是 `canvas_info` 里的**内容包围盒和四边留白**：留白多而你又说"缩小"，AI 就知道该裁剪而不是缩放。**真的说不清时它会先问你一句**，而不是猜。
-
-### 风格：让它的画风听你的
-
-风格 = **调色板 + 推荐尺寸 + 图层结构 + 作画规矩**四件套，可以切换、可以自己存。
-
-内置三个：`pixel-icon`（像素图标）、`stardew`（星露谷风）、`flat-minimal`（极简扁平）。
-
-- 「换个星露谷风格」→ 它先 `style_list` 看有什么，再 `style_use` 切过去
-- 切过去之后，该风格的**颜色、图层名、规矩**就写进了它的指令里，之后画什么都照这个来
-- 你描述了一个它没有的风格？它用 `style_save` 存下来再切过去，下次还在
-- 自定义风格落在 `bridge/data/styles/*.json`，纯文本，可以直接手改
-
-**省 token 的关键**：切风格时只把**当前那一个**渲染进 prompt（约 200 字符），
-不是把整库塞进去。所以风格可以随便加。
-
-### 作画：它自己画，而不是让你动手
-
-`new_sprite` 建画布 → `add_layer` 按风格建图层 → `draw_art` 落像素。
-
-**AI 不输出像素坐标**——它输出的是**字符网格**：
-
-```
-palette = { ".": "", "X": "#2E86DE", "o": "#7EE2A8" }
-rows    = [ "..XX..",
-            ".XooX.",
-            "XooooX" ]
-```
-
-一个字符 = 一个像素，配一张字符→颜色的表。同样的内容，字符网格约 100 token，
-坐标数组要几千；而且它是"所见即所得"的，行宽写歪了一行会被**当场挡住并指出是第几行**，
-不会画出半张错图。
-
-画大件时它分**多趟**画，一趟一个图层（先铺大色块 → 阴影 → 细节 → 高光），
-每一趟是一个独立的撤销步骤。单趟网格建议不超过 32×32。
-
-### 记忆：让它越用越懂你
-
-- **你说「记住…」** → 存进记忆库
-- **你陈述长期偏好**（定下来的配色、风格规矩、项目约定）→ 它也会记
-- **日常改动、临时状态不会记**（免得把库撑爆、把 token 吃掉）
-
-记忆**不会**塞进每次请求的提示里——它只在需要时按关键词检索几条出来。所以存再多也不影响 token 开销。单条有长度上限、总量有上限，超了会淘汰**最少被用到**的那些；反过来，越常被检索到的越留得住。
-
-想看看记了什么：直接问「你都记得我什么？」。想删：说「忘掉那条 xxx」。
-
-### 内建命令（不用发给 AI，中英都能敲）
-
-| 命令 | 作用 |
-|---|---|
-| `菜单` / `menu` | 打开命令表（见下） |
-| `cls` / `清屏` | 清屏 |
-| `help` / `帮助` / `?` | 示例与内建命令列表 |
-| `设置` / `settings` | API Key / 模型设置 |
-| `快照` / `snapshot` | 备份当前版本 |
-| `回滚` / `rollback` | 回到上一个版本 |
-| `版本` / `versions` | 列出版本栈 |
-| `矫正` / `fix` | 矫正图片（Perfect Pixel） |
-| `选图` / `upload` | 选一张图片文件 |
-| `清空上下文` / `forget` | 让助手忘掉之前聊的（对话记忆清零） |
-| `做不到` / `gaps` | 看助手记下的"我做不到的需求"清单（给开发者看的） |
-| `退出` / `exit` | 关掉控制台 |
-
-其余任何输入都原样发给 AI。`↑` / `↓` 翻历史指令（翻到底会把没写完的草稿还回来），
-滚轮翻输出，`x` / `esc` / `关闭` 收起命令表。
-
-### 命令表（控制台式菜单）
-
-在输入框里输入 **`菜单`** 或 **`menu`**（大小写随意，带括号/标点也行：`[menu]`、`菜单！`），
-控制台里会弹出一张**纵向排列的命令表**：
-
-```
-命令表
- 1:S   快照当前版本
-       AI 改动前自动备份              ← 鼠标悬浮：整行变蓝
- 2:R   回滚到上一个版本
-       恢复到最新备份 (0)
- ...
-```
-
-- **鼠标悬浮**到哪一行，哪一行就高亮成主题蓝；
-- **点击**那一行 = 直接执行（就是面板上那些按钮的功能）；
-- 也可以**输入编号**（`1`…`9`）或**键位字母**（`S`/`R`/`V`…）回车执行；
-- 输入 `x`、`q`、`esc` 或 `关闭` 收起命令表。
-
-命令表里的 9 条命令与面板按钮一一对应：快照 / 回滚 / 版本栈 / 矫正图片 / 选图 /
-设置 / 重连 / 清屏 / 帮助。菜单文案跟随 Aseprite 的界面语言
-（中文 / English，见 `extension/lib/i18n.lua`）。
-
-### 贴边小面板
-
-面板底部输入框右边的 **[…]** 按钮（或快捷键 `Ctrl+Shift+P`）
-会在**对话窗自己的右下角**唤出一个**贴边的小面板**（跟着面板走，不是主窗口的角）：
-
-```
-AI                    ::::  ::::
-┌──────────┬──────────┐
-│ ◇ 快照    │ ◁ 回滚    │   ← 鼠标悬浮变蓝、按下有反馈
-│ C 版本栈  │ ╱ 矫正图片│     按住顶部把手可以拖动
-│ ⬆ 选图    │ ✦ 设置    │
-│ C 命令表  │ ✕ 收起    │
-└──────────┴──────────┘
-```
-
-小面板上的每个图标按钮都对应面板上的同一功能，画布操作不用再把主面板翻出来。
-`Menu` 会直接打开命令表，`Hide` 收起小面板（也可以点面板底部的 `[…]` 切换）。
-
-### 语言（中文默认）
-
-界面文案、按钮、命令表、状态、帮助全都有中英两套（`extension/lib/i18n.lua`）。
-语言判定顺序：
-
-1. Aseprite 首选项 `编辑 > 首选项 > 常规 > 语言`（选了 English 就是英文，`zh_hans` 就是中文）；
-2. 系统语言线索（`LANGUAGE` / `LANG` / 系统全名里的 English / 中文）；
-3. 都没有 -> **默认中文**。
-
-桥那边发来的状态文本（`ready` 等）也会按表翻译成中文（`就绪`）。
-
-### 终端小习惯
-
-- **↑ / ↓** 在输入框里翻历史指令（翻到顶再按 ↓ 会把你没提交的半截草稿还回来）；
-- 输入行前面有 `▸` 提示符，日志按 用户(绿) / AI(白) / 思考(灰) / 工具(青) / 错误(红) 着色。
-
-### 矫正图片
-
-在面板下方文件框里选图 → 点 **Fix Image** → 说"矫正这张图"；
-或者在小面板里点 **Upload...**（走 Aseprite 原生打开对话框，选完自动开始矫正）。
+| `aseprite_config` | 读/改工作区、导出区、allowOutside、aseprite 路径、Lua 模块根 |
+| `aseprite_status` | 版本 + 算子数 + 工作区设置 |
+| `aseprite_ops` | 10 个算子及其**参数 schema / 默认值**（来自 `ops.manifest()`，不写死） |
+| `aseprite_ls` | 列工作区里的 .ase/.aseprite/.png |
+| `aseprite_apply` | 跑算子并保存：**覆盖前自动备份**、失败即中止、结果里带 GUI 冲突提示 |
+| `aseprite_export` | 导出 PNG 等格式（默认落导出区） |
+| `aseprite_open` | 用 GUI 打开文件，改完直接看图 |
+
+执行方式：`aseprite -b --script`（每次一个新进程，约 0.37s），**不需要在 Aseprite 里装任何东西**。
+
+**备份**：写到 `<workspace>/_backup/<源相对路径>/<时间戳>_<原名>`，同一源文件只留最新 10 份。
+备份失败（复制出错 / 大小不符）会**中止**，不写入任何东西。
+
+**GUI 冲突**：batch 写盘后 Aseprite 不会自动重载，所以 `aseprite_apply` 的结果里会明确提示
+`File > Revert`；在那之前从旧窗口 Ctrl+S 会覆盖本次改动（DESIGN §5）。
 
 ## 目录
 
 ```
-extension/            Aseprite 扩展（装到 %APPDATA%\Aseprite\extensions\ai-pixel-copilot）
-  main.lua            入口：注册命令与快捷键（菜单只挂 1 条，其余只注册命令不挂菜单）
-  keys.aseprite-keys  快捷键：Ctrl+Shift+A 面板 / Ctrl+Shift+M 命令表 / Ctrl+Shift+P 小面板
-  lib/panel.lua       终端式控制台（canvas = 滚回缓冲 + 命令表叠层；提示符行 = entry 输入）
-  lib/menu.lua        命令表：纵向表格、悬浮变蓝、点击/编号/键位执行
-  lib/miniwindow.lua  贴边小面板：自绘图标按钮的无标题栏小窗，可拖动
-  lib/i18n.lua        中/英双语文案 + 终端内建命令词表 + 语言判定（默认中文）
-  lib/agent.lua       编排：协议、画布上下文、导入新文档、尺寸/作画请求
-  lib/ops.lua         7 个安全算子
-  lib/sizelib.lua     文档级尺寸：crop / scale / canvas_size（crop 不重采样）
-  lib/artlib.lua      作画：字符网格落像素 / 新建文档 / 建图层
-  lib/workspace.lua   工作区：备份 / 副本 / 打开 / 交付（v0.5.0）
-  lib/versions.lua    快照 / 回滚 / 临时版本栈
-  lib/ws.lua          WebSocket 封装
-bridge/               本地桥（Node，零第三方依赖除 ws）
-  src/server.mjs      WS 服务 + 会话 + 请求关联 + /health
-  src/llm.mjs         OpenAI 兼容调用 + 工具调用循环
-  src/tools.mjs       工具 schema + 分发
-  src/colorbank.mjs   色值+场景记忆库（data/colors.json）
-  src/memory.mjs      通用记忆库（data/memory.json）
-  src/styles.mjs      风格库（内置 + data/styles/*.json）
-  vendor/             Perfect Pixel 核心（esbuild 从原仓库 src/core 打包而来）
-tests/                测试与 GUI 探针（见 STATUS.md）
-  lua/menu_test.lua           命令表/语言/历史 无头单测（89 项）
-  lua/sizelib_test.lua        裁剪/缩放/画布尺寸（23 项）
-  lua/artlib_test.lua         字符网格作画（30 项）
-  lua/artop_test.lua          协议层：桥的消息 -> 真动画布（40 项）
-  lua/path_test.lua           安装路径机制验证（__project.lua -> bridge）
-  lua/gui_menu_probe.lua      命令表 + 小面板的 GUI 可视化探针
-  lua/gui_key_probe.lua       真键盘探针（配 run_key_test.sh，验连续退格）
-  type_probe.ps1              把真键盘按键发进 Aseprite（SendKeys）
-  run_key_test.sh             真键盘验证：预填 abc，发 3 次退格，看是否删空
-STATUS.md             当前进度、踩坑记录、下一步
+lib/index.js          插件入口：defineTool × 7 + ctx.tools.register
+lib/opsinfo.js        算子清单文本化 / 工具说明 / 冲突提示（不依赖 dsh，可单测）
+lib/config.js         工作区 / 路径判定 / 备份（零 dsh 依赖，可单测）
+lib/runner.js         批处理执行器（零 dsh 依赖，可脱离宿主单测）
+lib/ops.lua           领域层：10 个算子 + params 元数据 + ops.manifest()（唯一真源）
+lib/util.lua          ops.lua 的公共小工具
+lib/ops.manifest.json 由 ops.manifest() 生成的机器可读清单（别手改）
+client/client.js      客户端 bundle（当前是 hello 版，P2 才接真实数据）
+test/config.mjs       路径 / 配置 / 备份单测（不需要 Aseprite）
+test/manifest.mjs     清单与 ops.lua 一致性 + 工具说明生成（不需要 Aseprite）
+test/smoke.mjs        对真 Aseprite 的冒烟：建图 / 导出 / 算子 / 备份 / 越界拒绝 / 清单新鲜度
+test/gen-manifest.mjs 从 ops.lua 重生成清单（--check 只校验是否过期）
+test/lua/ops_test.lua 领域层 104 条无头断言（和旧仓库同一份测试）
+test/sync.mjs         把插件同步进 desktop profile
+test/register-check.mjs  用假 ctx 验证注册（需要 dsh-tools stub，见下）
 ```
 
-## 排错
-
-**"我已经矫正过的图，它又说要再处理一遍"** —— v0.5.0 修了。原因是 Perfect Pixel 的
-自动网格检测只找 **4 倍以上**的上采样因子，1px 一格的真像素画（也就是任何用这个算法
-处理过的结果）会检测失败报"无网格"，模型看到失败就想重试。现在桥侧会：
-① 这种情况下让你"不用处理"，并**明确禁止**模型盲目重试；
-② 如果模型仍然重试了同样的来源，同一轮内直接挡掉，不会再开一个一模一样的文档。
-
-**"矫正结果不对"怎么反馈** —— 每次矫正成功，面板里都会有一行诊断：
-`perfect_pixel: input=64x64 grid=16x16 refined=16x16 output=16x16 sample=center colors=5`。
-觉得不对的时候把这一行 + 原图 + 你期望的结果一起给开发者，有这三样才能定位。
-（`tests/lua/ws_api_probe.lua`、`tests/lua/gui_bar_probe.lua` 这些探针就是复现模板。）
-
-## 其他常见问题
-
-- **连不上桥**：浏览器开 http://127.0.0.1:8777/health 看是否 `{"ok":true}`；
-  没有就手动 `cd bridge && node src/server.mjs` 看报错。
-- **面板里提示缺 API Key**：`bridge/config.json` 的 `llm.apiKey` 是空的。
-- **矫正结果糊**：原图不是像素画，或网格没检测准。让 AI 用 `gridSize` 手动指定重试，例如 `[32,32]`。
-- **算子报"只支持 32 位 RGB/RGBA"**：先执行 精灵 > 色彩模式 > RGB。
-- **单张图超过 512x512**：逐像素算子有上限（512x512），先缩小范围或分区域处理。
-
-## 上下文与记忆（v0.5.2；v0.5.8 起分对话、压缩不再真删）
-
-助手有两层记忆，互不干扰：
-
-1. **对话上下文** —— 存在 `bridge/data/conversations/<对话 id>.json`，**一个对话一个文件**，
-   重启桥 / 重启 Aseprite / 重启电脑都接得上。长度按 **token 预算**算（默认 16000，
-   设置里可调 1000–200000）：超了就把最老的一段交给 LLM 摘要成几句话，摘要常驻系统提示，
-   只保留最近的原始消息 —— 所以"外壳用 #2E86DE"这种决定不会因为聊久了被忘掉。
-   **摘要不等于删除**：被摘要掉的原文进同一个文件的 `archive` 段留着（上限 2000 条），
-   只是不再发给模型。摘要失败时**宁可不压**（留着原文），绝不把上下文弄丢。
-2. **长期记忆**（v0.4.0 就有）—— `remember` / `recall` 工具 + `bridge/data/memory.json`，
-   只在你明确让它记的时候才存，按关键词召回，不会全量塞进提示词（省 token）。
-   **全局共享**：换对话也还记得你的偏好。
-
-一次请求最多调几次工具由 `Steps per request` 决定（默认 24）。撞上上限时它会说
-"已达本轮步数上限，说『继续』我就接着做"—— 因为有上下文，接着说"继续"真的能接着画。
-
-## 多对话（v0.5.8）
-
-**打开面板就是上次那段对话**，屏幕上那段记录也回来了（不只是上下文，是你看到的那些字）。
-
-```
-▸ 会话
-对话表   --   敲编号切换 · 点行也行 · x 关闭
- 1:  把背景改成蓝色            12 条 / 3.4k tok
- 2:  图标配色方案               4 条 / 0.9k tok ← 当前
- 3:  工作区交付流程            31 条 / 9.1k tok
- 8:n 新对话                    干净的一页，旧的留着
- 9:r 改名当前对话              下一行输入就是新名字
- 0:d 删除当前对话              移进回收站，不是真删
-▸ 2
-已切换对话。
-── 以下是恢复的记录：14 行 ──
-▸ 换个风格画个 16x16 的药水图标
-· 已画 128 像素（16x16），图层 主体
-…
-```
-
-命令（中英都能敲）：
-
-| 敲什么 | 干什么 |
-|---|---|
-| `会话` / `对话表` / `chats` | 列出对话表，敲编号切过去 |
-| `新对话` / `new chat` | 开一条新的（旧的留着，随时切回来） |
-| `改名` / `rename` | 改当前对话的名字（下一行输入就是新名字） |
-| `删对话` / `delete chat` | 删当前对话（要敲一次确认；进回收站，可捞回） |
-| `忘记` / `forget` | 清空**当前**对话的内容（对话本身还在） |
-
-- 命令表里也有这一行（`A` 键）。
-- **删除是移进 `data/conversations/trash/`**，不是真删；**只剩一个对话时拒绝删除**
-  （否则界面没地方可去）。
-- **老用户的 `data/history.json` 会自动变成第一个对话**（标题从老消息里派生），
-  原文件改名 `history.json.migrated` 留底。
-- 对话文件是普通 JSON，想备份/搬走直接拷 `data/conversations/` 就行。
-
-## 输入行上的控件（v0.5.3 起；v0.5.4 起所有形态都有；v0.5.5 起多了最小化）
-
-**面板 / 底边栏 / 侧边栏 / 小窗四种形态里都在**输入行那一行（和光标同行、右对齐）：
-
-
-和输入框、`＋`、思考滑杆**同一行**（不额外占高度，也不单独占一块地方）：
-
-- **工作图片缩略图**（16px）：当前文档的实时缩略图，自己按层合成 —— 不能用
-  `sprite:flatten()`，实测那个会真的把图层合掉。点缩略图或点它右边的 `＋` 都打开原生选图器，
-  换一张新的工作图片。
-- **上下文电量条**：**20 格**表示对话历史用了多少 / 预算多少，右边跟一个 `8.2k/16k` 的短标签
-  （栏太窄时自动去掉标签）。绿 → 琥珀（>60%）→ 红（>85%）。点一下在日志里报条数和 token 用量。
-  注意：这是**对话历史**的占用，不是模型整窗口占用（系统提示、画布上下文、工具表没算）。
-- **思考强度滑杆**：4 档 `auto / low / medium / high`，点一下或拖着走都行，松手才写回配置
-  （拖拽过程只动视觉，不会写四次配置）。端点不支持 `reasoning_effort` 时自动忽略并提示。
-
-- **贴边切换按钮**：图标是「小窗口 + 贴住底边/右边的高亮」，点一下在 **贴底 ⇄ 贴侧边** 之间切
-  （面板模式下点它 = 去贴底）。
-- **最小化按钮**：收成一个 **360x56 的小窗**（上面一行状态 + 控件、下面一行输入）。
-  小窗里**照样能直接打字下指令**，点输入行就把焦点给输入框；点**状态行左侧**或那颗**还原**方块
-  都能回去，回到最小化之前的形态。`B` 键 / `栏` 命令的循环现在是四态：
-  面板 → 贴底 → 贴侧边 → 小窗。
-
-小窗**默认贴在主窗口的右下角**（v0.5.9 起；以前是"贴右侧、垂直居中"，正好杵在画面中央）。
-它就是一个**独立的浮动对话框** —— 有标题栏，**按住标题栏就能拖到任意位置**，
-和主面板的"停靠"无关。只有在你**换形态**的时候才会重新贴回角落：
-重连、保存设置这些动作都会重复设置同一个形态，那不该把你拖走的窗口拽回来。
-
-> Aseprite 没给脚本任何"停靠"接口，所以"贴边"只能是按主窗口尺寸算坐标摆过去。
-> 而且 `app.window` 只有 `width` / `height`，**没有位置** —— 你把主窗口挪到副屏，
-> 脚本是感知不到的。这就是为什么窗口永远可以手动拖：贴边是默认值，不是限制。
-> 探针见 `tests/lua/gui_bar_probe.lua`（会打出小窗的右边距和底边距，都该是 0）。
-
-> 小窗为什么必须自己画一行输入：原生 `Entry` 只是"输入点"（中文输入法只有它会开），
-> **正文一律由画布画** —— 中文在 `ui::Entry` 里上下会被切掉一半（实测截图
-> `tests/lua/entry_cjk_zoom.png`）。所以画布不留输入行 = 最小化以后打字看不见，
-> 这是 v0.5.6 记进 `bridge/data/gaps.md` 的一条，v0.5.7 补上。
-
-所有方块统一 16x16、间距 6px、同一条中线对齐；宽度是**实测**出来的（中文标签、字体高度都量），
-所以不会出现"文字顶出框外"或"控件超出画布"——无头和真 GUI 两种字体下都有断言守着。
-
-窗口太窄（比如侧边栏）时先去掉文字标签，再窄就整体不画 —— 宁可只留文字，也不把输入框挤没。
-
-> **为什么按钮做在这里、而不是 Aseprite 自己的状态栏？** Aseprite 的 Lua API **没有**任何
-> 给主窗口状态栏添加控件的接口 —— 实测 `app` 只暴露 `command fs os params pixelColor
-> preferences theme` 七个成员，没有 `app.ui` / `app.menus`，`app.command` 里也没有状态栏命令。
-> 所以脚本能放按钮的地方只有自己创建的窗口（也就是这里）。
-> 探针见 `tests/lua/_statusbar_api_probe.lua` 的输出。
-
-## Token 花在哪（v0.5.9）
-
-**改 200x200 的图，比改 16x16 的图不会多花多少 token** —— 像素数据从不进模型上下文。
-模型看到的永远只有尺寸、图层名、选区和**最多 12 个颜色的用量统计**（`canvas_info`）。
-`apply_ops` 的工具结果也是几百字节的汇总（改了多少像素、哪个图层），不是像素。
-
-真正的大头是**每一步的固定开销**：
-
-| 东西 | 大小 | 什么时候发 |
-|---|---|---|
-| 工具表（25 个工具的 schema） | 17.5KB ≈ **4.4k token** | **每一次**请求（每一步） |
-| 系统提示 | ~8.5KB（含当前风格） | 每一次请求 |
-| 画布上下文 | 几百字节 | 每一次请求 |
-
-所以成本**跟步数成正比，跟像素数无关**：一步 ≈ 5k token，一轮三步 ≈ 15k token 输入。
-"锐化一张 200x200"是一步的事，和你手动改一个像素花的是同一份钱。
-
-省 token 的三个地方已经做了：**只有当前风格**被注入提示（不是整库）、**长期记忆按关键词召回**
-（不是全量塞）、**工具结果截断到 8000 字符**。上下文超预算时最老的一段会被摘要压缩
-（见上面"上下文与记忆"），压缩只影响对话历史，不影响上表这三项。
-
-## 做不到的需求会记到哪（v0.5.6）
-
-助手遇到"我现在做不到"的请求时，除了当场诚实告诉你，还会**把这条需求写进一份文档** ——
-相当于它自己给自己开的待办，方便事后补上：
-
-- 落盘在 `bridge/data/gaps.md`（路径可配 `paths.gaps`），旁边还有一份机器读的 `gaps.md.json`
-- 每条记：**你的原话**、为什么做不到、它给了什么变通、涉及哪个工具、当时的模型
-- **同一条重复提只加计数**（`x3`），不会把文档刷爆；超长内容截断，最多留 200 条
-- 两条路都会记：模型主动调 `log_gap` 工具（系统提示要求它这么做）**以及**桥的自动兜底
-  —— 工具返回"未支持 / 未知算子 / 做不到"这类错误时，即使模型忘了记也会补上
-- 面板里敲 `做不到` / `gaps`（命令表 `K` 键）能看到有几条、记在哪个文件、最近一条是什么
-
-**开发者这一侧怎么处理**：
+## 跑测试
 
 ```bash
-cd bridge
-node src/gaps.mjs list                              # 看还差什么
-node src/gaps.mjs done 3 --note "v0.5.7 已支持"      # 关掉一条：移出待处理 + 写进「已处理」
-node src/gaps.mjs path                              # 文档在哪
+node test/config.mjs     # 24：路径 / 配置 / 备份
+node test/manifest.mjs   # 14：清单一致性 + 工具说明生成
+node test/smoke.mjs      # 19：需要本机装了 Aseprite（还校验清单没过期）
+node test/gen-manifest.mjs            # 改了 ops.lua 之后：重生成清单
+node test/gen-manifest.mjs --check    # 只校验，过期 exit 1
+aseprite -b --script test/lua/ops_test.lua   # 104：领域层断言
+node test/sync.mjs       # 改完代码后同步进 profile，然后重启 DSH
 ```
 
-「已处理」段是**手写区**：重写文档时会原样保留，所以写进去的结论不会被后来的记录冲掉。
-这份文档因此是双向的 —— 助手往里写"做不到什么"，我读完往里写"已支持 / 为什么不做"。
+`test/register-check.mjs` 需要 `@deepseek-ai/dsh-tools` 能被解析（只有 DSH 自己的模块映射能提供它）。
+本地验证注册的办法：临时在 profile 的 `node_modules/@deepseek-ai/` 下放一个 `dsh-tools` stub
+（`export const defineTool = (x) => x`），跑完删掉。已用此法验证过 7 个工具与内嵌算子清单。
 
-## 插件内设置 API
+## 装载方式（DSH 的 desktop profile）
 
-在面板里敲 `menu` 打开命令表，选「**设置**」（键位 `6:T`；也可以直接敲 `settings`）：
+`dsh plugin --profile desktop ...` 被 CLI 拒绝（"managed exclusively by the Electron application"），所以直接改文件：
 
-- **Base URL** / **Model** / **API Key** 三个输入框，预填当前值（key 只显示掩码，不回显真值）
-- **Workspace**（备份/副本放哪，留空 = 关闭工作区模式）、**Bar colour**（边栏底色）
-- **高级**：`Steps per request`（每次请求最多调几次工具，默认 **24**）、
-  `Context limit (tokens)`（对话历史上限，默认 **16000**，超了自动摘要压缩）、
-  `Temperature`、`Thinking`（auto/low/medium/high）、
-  `Request timeout`（单次 HTTP 请求上限，默认 **180 秒**）、
-  `Turn timeout`（整轮对话上限，默认 **600 秒**）
-- **Save** 写入 `bridge/config.json` 并**立即生效**（不用重启桥；上下文预算改完当场生效）
-- **Test Connection** 发一次最小请求，结果直接显示在面板日志里
+1. `~/.dsh/profiles/desktop/package.json`：`dsh.profile.bundles` 加 `dsh-plugin-aseprite`，
+   `dependencies` 写 `"dsh-plugin-aseprite": "file:D:/PraticleTool/Aseprite-AI"`
+2. 包必须存在于 `~/.dsh/profiles/desktop/node_modules/dsh-plugin-aseprite`（用 `node test/sync.mjs` 复制）
+3. 重启 DSH
 
-key 只在"面板 → 桥"这一跳出现，桥只回传"是否已设置 + 掩码"。
-数字填错/留空 = 不改（不会把配置清成空）。`Thinking` 只有端点支持时才发出去，
-不支持会自动去掉重试并提示，不会因此连不上。
+**注意**：`package.json` 必须是 **UTF-8 无 BOM**（PS 5.1 的 `Set-Content -Encoding UTF8` 会写 BOM，导致 `JSON.parse` 失败、DSH 起不来）。
 
-## 超时（v0.5.9）
+**注意**：junction 不行。Node 会把 junction 解析成真实路径，于是 `@deepseek-ai/dsh-tools` 解析不到；必须**复制**进 profile 的 node_modules。
 
-两层，别混：
+## 客户端插槽（挖自 app.asar，非文档）
 
-| 层 | 默认 | 管什么 | 撞上会怎样 |
-|---|---|---|---|
-| 单次请求（`llm.timeoutMs`） | **180s** | 一次 HTTP 到 LLM 的往返 | 这次请求作废，面板提示"模型 N 秒内没回应"，并指向设置窗 |
-| 整轮（`llm.maxTurnMs`） | **600s** | 从你按下回车到它说完，中间可能有好几步 | 自动中断，提示"整轮超过 N 秒" |
-
-两个都能在**设置窗**里按秒改（单次 10–1800 秒，整轮 30–3600 秒，越界会被夹回范围内）。
-旧版本是 120s / 180s —— 后者其实一直偏紧：一轮最多 24 步、每步一次 HTTP，
-多步的活很容易撞上，而且撞上时甩给用户的是 fetch 那句 `This operation was aborted`。
-现在两条超时都有本地化文案、带秒数，并且和"用户主动按停止"的提示区分开。
-
-> 单次超时**不是**轮级超时的一部分：它只作废当前这一次请求。所以把单次调得比整轮还大
-> 没有意义（整轮会先到）。反过来，单次太小会在大提示词 / 慢的推理模型上频繁触发。
-
-## 插件内设置 API
-
-## 中文像素字体（已装，无平滑）
-
-中文字形走 Aseprite 的字体回退链（`data/fonts/fonts.xml`）。已换成
-**Fusion Pixel Font 10px（缝合像素字体）**，并关掉抗锯齿与自动微调：
-
-- `data/fonts/fusion-pixel-10px.ttf`（由你给的 BDF 转出，见下）
-- `fonts.xml`：`<font name="Fusion Pixel 10" file="fusion-pixel-10px.ttf"
-  antialias="false" hinting="false" />`，`Aseprite` 与 `Aseprite Mini` 的第一层回退都指向它，
-  `size="10"`
-
-**BDF 不能直接用**（Aseprite 只认 truetype/spritesheet/system），所以附了转换器
-`tools/bdf2ttf.py`（需要 fontTools）：
-
-```bash
-python tools/bdf2ttf.py <字体.bdf> -o fusion-pixel-10px.ttf --family "Fusion Pixel 10px"
+```js
+ctx.slots.inject("sidebar.panellist", () => ctx.slots.register(
+  { name: "sidebar.panellist", id: PANEL_ID, order: 40, label: () => "Aseprite" }, 条目组件));
+ctx.slots.register({ name: "main", key: PANEL_ID }, 页面组件);   // 点进去的主区页面
 ```
 
-三条实测结论（改之前务必知道）：
-1. **laf 只查第一层回退** —— 挂在中间层（如 `Unicode` 的 fallback）完全没效果。
-2. **回退字号 = size × 界面缩放** —— 像素字体必须写设计尺寸（10）才不糊。
-3. **antialias 默认开、hinting 默认开** —— 像素字体必须两个都关，否则糊/移位。
+客户端 bundle 外壳必须是 `window.__ModuleLoader__.load({ id, factory: (require) => ... })`，`react` 通过 `require` 注入，导出 `{ name, apply, inject }`。
 
-想还原：把 `data/fonts/fonts.xml.orig-backup` 覆盖回 `fonts.xml` 并删掉 fusion-pixel-10px.ttf。
+## 下一步
 
-## 已知限制
-
-- 面板用 Aseprite 的 `dlg` 控件：日志和命令表都是自绘的，不能选中复制；
-  输入仍是单行（中文输入法可用，回车提交，↑/↓ 翻历史）。
-- **输入只能"末尾编辑"**：输入框里常驻一个空格哨兵，靠 `onchange` 的文本差算
-  "插入了什么 / 是否退格"，所以把光标 ←/→ 移到中间改字是无效的。
-  退格能连续删（这条修过：`Entry::onSetText` 不会把光标挪到末尾，
-  详见 STATUS.md）。要真正的中间编辑，得等 Aseprite 把 Entry 的光标 API 暴露给 Lua。
-- **输入行为什么要"原生 Entry + 画布"两处**：Aseprite 里唯一会开输入法（IME）的控件是
-  `ui::Entry` / `ui::TextEdit`，而"开 IME"的开关没有暴露给 Lua（只有 C++ 能调 `setTextInput`），
-  自绘的输入行收不到中文合成字符 —— 等于中文打不了字。所以分工是**原生 Entry 当输入点**
-  （中文能打、素边框 + 同底色），**正文由画布画**（中文在 `ui::Entry` 里上下会被切掉一半，
-  见 `tests/lua/entry_cjk_zoom.png`）。**每个形态的画布都必须画出输入行** —— 漏了就等于
-  "打字看不见"（v0.5.6 小窗就是这么漏的）。要"光标直接画进画布 + 中文输入"
-  得改 Aseprite 源码（给 canvas 开 IME 或加控件）。
-- 命令表悬浮高亮用的是 canvas 的鼠标事件（`onmousemove`）；键盘 ↑/↓ 只在
-  输入框/控制台拿到焦点时才翻历史。
-- 模型看不到图像内容，只能看色值统计和尺寸；图像级工作一律走 Perfect Pixel 算法。
-- 逐像素算子有区域上限 512×512（防卡死）；大图请分区域处理。`sharpen` / `contrast` 同样
-  受这个上限约束（512×512 的 3x3 邻域读 ≈ 240 万次字节读，是这一档的上限）。
-- **锐化/对比不做"保护色相"**：`contrast` 是逐通道乘开的，色相会跟着明暗略微移动
-  （这正是手绘时"把暗部再压暗一档"的直觉）。要保色相就把 `pivot` 往你要保的那一端挪。
-- **窗口最小尺寸拦不住**：Aseprite 没给脚本设置"对话框最小尺寸"的接口，canvas 的
-  `autoscaling` 开或关都不影响（实测能把窗口缩到 40×30）。所以缩太小的时候面板会
-  改画一行"窗口太小，请拖大一点"作为兜底提示。
-- **"完美融入"只能做到配色**：`app.theme` 读不到主题色（实测：用真名字 `window_face`
-  和假名字 `zzzz` 取色都返回 `0,0,0` —— 那是个兜底对象）。所以设置里给了「Bar colour」，
-  填一个你主题的十六进制底色（如 `#2B2B2B`）就能让栏和你的界面同色。
-- **栏模式是浮动的**：Aseprite 对脚本既没 dock 接口，也**读不到主窗口的位置**
-  （`app.window` 只有 `width`/`height`，没有 `bounds`/`x`/`y`）。所以底边栏/侧边栏/小窗
-  都是浮窗：它们按主窗口尺寸贴到边上（小窗贴右下角），但你把主窗口挪走它就跟着不对了，
-  需要自己拖。**窗口位置不落盘** —— 小窗每次进入都回到右下角，不记你上次拖到哪儿。
-- **面板窗口点一下会跳回原大小这件事已经修了**（v0.5.0）：根因是每次点画布都会
-  `dlg:modify` 改焦点，而那会触发重新布局把窗口撑回内容自然尺寸。现在只在
-  焦点确实不在输入框、且窗口还是自然尺寸时才 modify。
-- **桥只有一个"活动对话"**：一个桥进程（一个端口）服务所有 Aseprite 窗口，
-  所以多开窗口共享同一个活动对话（后开的那个会把当前对话切走）。
-  协议里留了 `hello.conversation` 字段，以后要做"每窗口一个对话"不用改结构。
-- **回放上限 400 行**：更早的仍在文件里，只是不再回放到屏幕；命令历史（↑/↓）不落盘。
-- **回放是"替换"不是"追加"**：桥是唯一真相来源，连上就把面板滚回区换成该对话的记录
-  （短暂断线重连会重画一遍，不会重复）。
-- **归档会占磁盘**：`archive` 上限 2000 条，超出丢最老的。
-
-## 测试
-
-```bash
-# 无头单测（命令表排版 / 输入模型 / 历史 / 矫正队列）
-aseprite.exe -b --script tests/lua/menu_test.lua      # 89 项
-aseprite.exe -b --script tests/lua/ops_test.lua       # 82 项（算子：换色/擦除/描边/清杂点/减色/锐化/对比）
-aseprite.exe -b --script tests/lua/versions_test.lua  # 20 项
-aseprite.exe -b --script tests/lua/sizelib_test.lua   # 23 项（裁剪/缩放/包围盒）
-aseprite.exe -b --script tests/lua/artlib_test.lua    # 40 项（字符网格作画）
-aseprite.exe -b --script tests/lua/artop_test.lua     # 103 项（协议层：桥的消息 -> 真动画布）
-aseprite.exe -b --script tests/lua/panel_test.lua     # 254 项（滚轮/状态转圈/Esc 中断/选项输入/四种形态/控件几何/多对话/贴位算式）
-aseprite.exe -b --script tests/lua/settings_test.lua  # 44 项（设置窗：步数/上下文/温度/思考强度/超时）
-aseprite.exe -b --script tests/lua/ws_test.lua        # 20 项（帧形状：二进制头帧不能覆盖语义 type）
-aseprite.exe -b --script tests/lua/path_test.lua      # 安装路径机制
-aseprite.exe -b --script tests/lua/workspace_test.lua # 191 项（工作区：备份/副本/交付/打开/上传，用真文件）
-
-# 桥的自测（mock LLM + mock Aseprite，不联网、不花 token）
-cd bridge && npm test                                 # 470 项，跑下面七个
-node test/selftest.mjs                                # 152 项（端到端：桥 <-> 假 LLM <-> 假 Aseprite）
-node test/memory_test.mjs                             # 23 项（记忆库）
-node test/styles_test.mjs                             # 47 项（风格库：优先级/清洗/只注入当前）
-node test/tools_test.mjs                              # 188 项（25 个工具的分发 + 幂等 + 能力清单/算子名单交叉核对）
-node test/history_test.mjs                            # 24 项（上下文：预算/压缩/留档/摘要失败不丢原文）
-node test/conversations_test.mjs                      # 23 项（多对话：建切改删/迁移/回收站/活动对话落盘）
-node test/gaps_test.mjs                               # 13 项（做不到清单：去重计数/淘汰/已处理段保留/CLI）
-
-# GUI 可视化验证（会短暂弹 Aseprite 窗口并自动截图）
-bash tests/run_gui_visual.sh --term        # 终端面板 + 命令表 + 小面板
-bash tests/run_key_test.sh                 # 真键盘：预填 abc 再发 3 次退格，看是否删空
-bash tests/run_gui_resize.sh               # 窗口尺寸行为（点一下跳不跳、能缩多小）
-bash tests/run_gui_bar.sh                  # 四种形态的窗口尺寸 + 小窗贴角边距 + 底边栏截图
-bash tests/run_gui_agent.sh                # 四种形态的控件几何 + 小窗两行高（真字体）
-```
-
-合计 **Lua 871 + 桥 470 = 1341 项**。
-
-五个探针脚本（`tests/lua/*_probe.lua`）是"只能靠真 Aseprite 才能问出答案"的那些问题的
-记录：`ws_api_probe` 验文件 API（saveCopyAs / OpenFile / 路径分隔符），
-`gui_resize_probe` 验窗口跳变的根因，`gui_bar_probe` 验主窗口几何、形态尺寸和小窗贴角，
-`_statusbar_api_probe` 验主窗口状态栏到底能不能加控件（结论：不能）。
-改这些地方之前先看探针的结论，别重复踩。
-
-`run_key_test.sh` 是唯一能验证"输入光标"的测试：哨兵机制下的光标位置只有真实按键
-路径才暴露，纯 Lua 探针直接改文本会绕过它。
-
-## 许可
-
-[MIT](LICENSE)。
-
-本项目的 Perfect Pixel 核心（`bridge/vendor/perfectPixel.mjs`）打包自
-[Perfect Pixel Studio](https://github.com/tsmango/perfect-pixel-studio) 的算法实现，
-仅供学习与个人使用；商用请自行确认上游许可。
-
-## 贡献
-
-Issue / PR 都欢迎。改 `extension/lib/panel.lua` 的输入逻辑前，
-请先读 STATUS.md 里的"已知硬限制"那一节 —— 有几条是撞过源码才确认的死路，
-免得重复踩。
+- P2：面板薄版三块（文件列表 / 画布预览 / 算子台）+ 操作回显到主会话
+- P3：薄扩展 + ws 实时通道（改你正在编辑的未保存画布；先解决 stale/覆盖问题）

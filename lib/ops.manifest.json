@@ -1,0 +1,235 @@
+[
+  {
+    "desc": "raise or lower light/dark contrast: pushes every channel away from pivot (default 128) by amount (1.3 = +30%, 1 = unchanged, 0.5 = flatter); alpha untouched; use it for \"more contrast / darker shadows, brighter highlights / flat looking\"",
+    "name": "contrast",
+    "params": [
+      {
+        "default": 1.3,
+        "desc": "1 = unchanged, >1 = more contrast, <1 = flatter",
+        "name": "amount",
+        "required": false,
+        "type": "number"
+      },
+      {
+        "default": 128,
+        "desc": "axis colour value 0-255",
+        "name": "pivot",
+        "required": false,
+        "type": "int"
+      },
+      {
+        "desc": "rect {x,y,w,h}; omitted = whole frame",
+        "name": "region",
+        "required": false,
+        "type": "region"
+      }
+    ]
+  },
+  {
+    "desc": "delete isolated blobs up to maxCluster pixels (1 = single stray pixel)",
+    "name": "despeckle",
+    "params": [
+      {
+        "default": 1,
+        "desc": "largest blob to delete, in pixels",
+        "name": "maxCluster",
+        "required": false,
+        "type": "int"
+      },
+      {
+        "desc": "rect {x,y,w,h}; omitted = whole frame",
+        "name": "region",
+        "required": false,
+        "type": "region"
+      }
+    ]
+  },
+  {
+    "desc": "make pixels of one colour transparent",
+    "name": "erase_color",
+    "params": [
+      {
+        "desc": "colour to erase, e.g. #ff0000",
+        "name": "color",
+        "required": true,
+        "type": "color"
+      },
+      {
+        "default": 0,
+        "desc": "per-channel tolerance 0-255",
+        "name": "tolerance",
+        "required": false,
+        "type": "int"
+      },
+      {
+        "desc": "rect {x,y,w,h}; omitted = whole frame",
+        "name": "region",
+        "required": false,
+        "type": "region"
+      }
+    ]
+  },
+  {
+    "desc": "clear a rectangular region to transparent",
+    "name": "erase_region",
+    "params": [
+      {
+        "desc": "rect {x,y,w,h} to clear",
+        "name": "region",
+        "required": true,
+        "type": "region"
+      }
+    ]
+  },
+  {
+    "desc": "fill a rectangular region with a solid colour",
+    "name": "fill_region",
+    "params": [
+      {
+        "desc": "fill colour, e.g. #112233",
+        "name": "color",
+        "required": true,
+        "type": "color"
+      },
+      {
+        "desc": "rect {x,y,w,h}; omitted = whole frame",
+        "name": "region",
+        "required": false,
+        "type": "region"
+      }
+    ]
+  },
+  {
+    "desc": "draw a 1px outline around opaque pixels, on previously transparent pixels",
+    "name": "outline",
+    "params": [
+      {
+        "desc": "outline colour, e.g. #000000",
+        "name": "color",
+        "required": true,
+        "type": "color"
+      },
+      {
+        "desc": "rect {x,y,w,h}; omitted = whole frame",
+        "name": "region",
+        "required": false,
+        "type": "region"
+      }
+    ]
+  },
+  {
+    "desc": "remap colours by { old: new } and update the palette too",
+    "name": "palette_map",
+    "params": [
+      {
+        "desc": "{ \"#old\": \"#new\" } pairs",
+        "name": "map",
+        "required": true,
+        "type": "object"
+      },
+      {
+        "default": 0,
+        "desc": "per-channel tolerance 0-255",
+        "name": "tolerance",
+        "required": false,
+        "type": "int"
+      },
+      {
+        "default": true,
+        "desc": "rewrite the sprite palette too",
+        "name": "updatePalette",
+        "required": false,
+        "type": "bool"
+      },
+      {
+        "desc": "rect {x,y,w,h}; omitted = whole frame",
+        "name": "region",
+        "required": false,
+        "type": "region"
+      }
+    ]
+  },
+  {
+    "desc": "reduce the number of colours to N by median cut (merges similar colours); use it for \"too many colours / simplify the palette / merge to 64 colours\"; also rewrites the palette",
+    "name": "quantize",
+    "params": [
+      {
+        "default": 64,
+        "desc": "target colour count",
+        "name": "colors",
+        "required": false,
+        "type": "int"
+      },
+      {
+        "default": true,
+        "desc": "rewrite the sprite palette too",
+        "name": "updatePalette",
+        "required": false,
+        "type": "bool"
+      },
+      {
+        "desc": "rect {x,y,w,h}; omitted = whole frame",
+        "name": "region",
+        "required": false,
+        "type": "region"
+      }
+    ]
+  },
+  {
+    "desc": "replace pixels of one colour with another (tolerance absorbs anti-aliased edges)",
+    "name": "replace_color",
+    "params": [
+      {
+        "desc": "colour to find, e.g. #ff0000",
+        "name": "from",
+        "required": true,
+        "type": "color"
+      },
+      {
+        "desc": "colour to write; 6 digits keep the original alpha, 8 digits set it, e.g. #00ff00",
+        "name": "to",
+        "required": true,
+        "type": "color"
+      },
+      {
+        "default": 0,
+        "desc": "per-channel tolerance 0-255",
+        "name": "tolerance",
+        "required": false,
+        "type": "int"
+      },
+      {
+        "desc": "rect {x,y,w,h}; omitted = whole frame",
+        "name": "region",
+        "required": false,
+        "type": "region"
+      }
+    ]
+  },
+  {
+    "desc": "sharpen edges: 3x3 unsharp mask on RGB, alpha untouched; use it for \"sharpen / crisp up the edges / make it less blurry\" (amount 1 = standard, 2+ = aggressive; threshold 0-255 leaves flat areas alone)",
+    "name": "sharpen",
+    "params": [
+      {
+        "default": 1,
+        "desc": "1 = standard, 2+ = aggressive",
+        "name": "amount",
+        "required": false,
+        "type": "number"
+      },
+      {
+        "default": 0,
+        "desc": "ignore differences up to this, 0-255",
+        "name": "threshold",
+        "required": false,
+        "type": "int"
+      },
+      {
+        "desc": "rect {x,y,w,h}; omitted = whole frame",
+        "name": "region",
+        "required": false,
+        "type": "region"
+      }
+    ]
+  }
+]

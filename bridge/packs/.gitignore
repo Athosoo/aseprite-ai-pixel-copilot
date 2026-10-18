@@ -1,6 +1,0 @@
-# 运行时产物：账本、暂存区、快照、模型装载的包都不进版本库。
-# 它们和 bridge/data/ 一样是用户数据 —— 可重建，且会随每次 propose/activate 变化。
-.journal.jsonl
-.staging/
-.snapshots/
-user/
