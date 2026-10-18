@@ -17,8 +17,12 @@
    region 覆盖 10 算子、describe 带摘要。
 3. 插件侧 P1b 完成：vendor 了 `ops.lua`+`util.lua` 并用 `ops.manifest()` 生成清单、
    覆盖前自动备份（同源 10 份 / 失败即中止）、GUI 冲突提示、7 个工具、
-   `test/config.mjs` 22 + `test/manifest.mjs` 10 + `test/smoke.mjs` 18 全绿。
+   `test/config.mjs` 22 + `test/manifest.mjs` 14 + `test/smoke.mjs` 18 全绿。
    **插件从此不依赖本仓库的路径**。
+
+**验证**：`tests/verify-v1.0.ps1` → **Lua 2004 通过 / 0 失败**（21 文件），
+桥 **636 通过 / 3 失败**（仍是那 3 条施工前就有的 selftest 隔离失败）。
+上游 **v0.6.1** 已推远程并打 tag（commit `71bbdf1`）。插件侧已同步进 desktop profile，**重启 DSH 生效**。
 
 **下一步**：桥侧 `tools.mjs` 的 enum 也可以从 `ops.manifest()` 生成（现在仍是手写，第二份名单）。
 
