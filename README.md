@@ -1,5 +1,8 @@
 # dsh-plugin-aseprite
 
+> **状态：已归档（2026-10-19）** —— 项目停止维护，仓库转为 read-only。
+> 下面是最后一份可用说明，留作参考；卸载后想装回，见「装载方式」一节。
+
 把 Aseprite 的能力接进 DeepSeek Harness。**UI 全在 DSH，Aseprite 侧零安装**（batch 路线）。
 设计契约见 `DESIGN.md`（改行为先改那里）。
 
