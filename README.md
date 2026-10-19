@@ -1,7 +1,23 @@
 # dsh-plugin-aseprite
 
-> **状态：已归档（2026-10-19）** —— 项目停止维护，仓库转为 read-only。
-> 下面是最后一份可用说明，留作参考；卸载后想装回，见「装载方式」一节。
+> ## ⛔ 已停止维护（2026-10-19 归档）
+>
+> 本仓库不再更新，代码保持原样，供参考或自行取用。**不要期待 issue/PR 有回应。**
+>
+> **最后状态（诚实版）**
+>
+> - 对话侧 7 个工具、领域层 10 个算子（含参数元数据）、P2 三块面板都已实现；
+> - 本地测试全绿：`config 24 + manifest 14 + api 24 + client-load 4 + inject-wiring 8 + smoke 25 = 99`
+>   （smoke 需真机）+ 领域层 `ops_test 104`；
+> - **面板 405 的修复（`f1e83cf`，cordis 服务注入竞态 → `ctx.inject` 延迟挂路由）只过了单测，
+>   没有在真机重启后确认过一次。** 重装后第一件事就是看面板是否还报 405；
+> - 本机已卸载：profile 依赖与 `dsh.profile.bundles` 登记、`node_modules` 副本、
+>   `~/.dsh/dsh-plugin-aseprite` 数据目录、`pnpm-lock.yaml` 引用全部移除。
+>
+> **想重新装回**：`git clone` → `node test/sync.mjs` → 按下面「装载方式」一节登记到 profile → 重启 DSH。
+>
+> **旧产品**（Aseprite 扩展 + Node 桥，v0.5.x–v0.6.1）在 tag `v0.6.1` 与分支 `archive/extension`；
+> 领域层 `lib/ops.lua` 就是从那边迁过来的。
 
 把 Aseprite 的能力接进 DeepSeek Harness。**UI 全在 DSH，Aseprite 侧零安装**（batch 路线）。
 设计契约见 `DESIGN.md`（改行为先改那里）。
